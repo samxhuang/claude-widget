@@ -1,0 +1,11 @@
+# Diagnostic dumps from debugging sessions (contain session transcript content)
+diagnostics/
+
+# Build output
+ClaudeUsageOverlay/.build/
+ClaudeUsageOverlay/ClaudeUsageOverlay.app/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

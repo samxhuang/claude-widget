@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""
+claude-autoresume daemon
+=========================
+
+Watches Claude Code (CLI) sessions on this Mac. When a session gets cut off
+by your Pro/Max plan's rate limit, this daemon detects it and records it in
+a shared state file — it does NOT resume anything on its own. Resuming only
+happens for sessions you've explicitly opted into via the Claude Usage
+Overlay widget (or that you've told it to resume right now from there).
+
+Scope: Claude Code (CLI) sessions ONLY. Cowork sessions run server-side and
+never write a local transcript, so there's nothing on disk for this daemon
+to watch. Plain chat conversations aren't "sessions" in this sense — there's
+nothing to relaunch, you just send your next message when the limit clears.
+
+State file: ~/.claude-autoresume/state.json
+This is shared with the ClaudeUsageOverlay app, which reads it to show you
+detected sessions and lets you flip each one's "enabled" flag (default:
+off) or set "force_resume" for an immediate one-off resume. Both processes
+take an exclusive lock (~/.claude-autoresume/state.json.lock) around every
+read-modify-write so toggles from the widget and updates from this daemon
+don't clobber each other.
+
+Per-cycle behavior:
+  1. Scan ~/.claude/projects/**/*.jsonl (touched recently) for two kinds of
+     sessions:
+       - "active": touched in the last ACTIVE_WINDOW_MINUTES, no rate-limit
+         cutoff yet. Shown in the widget so you can pre-authorize a resume
+         in case it does get cut off later, without needing to come back.
+       - "waiting": log ends in a rate_limit_event — already cut off, with
+         a known reset time.
+     New sessions are added with enabled=false, handled=false. If a session
+     you've already seen transitions from active -> waiting, its enabled
+     flag (and any other choice you made) is preserved, not reset.
+  2. For every tracked, not-yet-handled "waiting" session: resume it now if
+     either
+       - force_resume is true (widget's "Resume Now" button), or
+       - enabled is true AND the reported reset time has passed.
+     "active" sessions are never auto-resumed (there's nothing to resume —
+     they're still running).
+  3. Prune old handled entries and stale "active" entries (gone quiet for a
+     while and never got rate-limited) so state.json doesn't grow forever.
+"""
+
+from __future__ import annotations  # keeps `X | None` / `list[str]` hints safe on Python 3.9 (macOS system python3)
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+HOME = Path.home()
+PROJECTS_DIR = HOME / ".claude" / "projects"
+# Cowork sessions (this includes Claude Desktop's Cowork mode) each get a
+# metadata file here (local_<uuid>.json: title, lastActivityAt, isArchived,
+# ...) plus a sibling local_<uuid>/audit.jsonl activity log. There is no
+# rate-limit/resume concept for these — Cowork manages its own lifecycle —
+# so we only ever show them in the widget as "active", never "waiting".
+COWORK_SESSIONS_DIR = HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+STATE_DIR = HOME / ".claude-autoresume"
+STATE_FILE = STATE_DIR / "state.json"
+LOCK_FILE = STATE_DIR / "state.json.lock"
+LOG_DIR = STATE_DIR / "logs"
+DAEMON_LOG = STATE_DIR / "daemon.log"
+
+POLL_INTERVAL_SECONDS = 30
+# Only look at session files touched in the last N minutes when scanning at
+# all — no need to re-read your entire session history every cycle.
+SCAN_WINDOW_MINUTES = 20
+# A session touched more recently than this is considered "active" and shown
+# in the widget even though it hasn't hit a rate limit (yet).
+ACTIVE_WINDOW_MINUTES = 5
+# Small buffer after the reported reset time before we actually fire, to
+# avoid racing the server's own clock.
+RESET_BUFFER_SECONDS = 30
+# Drop handled entries from state.json after this long, so the widget's
+# list (and this file) stay small.
+PRUNE_AFTER_HOURS = 48
+# Drop "active" entries that have gone quiet (and never got rate-limited)
+# after this long.
+ACTIVE_STALE_MINUTES = ACTIVE_WINDOW_MINUTES * 2
+
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+RESUME_PROMPT = os.environ.get("AUTORESUME_PROMPT", "continue")
+# See README's "Known rough edges" section — verify with `claude --help` if
+# resume attempts fail immediately.
+PERMISSION_MODE = os.environ.get("AUTORESUME_PERMISSION_MODE", "bypassPermissions")
+
+
+def log(msg: str) -> None:
+    line = f"[{datetime.now().isoformat(timespec='seconds')}] {msg}"
+    print(line, flush=True)
+    try:
+        DAEMON_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(DAEMON_LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Locked state read/modify/write
+# ---------------------------------------------------------------------------
+
+class StateLock:
+    """Exclusive file lock shared with the Swift widget, so a toggle click
+    and a daemon poll cycle can never interleave and lose an update."""
+
+    def __enter__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._fh = open(LOCK_FILE, "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            log(f"WARNING: could not parse {STATE_FILE}, starting fresh")
+    return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Session log parsing
+# ---------------------------------------------------------------------------
+
+def parse_reset_timestamp(value) -> float | None:
+    """rate_limit_event reset fields have shown up as either unix seconds
+    or ISO-8601 strings in the wild; handle both."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1000.0 if value > 10**12 else float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            log(f"WARNING: could not parse reset timestamp {value!r}")
+            return None
+    return None
+
+
+def find_cwd_in_lines(objs: list[dict]) -> str | None:
+    for obj in objs:
+        for key in ("cwd", "cwdPath", "workingDirectory"):
+            val = obj.get(key)
+            if isinstance(val, str):
+                return val
+    return None
+
+
+def find_prompt_preview(objs: list[dict]) -> str:
+    for obj in objs:
+        if obj.get("type") == "user":
+            message = obj.get("message")
+            content = None
+            if isinstance(message, dict):
+                content = message.get("content")
+            elif isinstance(message, str):
+                content = message
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        content = block.get("text")
+                        break
+            if isinstance(content, str) and content.strip():
+                text = content.strip().replace("\n", " ")
+                return text[:100] + ("…" if len(text) > 100 else "")
+    return "(no preview available)"
+
+
+def find_session_title(objs: list[dict]) -> str | None:
+    """Claude Code stamps each session with a couple of standalone
+    bookkeeping events as the conversation goes: "ai-title" (an
+    auto-generated summary) and "custom-title" (set if you or the app
+    renamed it). Both can appear multiple times as the conversation
+    evolves — later ones supersede earlier ones — and a custom title (if
+    ever set) should win over the auto-generated one. This is what lets
+    the widget show something like "Test session do nothing" instead of
+    just the project folder name, which is all we had before and wasn't
+    enough to tell sessions in the same repo apart."""
+    ai_title = None
+    custom_title = None
+    for obj in objs:
+        obj_type = obj.get("type")
+        if obj_type == "ai-title" and obj.get("aiTitle"):
+            ai_title = obj["aiTitle"]
+        elif obj_type == "custom-title" and obj.get("customTitle"):
+            custom_title = obj["customTitle"]
+    return custom_title or ai_title
+
+
+def guess_project_dir_from_folder(folder_name: str) -> str | None:
+    """Best-effort fallback: Claude Code encodes the project's absolute path
+    into the folder name (roughly: '/' -> '-'). Not guaranteed reversible if
+    the original path itself contained dashes, hence "best-effort"."""
+    if folder_name.startswith("-"):
+        candidate = "/" + folder_name[1:].replace("-", "/")
+        if Path(candidate).is_dir():
+            return candidate
+    return None
+
+
+def latest_activity_mtime(jsonl_path: Path) -> float:
+    """A session's own top-level transcript file goes quiet the moment work
+    gets delegated to a subagent (Task tool) — the subagent's own writes
+    land in a sibling <session_id>/subagents/*.jsonl file instead, not in
+    the top-level file. Using only the top-level file's mtime made
+    long-running sessions with a subagent doing the actual work look idle
+    (and eventually age out of the active window entirely) even while
+    they were actively running. This returns the most recent mtime across
+    the session's own file and any of its subagent transcripts, so
+    delegated work counts as activity too."""
+    latest = jsonl_path.stat().st_mtime
+    subagents_dir = jsonl_path.parent / jsonl_path.stem / "subagents"
+    if subagents_dir.is_dir():
+        for sub_path in subagents_dir.glob("*.jsonl"):
+            try:
+                latest = max(latest, sub_path.stat().st_mtime)
+            except OSError:
+                continue
+    return latest
+
+
+def scan_sessions(state: dict) -> None:
+    """Scans recent session files and tracks two kinds of sessions in
+    state.json: currently-active ones (touched in the last
+    ACTIVE_WINDOW_MINUTES) and rate-limited ones (log ends in a
+    rate_limit_event). New sessions start disabled; existing ones get their
+    display fields refreshed but keep whatever enabled/force_resume the
+    user already set — including across an active -> waiting transition."""
+    if not PROJECTS_DIR.is_dir():
+        return
+
+    now = time.time()
+    scan_cutoff = now - SCAN_WINDOW_MINUTES * 60
+
+    for project_folder in PROJECTS_DIR.iterdir():
+        if not project_folder.is_dir():
+            continue
+        for jsonl_path in project_folder.glob("*.jsonl"):
+            try:
+                mtime = latest_activity_mtime(jsonl_path)
+            except OSError:
+                continue
+            if mtime < scan_cutoff:
+                continue
+
+            session_id = jsonl_path.stem
+            existing = state.get(session_id)
+            if existing and existing.get("handled"):
+                continue  # already resumed/failed once — don't resurrect it
+
+            try:
+                raw_lines = jsonl_path.read_text(errors="ignore").splitlines()
+            except OSError:
+                continue
+
+            objs = []
+            for raw in raw_lines:
+                try:
+                    objs.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+
+            # Claude/Claude Code spawn short-lived internal sessions for
+            # things like the bash-command permission classifier — each one
+            # gets its own session file in the same project directory,
+            # sharing entrypoint/promptSource/isSidechain with real
+            # sessions. We previously tried to distinguish them by model
+            # (internal calls run on Haiku) but that broke: trivial real
+            # prompts (e.g. a one-line "test" message) can *also* get
+            # routed to Haiku, so that heuristic hid genuine short
+            # conversations. The actual reliable signal is the "origin"
+            # field Claude Code itself stamps on every "user" event: a
+            # message the human actually typed carries
+            # origin.kind == "human". Internal/synthetic prompts (the
+            # classifier's "Classify this shell command..." calls,
+            # task-notifications, etc.) never have it. A session is
+            # "real" if at least one of its user turns is human-originated.
+            has_human_message = any(
+                obj.get("type") == "user"
+                and isinstance(obj.get("origin"), dict)
+                and obj["origin"].get("kind") == "human"
+                for obj in objs
+            )
+
+            rate_limit_obj = None
+            for obj in reversed(objs):
+                obj_type = obj.get("type", "")
+                if "rate_limit" in obj_type.lower():
+                    rate_limit_obj = obj
+                    break
+                if obj_type in ("result", "session_end"):
+                    break  # session ended normally
+
+            resets_at = None
+            status = None
+
+            if rate_limit_obj is not None and has_human_message:
+                info = (
+                    rate_limit_obj.get("rateLimitInfo")
+                    or rate_limit_obj.get("rate_limit_info")
+                    or rate_limit_obj
+                )
+                resets_raw = None
+                for key in ("resetsAt", "resets_at", "reset_at", "resetAt"):
+                    if isinstance(info, dict) and key in info:
+                        resets_raw = info[key]
+                        break
+                resets_at = parse_reset_timestamp(resets_raw)
+                if resets_at is not None:
+                    status = "waiting"
+                else:
+                    log(f"Found rate_limit_event in {jsonl_path} but couldn't read a reset time")
+
+            if status is None and has_human_message and (now - mtime) <= ACTIVE_WINDOW_MINUTES * 60:
+                status = "active"
+
+            if status is None:
+                if existing and not existing.get("handled"):
+                    # Was tracked as "active" before this filter existed (or
+                    # has simply gone quiet with no rate limit) — drop it.
+                    del state[session_id]
+                continue
+
+            project_dir = find_cwd_in_lines(objs) or guess_project_dir_from_folder(project_folder.name)
+            if not project_dir:
+                log(f"Found session {session_id} ({status}) but couldn't determine its project directory; skipping")
+                continue
+
+            session_title = find_session_title(objs)
+
+            if existing:
+                was_active = existing.get("status") == "active"
+                existing["project_dir"] = project_dir
+                existing["project_name"] = Path(project_dir).name
+                existing["session_title"] = session_title
+                existing["prompt_preview"] = find_prompt_preview(objs)
+                existing["status"] = status
+                existing["resets_at"] = resets_at
+                existing["last_seen"] = now
+                if was_active and status == "waiting":
+                    log(f"Session {session_id} in {project_dir} transitioned active -> rate-limited "
+                        f"(enabled={existing.get('enabled', False)} preserved), resets at {datetime.fromtimestamp(resets_at)}")
+            else:
+                log(f"Detected {status} session {session_id} ({session_title!r}) in {project_dir}"
+                    + (f", resets at {datetime.fromtimestamp(resets_at)}" if resets_at else "")
+                    + " — added to widget, NOT auto-resuming")
+                state[session_id] = {
+                    "project_dir": project_dir,
+                    "project_name": Path(project_dir).name,
+                    "session_title": session_title,
+                    "prompt_preview": find_prompt_preview(objs),
+                    "resets_at": resets_at,
+                    "detected_at": now,
+                    "last_seen": now,
+                    "enabled": False,       # <-- default OFF; only the widget can flip this
+                    "force_resume": False,
+                    "handled": False,
+                    "handled_at": None,
+                    "status": status,
+                }
+
+
+def read_last_jsonl_object(path: Path, initial_chunk: int = 8192) -> dict | None:
+    """Returns the last parseable JSON object in a .jsonl file without
+    reading the whole thing — audit.jsonl files carry full message content
+    and can get large. Seeks backward from the end, growing the read
+    window only if the tail chunk doesn't contain a full line yet."""
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return None
+        read_size = min(initial_chunk, size)
+        with open(path, "rb") as f:
+            while True:
+                f.seek(size - read_size)
+                chunk = f.read(read_size)
+                lines = [ln for ln in chunk.split(b"\n") if ln.strip()]
+                # Drop a possibly-truncated first line unless we've already
+                # read the whole file.
+                if read_size < size and len(lines) > 1:
+                    lines = lines[1:]
+                for raw in reversed(lines):
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                if read_size >= size:
+                    return None
+                read_size = min(read_size * 4, size)
+    except OSError:
+        return None
+
+
+def _truthy(value) -> bool:
+    """isArchived and similar fields have shown up as both native JSON
+    booleans and stringified "True"/"False" — normalize either way."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
+def scan_cowork_sessions(state: dict) -> None:
+    """Cowork sessions (including Claude Desktop's Cowork mode) don't write
+    into ~/.claude/projects at all — they get their own metadata file plus
+    an audit.jsonl activity log under COWORK_SESSIONS_DIR. Unlike Claude
+    Code CLI sessions, there's no rate-limit/resume cycle to track here:
+    Cowork manages its own retries. We only ever add these as "active" (so
+    they show up in the widget with their real title) and drop them the
+    moment their last audit event shows the turn actually finished."""
+    if not COWORK_SESSIONS_DIR.is_dir():
+        return
+
+    now = time.time()
+    scan_cutoff_ms = (now - SCAN_WINDOW_MINUTES * 60) * 1000
+
+    for meta_path in COWORK_SESSIONS_DIR.rglob("local_*.json"):
+        # Sibling directory of the same name holds audit.jsonl; if it's not
+        # there this isn't a session metadata file (or the session was
+        # cleaned up already).
+        session_dir = meta_path.with_suffix("")
+        audit_path = session_dir / "audit.jsonl"
+        if not session_dir.is_dir() or not audit_path.exists():
+            continue
+
+        try:
+            meta = json.loads(meta_path.read_text(errors="ignore"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if _truthy(meta.get("isArchived")):
+            continue
+
+        session_id = meta.get("sessionId") or meta_path.stem
+        existing = state.get(session_id)
+        if existing and existing.get("handled"):
+            continue
+
+        try:
+            last_activity_ms = float(meta.get("lastActivityAt", 0))
+        except (TypeError, ValueError):
+            last_activity_ms = 0
+        if last_activity_ms and last_activity_ms < scan_cutoff_ms:
+            # Gone quiet a while ago — treat like any other stale "active"
+            # entry: drop it if we were tracking it, otherwise skip.
+            if existing and not existing.get("handled"):
+                del state[session_id]
+            continue
+
+        last_event = read_last_jsonl_object(audit_path)
+        # A finished turn ends in a "result" event. Anything else at the
+        # tail (assistant/user/tool events, or a "system" event mid-request)
+        # means the session is still actively working.
+        is_running = bool(last_event) and last_event.get("type") != "result"
+        if not is_running:
+            if existing and not existing.get("handled"):
+                del state[session_id]
+            continue
+
+        title = meta.get("title") or "Cowork session"
+
+        if existing:
+            existing["project_dir"] = str(session_dir)
+            existing["project_name"] = "Cowork"
+            existing["session_title"] = title
+            existing["prompt_preview"] = ""
+            existing["status"] = "active"
+            existing["resets_at"] = None
+            existing["last_seen"] = now
+        else:
+            log(f"Detected active Cowork session {session_id} ({title!r}) — added to widget")
+            state[session_id] = {
+                "project_dir": str(session_dir),
+                "project_name": "Cowork",
+                "session_title": title,
+                "prompt_preview": "",
+                "resets_at": None,
+                "detected_at": now,
+                "last_seen": now,
+                "enabled": False,
+                "force_resume": False,
+                "handled": False,
+                "handled_at": None,
+                "status": "active",
+            }
+
+
+def resume_due_sessions(state: dict) -> None:
+    now = time.time()
+    for session_id, entry in state.items():
+        if entry.get("handled"):
+            continue
+        if entry.get("status") != "waiting" or entry.get("resets_at") is None:
+            continue  # "active" sessions have nothing to resume yet
+
+        force = entry.get("force_resume", False)
+        enabled = entry.get("enabled", False)
+        due = now >= entry["resets_at"] + RESET_BUFFER_SECONDS
+
+        if not (force or (enabled and due)):
+            continue
+
+        project_dir = entry["project_dir"]
+        reason = "forced from widget" if force else "enabled + reset time reached"
+        log(f"Resuming session {session_id} ({project_dir}) — {reason}")
+
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        session_log = LOG_DIR / f"{session_id}.log"
+
+        cmd = [
+            CLAUDE_BIN,
+            "--resume", session_id,
+            "--print", RESUME_PROMPT,
+            "--output-format", "json",
+            "--permission-mode", PERMISSION_MODE,
+        ]
+
+        try:
+            with open(session_log, "a") as f:
+                f.write(f"\n--- auto-resume attempt at {datetime.now().isoformat()} ({reason}) ---\n")
+                f.write(f"cmd: {' '.join(cmd)}\n\n")
+                f.flush()
+                subprocess.Popen(cmd, cwd=project_dir, stdout=f, stderr=subprocess.STDOUT)
+            log(f"Launched resume for {session_id}, output logging to {session_log}")
+            entry["status"] = "resumed"
+        except FileNotFoundError:
+            log(f"ERROR: could not find '{CLAUDE_BIN}' executable. Set CLAUDE_BIN in the launchd plist's environment.")
+            entry["status"] = "failed"
+        except OSError as e:
+            log(f"ERROR launching resume for {session_id}: {e}")
+            entry["status"] = "failed"
+
+        entry["handled"] = True
+        entry["handled_at"] = now
+        entry["force_resume"] = False
+
+
+def prune_old_entries(state: dict) -> None:
+    now = time.time()
+    handled_cutoff = now - PRUNE_AFTER_HOURS * 3600
+    active_cutoff = now - ACTIVE_STALE_MINUTES * 60
+
+    stale = []
+    for sid, e in state.items():
+        if e.get("handled") and (e.get("handled_at") or 0) < handled_cutoff:
+            stale.append(sid)
+            continue
+        if e.get("status") == "active" and not e.get("handled"):
+            last_seen = e.get("last_seen", e.get("detected_at", 0))
+            if last_seen < active_cutoff:
+                stale.append(sid)  # went quiet and never got rate-limited
+
+    for sid in stale:
+        del state[sid]
+
+
+def main() -> None:
+    log(f"claude-autoresume daemon starting (poll every {POLL_INTERVAL_SECONDS}s). "
+        f"Default is OFF for every detected session — resumes only happen via the widget.")
+    log(f"Watching {PROJECTS_DIR} and {COWORK_SESSIONS_DIR}")
+    while True:
+        try:
+            with StateLock():
+                state = load_state()
+                scan_sessions(state)
+                scan_cowork_sessions(state)
+                resume_due_sessions(state)
+                prune_old_entries(state)
+                save_state(state)
+        except Exception as e:  # daemon must never die from a single bad cycle
+            log(f"ERROR in poll cycle: {e!r}")
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
