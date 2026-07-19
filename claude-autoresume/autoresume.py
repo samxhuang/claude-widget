@@ -1322,9 +1322,16 @@ def _usage_analytics_worker() -> None:
                     log("usage analytics: collected, compacted "
                         "(AUTORESUME_REMOTE=1 — plan_fit/pricing skipped)")
                 else:
+                    # Finding 3: snapshot config.json's mtime BEFORE the
+                    # (potentially slow) write, then stamp that value. Reading
+                    # it AFTER would absorb a config edit that landed mid-write
+                    # — the next poll's change-detector would compare against
+                    # the newer mtime and never rewrite. Snapshotting first
+                    # leaves that edit visible to the detector below.
+                    cfg_mtime_before_write = autoresume_config.config_mtime(STATE_DIR)
                     plan_fit.write_plan_fit(STATE_DIR, datetime.now().astimezone())
                     log("usage analytics: collected, compacted, plan_fit.json refreshed")
-                    last_config_mtime = autoresume_config.config_mtime(STATE_DIR)
+                    last_config_mtime = cfg_mtime_before_write
             # Finding 2: between hourly passes, still reflect a config.json edit
             # into plan_fit.json on the very next poll (~10s), not an hour later.
             last_config_mtime = _maybe_write_plan_fit_on_config_change(

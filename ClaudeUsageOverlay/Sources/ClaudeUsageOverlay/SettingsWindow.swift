@@ -108,6 +108,30 @@ struct AccountBudgetSection: View {
     @State private var monthlyText: String = ""
     @State private var weekStart: String = "monday"
     @State private var seeded = false
+    /// Finding 2: snapshot of the section-owned config fields as this section
+    /// last seeded or persisted them. Used to tell an *external* config edit
+    /// (ConfigStore.reloadIfChanged picking up a hand-edited config.json) apart
+    /// from the echo of our own write — only the former should re-seed the
+    /// fields, so in-progress typing isn't stomped by our own persist round-trip.
+    @State private var lastSyncedSnapshot: SectionSnapshot?
+
+    /// The subset of AppConfig this section reads/writes, compared to decide
+    /// whether an incoming config change originated here or elsewhere.
+    private struct SectionSnapshot: Equatable {
+        let choice: AccountChoice
+        let weeklyUsd: Double?
+        let monthlyUsd: Double?
+        let weekStart: String
+    }
+
+    private func snapshot(of c: AppConfig) -> SectionSnapshot {
+        SectionSnapshot(
+            choice: AccountChoice.from(config: c),
+            weeklyUsd: c.weeklyUsd,
+            monthlyUsd: c.monthlyUsd,
+            weekStart: weekdayOptions.contains(c.weekStart) ? c.weekStart : "monday"
+        )
+    }
 
     private var weeklyValid: Bool { Self.isValidBudget(weeklyText) }
     private var monthlyValid: Bool { Self.isValidBudget(monthlyText) }
@@ -174,24 +198,45 @@ struct AccountBudgetSection: View {
                 .foregroundColor(.secondary)
         }
         .onAppear(perform: seedFromConfig)
+        // Finding 2: the Settings window is kept alive (isReleasedWhenClosed =
+        // false), so an externally-edited config.json picked up by
+        // ConfigStore.reloadIfChanged must reflect here without a relaunch.
+        // Mirror the HostRow re-seed — but only when the incoming change didn't
+        // originate from this section's own persist (compare against the last
+        // snapshot we wrote/seeded), so our own write's echo doesn't clobber a
+        // value the user is mid-typing.
+        .onChange(of: configStore.config) { newConfig in
+            if snapshot(of: newConfig) != lastSyncedSnapshot {
+                applyConfig(newConfig)
+            }
+        }
     }
 
     private func seedFromConfig() {
         guard !seeded else { return }
         seeded = true
-        let c = configStore.config
+        applyConfig(configStore.config)
+    }
+
+    /// Seeds all editable fields from `c` and records the snapshot so a
+    /// subsequent config change can be attributed to this section or elsewhere.
+    private func applyConfig(_ c: AppConfig) {
         accountChoice = AccountChoice.from(config: c)
         weeklyText = c.weeklyUsd.map { Self.formatBudget($0) } ?? ""
         monthlyText = c.monthlyUsd.map { Self.formatBudget($0) } ?? ""
-        // Finding 2: only monday/sunday are valid options now — fall back to
-        // monday for any other stored value (old/hand-edited config) so the
-        // Picker has a matching tag rather than rendering blank.
+        // Finding 2 (round 1): only monday/sunday are valid options now — fall
+        // back to monday for any other stored value (old/hand-edited config) so
+        // the Picker has a matching tag rather than rendering blank.
         weekStart = weekdayOptions.contains(c.weekStart) ? c.weekStart : "monday"
+        lastSyncedSnapshot = snapshot(of: c)
     }
 
     private func persistAccount() {
         let (type, plan) = accountChoice.typeAndPlan(preservingPlan: configStore.config.accountPlan)
         configStore.setAccount(type: type, plan: plan)
+        // Record what we just wrote so the resulting config change isn't
+        // mistaken for an external edit and re-seeded on top of live edits.
+        lastSyncedSnapshot = snapshot(of: configStore.config)
     }
 
     private func persistBudget() {
@@ -205,6 +250,7 @@ struct AccountBudgetSection: View {
         }
         configStore.setBudget(weeklyUsd: weekly, monthlyUsd: monthly,
                               weekStart: weekStart, timezone: configStore.config.timezone)
+        lastSyncedSnapshot = snapshot(of: configStore.config)
     }
 
     private static func isValidBudget(_ s: String) -> Bool {
@@ -341,6 +387,11 @@ private struct HostRow: View {
     @State private var expanded = false
     @State private var pollText: String = ""
     @State private var collectUsage: Bool = true
+    /// Finding 4 (round 2): the pollSeconds value pollText was last seeded from.
+    /// Used to skip re-seeding pollText when a host change touched only another
+    /// field (e.g. the collectUsage toggle persisting) — otherwise seedFromHost
+    /// would discard an in-progress, not-yet-submitted poll edit.
+    @State private var lastSeededPoll: Int?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -415,7 +466,14 @@ private struct HostRow: View {
     }
 
     private func seedFromHost() {
-        pollText = String(host.pollSeconds)
+        // Finding 4 (round 2): only re-seed pollText when pollSeconds itself
+        // changed. pollText commits on submit (not per-keystroke), so an
+        // unsubmitted value is live editing — a host change from another field
+        // (collectUsage toggle, deploy stamping version) must not overwrite it.
+        if host.pollSeconds != lastSeededPoll {
+            pollText = String(host.pollSeconds)
+            lastSeededPoll = host.pollSeconds
+        }
         collectUsage = host.collectUsage
     }
 
@@ -522,6 +580,10 @@ struct AddHostSheet: View {
         }
         .padding(20)
         .frame(width: 460)
+        // Finding 3: cancel any in-flight deploy if the sheet goes away by any
+        // route (Escape, click-outside, app quit), not just the Cancel button —
+        // otherwise the Process is orphaned and its read handler keeps firing.
+        .onDisappear { deployer.cancel() }
     }
 
     private func runTest() {
@@ -598,6 +660,8 @@ struct RedeploySheet: View {
         }
         .padding(20)
         .frame(width: 460)
+        // Finding 3: cancel an in-flight redeploy on any dismissal route.
+        .onDisappear { deployer.cancel() }
     }
 
     private func run() {
@@ -649,6 +713,8 @@ struct RemoveHostSheet: View {
         }
         .padding(20)
         .frame(width: 460)
+        // Finding 3: cancel an in-flight uninstall on any dismissal route.
+        .onDisappear { deployer.cancel() }
     }
 
     private func remove() {

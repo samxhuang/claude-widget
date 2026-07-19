@@ -16,12 +16,19 @@ Run with:
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import autoresume as ar
 import remote_sync as rs
+
+REPO_DIR = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +611,67 @@ class TestWorkerTick(TempEnvMixin, unittest.TestCase):
         self.assertIn("devbox", loop.next_poll, "still-configured host kept")
         self.assertNotIn("gone", loop.next_poll, "removed host evicted from next_poll")
         self.assertNotIn("gone", loop.next_usage, "removed host evicted from next_usage")
+
+
+class TestDeployPayloadImports(unittest.TestCase):
+    """Finding 1 (empirical): the exact PAYLOAD_FILES set deploy_remote.sh ships
+    must be self-sufficient for `import autoresume` on a bare remote — nothing
+    else is on the remote's sys.path. autoresume.py imports remote_sync at
+    module top, so a payload omitting it crash-loops the remote daemon at import
+    before main(). We stage EXACTLY the deploy payload into a throwaway bin/ and
+    confirm the import there; we also confirm the pre-fix set (no remote_sync.py)
+    DID fail, so this test is meaningful, not vacuously green."""
+
+    def _parse_payload_files(self):
+        """Read the PAYLOAD_FILES=(...) array straight out of deploy_remote.sh so
+        the test tracks the real deploy list rather than a hardcoded copy."""
+        text = (REPO_DIR / "deploy_remote.sh").read_text()
+        m = re.search(r"^PAYLOAD_FILES=\(([^)]*)\)", text, re.MULTILINE)
+        self.assertIsNotNone(m, "could not find PAYLOAD_FILES=(...) in deploy_remote.sh")
+        return m.group(1).split()
+
+    def _stage_and_import(self, files):
+        """Copy `files` into a temp bin/ (isolated from repo sys.path) and try
+        `import autoresume` under system python3. Returns (returncode, stderr)."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            for f in files:
+                src = REPO_DIR / f
+                self.assertTrue(src.is_file(), f"payload file missing in repo: {f}")
+                shutil.copy(src, bin_dir / f)
+            # Empty PYTHONPATH + cwd=bin_dir so ONLY the staged files resolve —
+            # mirrors the remote where nothing but bin/ is importable.
+            env = dict(os.environ)
+            env["PYTHONPATH"] = ""
+            env["AUTORESUME_REMOTE"] = "1"
+            proc = subprocess.run(
+                [sys.executable, "-c", "import autoresume"],
+                cwd=str(bin_dir), env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+            return proc.returncode, proc.stderr
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_deploy_payload_includes_remote_sync(self):
+        self.assertIn("remote_sync.py", self._parse_payload_files(),
+                      "deploy_remote.sh PAYLOAD_FILES must ship remote_sync.py "
+                      "(autoresume.py imports it at module top)")
+
+    def test_full_payload_imports_cleanly(self):
+        rc, err = self._stage_and_import(self._parse_payload_files())
+        self.assertEqual(rc, 0, f"import autoresume failed under deploy payload:\n{err}")
+
+    def test_payload_without_remote_sync_fails(self):
+        # The pre-fix set: prove omitting remote_sync.py genuinely breaks import,
+        # so the positive test above is not vacuous.
+        reduced = [f for f in self._parse_payload_files() if f != "remote_sync.py"]
+        rc, err = self._stage_and_import(reduced)
+        self.assertNotEqual(rc, 0, "import unexpectedly succeeded without remote_sync.py")
+        self.assertIn("remote_sync", err,
+                      f"expected a ModuleNotFoundError for remote_sync, got:\n{err}")
 
 
 if __name__ == "__main__":

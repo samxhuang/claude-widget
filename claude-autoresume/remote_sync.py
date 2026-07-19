@@ -145,7 +145,14 @@ def _remote_ctl_command(host, subcommand, *extra):
 
     Note: deploy_remote.sh only ever installs to `~/.claude-autoresume`, so a
     host configured with a custom `state_dir` needs a matching manual deploy
-    there — this composition just makes the runtime calls address it correctly."""
+    there — this composition just makes the runtime calls address it correctly.
+
+    Same caveat for `host["python"]`: deploy_remote.sh installs the daemon under
+    whatever `command -v python3` resolves to on the remote, but this runtime
+    path invokes the interpreter named in the host's config `python` field. They
+    diverge only on a hand-edited config; if you set a custom `python` it must
+    point at the same (>= 3.9) interpreter deploy installed with, or these
+    remote_ctl calls run under a different Python than the daemon."""
     state_dir = _resolve_state_dir(host["state_dir"])
     script = f"{state_dir}/bin/remote_ctl.py"
     python = host["python"]

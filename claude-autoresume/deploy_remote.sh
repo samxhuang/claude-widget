@@ -52,9 +52,12 @@ SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
 SERVICE_TEMPLATE="$SCRIPT_DIR/autoresume.service.template"
 
-# The .py payload shipped to the remote. remote_sync.py is Mac-side only and is
-# deliberately NOT deployed.
-PAYLOAD_FILES=(autoresume.py cowork_resume.py usage_collector.py plan_fit.py autoresume_config.py remote_ctl.py)
+# The .py payload shipped to the remote. remote_sync.py MUST be included:
+# autoresume.py imports it unconditionally at module top (`import remote_sync`),
+# so omitting it makes the remote daemon crash with ModuleNotFoundError before
+# main() ever runs (systemd Restart=always then crash-loops every RestartSec).
+# On a remote with no config.json its RemoteSync worker just idles harmlessly.
+PAYLOAD_FILES=(autoresume.py cowork_resume.py usage_collector.py plan_fit.py autoresume_config.py remote_ctl.py remote_sync.py)
 
 # --- ssh/scp wrappers (never prompt) ---------------------------------------
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
@@ -127,6 +130,12 @@ rssh 'echo ok' >/dev/null 2>&1 || fail "connect: cannot ssh to $HOST (BatchMode 
 echo "ssh ok."
 
 # --- python preflight ------------------------------------------------------
+# NOTE: we resolve the remote interpreter via `command -v python3` and install
+# the daemon under it. The Mac-side remote_sync runtime, however, invokes the
+# interpreter named in each host's config "python" field (see
+# _remote_ctl_command in remote_sync.py). Those diverge only on a hand-edited
+# config; a custom "python" MUST match what deploy installed with here, or
+# remote_ctl runs under a different Python than the daemon.
 step python
 REMOTE_PY="$(rssh 'command -v python3 || true' 2>/dev/null | tr -d '\r')"
 if [ -z "$REMOTE_PY" ]; then
@@ -232,5 +241,33 @@ if ! printf '%s' "$DUMP" | python3 -c 'import sys,json; d=json.load(sys.stdin); 
   fail "verify: remote_ctl.py dump did not return parseable {v,now,state}"
 fi
 echo "verify ok: remote_ctl.py dump returned a valid state envelope."
+
+# The dump above is a STANDALONE remote_ctl.py invocation — it succeeds even if
+# the *daemon* is dead (Type=simple/nohup both report "started" before the
+# process crashes at import or in main()). So separately confirm the daemon is
+# actually staying up: a payload/import failure crash-loops under
+# Restart=always (RestartSec=5), which the dump check alone would never catch.
+# Wait past one RestartSec window before judging so a single restart shows up.
+echo "Confirming the daemon is staying up (waiting past one restart window) ..."
+sleep 7
+if [ "$USE_SYSTEMD" -eq 1 ]; then
+  # A crash-looping unit is "activating"/"failed", or "active" with NRestarts>0
+  # after our wait — a healthy one is "active" with NRestarts=0.
+  ACTIVE="$(rssh "${SYSTEMD_PREFIX}systemctl --user is-active claude-autoresume.service" 2>/dev/null | tr -d '\r')"
+  NRESTARTS="$(rssh "${SYSTEMD_PREFIX}systemctl --user show claude-autoresume.service -p NRestarts --value" 2>/dev/null | tr -d '\r')"
+  if [ "$ACTIVE" != "active" ] || { [ -n "$NRESTARTS" ] && [ "$NRESTARTS" != "0" ]; }; then
+    echo "daemon unhealthy: is-active=${ACTIVE:-unknown} NRestarts=${NRESTARTS:-unknown}"
+    fail "verify: remote daemon is not staying up (crash-loop?) — check remote ~/.claude-autoresume/daemon.log and launchd.err.log"
+  fi
+  echo "verify ok: daemon active and stable (NRestarts=${NRESTARTS:-0})."
+else
+  # nohup path: confirm the recorded pid is still alive after the wait.
+  DPID="$(rssh 'cat ~/.claude-autoresume/daemon.pid 2>/dev/null' 2>/dev/null | tr -d '\r')"
+  if [ -z "$DPID" ] || ! rssh "kill -0 $DPID" >/dev/null 2>&1; then
+    echo "daemon pid ${DPID:-unknown} not alive after start"
+    fail "verify: remote daemon exited after launch (crash?) — check remote ~/.claude-autoresume/daemon.log and launchd.err.log"
+  fi
+  echo "verify ok: daemon pid $DPID still alive."
+fi
 
 ok "$VERSION"

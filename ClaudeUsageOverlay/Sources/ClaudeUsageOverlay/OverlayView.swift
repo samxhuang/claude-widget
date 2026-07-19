@@ -1266,7 +1266,13 @@ struct OverlayView: View {
     @ViewBuilder
     private var planFitTabContent: some View {
         if let data = planFit.data {
-            let isApi = data.isApiAccount
+            // Finding 1: gate the API-vs-Max layout switch on the LIVE config
+            // account type (mirrors mainTabContent), not `data.isApiAccount`
+            // from plan_fit.json — the latter is regenerated at most hourly, so
+            // the Plan-fit tab used to lag the Main tab by seconds-to-an-hour
+            // after an account-type flip. Dollar numbers still come from `data`;
+            // config only picks which framing to show.
+            let isApi = configStore.config.isApiAccount
             VStack(alignment: .leading, spacing: 9) {
                 // Current-plan identity used to live in the section header's
                 // trailing badge; kept here (rather than dropped) since the

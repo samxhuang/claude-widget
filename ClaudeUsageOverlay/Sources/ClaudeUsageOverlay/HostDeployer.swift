@@ -77,6 +77,11 @@ final class HostDeployer: ObservableObject {
     @Published var deployedVersion: String?
 
     private var process: Process?
+    /// Held so `cancel()` can detach the readability handler on an early
+    /// teardown (sheet dismissed / app quit) — otherwise the closure keeps the
+    /// handle live and firing after the process is gone. `terminationHandler`
+    /// still nils its own captured copy on the normal exit path.
+    private var stdoutHandle: FileHandle?
     private var stdoutBuffer = Data()
     private var lineRemainder = ""
 
@@ -156,6 +161,7 @@ final class HostDeployer: ObservableObject {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
+        stdoutHandle = pipe.fileHandleForReading
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
@@ -165,6 +171,7 @@ final class HostDeployer: ObservableObject {
         proc.terminationHandler = { [weak self] p in
             DispatchQueue.main.async {
                 pipe.fileHandleForReading.readabilityHandler = nil
+                self?.stdoutHandle = nil
                 self?.finish(exitCode: p.terminationStatus, onComplete: onComplete)
             }
         }
@@ -183,6 +190,12 @@ final class HostDeployer: ObservableObject {
     /// Cancels an in-flight run (e.g. the sheet was dismissed). Safe to call
     /// when nothing is running.
     func cancel() {
+        // Finding 3: detach the readability handler here too — cancel() runs on
+        // the teardown paths (sheet .onDisappear, app quit) where
+        // terminationHandler (which we've just cleared) won't fire, so without
+        // this the closure would keep the read handle live past the process.
+        stdoutHandle?.readabilityHandler = nil
+        stdoutHandle = nil
         process?.terminationHandler = nil
         process?.interrupt()
         process = nil
