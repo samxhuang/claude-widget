@@ -55,8 +55,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // measured 80pt (sessions) / 19pt (chats) — both comfortably under
     // these, confirming the ScrollView-absorbs-overflow design is working
     // as intended rather than silently under-covering. Left unchanged.
-    private let sessionsExpandedExtra: CGFloat = 145
-    private let chatsExpandedExtra: CGFloat = 140
+    //
+    // Item 4 fix: derived from OverlayView.SectionLayout (the single source
+    // of truth also used by the `.frame(height:)` on each section's actual
+    // ScrollView) rather than restated as separate literals, so this sum can
+    // never silently drift out of sync with what OverlayView actually
+    // renders. `siblingSpacing` accounts for the VStack(spacing: 8) gap
+    // OverlayView.body inserts between the section's header row and its
+    // expanded content block. Evaluates to the same 145 / 140 as before.
+    private let sessionsExpandedExtra: CGFloat = SectionLayout.sessionsContentHeight + SectionLayout.siblingSpacing
+    private let chatsExpandedExtra: CGFloat = SectionLayout.chatsContentHeight + SectionLayout.siblingSpacing
     // Plan fit isn't wrapped in a ScrollView (unlike Sessions/Chats) since
     // its content is a fixed handful of lines, so this needs to cover the
     // full expanded height: up to 4 moving-average lines, the API-equivalent

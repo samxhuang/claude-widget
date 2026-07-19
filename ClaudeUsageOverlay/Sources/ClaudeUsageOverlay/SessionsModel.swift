@@ -11,6 +11,14 @@ struct SessionEntry: Identifiable, Equatable, Hashable {
     var projectDir: String
     var promptPreview: String
     var resetsAt: Date?      // nil while status == "active" (not rate-limited yet)
+    /// Item 5: the session's real last-activity time (daemon's
+    /// `last_activity_at` — transcript mtime for CLI sessions,
+    /// `lastActivityAt` for Cowork), as opposed to `last_seen`, which is
+    /// just poll-cycle bookkeeping. Drives the "<1m" / "17m" age shown in
+    /// place of the old, useless "active now" for sessions that haven't hit
+    /// a rate limit yet. nil for entries written by a daemon build that
+    /// predates this field.
+    var lastActivityAt: Date?
     var enabled: Bool
     var forceResume: Bool
     var handled: Bool
@@ -106,6 +114,7 @@ final class SessionsModel: ObservableObject {
                 if handled { continue } // only show live, actionable sessions in the widget
                 guard let projectDir = dict["project_dir"] as? String else { continue }
                 let resetsAtNum = dict["resets_at"] as? Double // nil while status == "active"
+                let lastActivityNum = dict["last_activity_at"] as? Double
                 entries.append(SessionEntry(
                     id: sessionId,
                     projectName: dict["project_name"] as? String ?? (projectDir as NSString).lastPathComponent,
@@ -113,6 +122,7 @@ final class SessionsModel: ObservableObject {
                     projectDir: projectDir,
                     promptPreview: dict["prompt_preview"] as? String ?? "",
                     resetsAt: resetsAtNum.map { Date(timeIntervalSince1970: $0) },
+                    lastActivityAt: lastActivityNum.map { Date(timeIntervalSince1970: $0) },
                     enabled: dict["enabled"] as? Bool ?? false,
                     forceResume: dict["force_resume"] as? Bool ?? false,
                     handled: handled,
@@ -196,14 +206,27 @@ final class SessionsModel: ObservableObject {
         }
     }
 
+    /// Countdown text for "waiting" (rate-limited) sessions only — callers
+    /// with an active session (resetsAt == nil) use activityAgeText below
+    /// instead. Kept as a `Date?`-taking function (rather than requiring a
+    /// non-optional Date) so call sites can pass `entry.resetsAt` directly.
     func resetText(for date: Date?) -> String {
         guard let date = date else { return "active now" }
         let interval = date.timeIntervalSince(now)
         if interval <= 0 { return "ready to resume" }
-        let totalMinutes = Int(interval) / 60
-        let hours = totalMinutes / 60
-        let minutes = totalMinutes % 60
-        if hours > 0 { return "resumes in \(hours)h \(minutes)m" }
-        return "resumes in \(minutes)m"
+        return "resumes in \(DurationFormat.compact(interval))"
+    }
+
+    /// Item 5: replaces the old, uninformative "active now" for sessions
+    /// that haven't hit a rate limit yet — shows how long since the
+    /// session's last real activity instead ("<1m", "17m", …), so rows
+    /// don't all read identically. Falls back to the previous "active now"
+    /// wording if lastActivityAt is missing (e.g. a state.json entry written
+    /// by a daemon build that predates this field).
+    func activityAgeText(_ lastActivityAt: Date?) -> String {
+        guard let last = lastActivityAt else { return "active now" }
+        let interval = max(0, now.timeIntervalSince(last))
+        if interval < 60 { return "<1m" }
+        return DurationFormat.compact(interval)
     }
 }

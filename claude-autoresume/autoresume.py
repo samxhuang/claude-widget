@@ -84,11 +84,24 @@ POLL_INTERVAL_SECONDS = 30
 USAGE_COLLECT_INTERVAL_SECONDS = 60 * 60
 PRICING_REFRESH_INTERVAL_SECONDS = 24 * 60 * 60
 # Only look at session files touched in the last N minutes when scanning at
-# all — no need to re-read your entire session history every cycle.
-SCAN_WINDOW_MINUTES = 20
+# all — no need to re-read your entire session history every cycle. Kept in
+# lockstep with ACTIVE_WINDOW_MINUTES below (>=): scan_sessions() only
+# explicitly re-evaluates (and prunes) a session while its mtime is inside
+# this window, so if this were smaller than ACTIVE_WINDOW_MINUTES, sessions
+# idle beyond this cutoff but still inside the active window would stop
+# being touched entirely and freeze in state (with a stale "active" status)
+# until the much looser ACTIVE_STALE_MINUTES safety net eventually caught
+# them, instead of aging out predictably at the active window's edge.
+SCAN_WINDOW_MINUTES = 30
 # A session touched more recently than this is considered "active" and shown
-# in the widget even though it hasn't hit a rate limit (yet).
-ACTIVE_WINDOW_MINUTES = 5
+# in the widget even though it hasn't hit a rate limit (yet). This is also
+# the *effective session-list lookback*: once a session goes quiet for longer
+# than this, scan_sessions() (see the `status is None` branch below) deletes
+# its state.json entry outright on the next poll cycle, so it drops out of
+# the widget's Sessions list. Raised from 5 to 30 minutes so recently-idle
+# sessions stay visible long enough to still be found/resumed from the
+# widget.
+ACTIVE_WINDOW_MINUTES = 30
 # Small buffer after the reported reset time before we actually fire, to
 # avoid racing the server's own clock.
 RESET_BUFFER_SECONDS = 30
@@ -376,6 +389,17 @@ def scan_sessions(state: dict) -> None:
                 existing["status"] = status
                 existing["resets_at"] = resets_at
                 existing["last_seen"] = now
+                # Item 5: `last_seen` above is poll-cycle bookkeeping — it
+                # gets bumped to `now` every ~30s cycle this session's file
+                # is still inside SCAN_WINDOW_MINUTES, regardless of whether
+                # it was actually touched again, so it's useless as an
+                # "activity age" signal (it would just always read "just
+                # now" until the entry ages out and disappears). `mtime`
+                # (from latest_activity_mtime() above, which also covers
+                # subagent transcripts) is the real last-write time — that's
+                # what the widget shows as "<1m" / "17m" / etc for active
+                # sessions.
+                existing["last_activity_at"] = mtime
                 if was_active and status == "waiting":
                     log(f"Session {session_id} in {project_dir} transitioned active -> rate-limited "
                         f"(enabled={existing.get('enabled', False)} preserved), resets at {datetime.fromtimestamp(resets_at)}")
@@ -389,6 +413,7 @@ def scan_sessions(state: dict) -> None:
                     "session_title": session_title,
                     "prompt_preview": find_prompt_preview(objs),
                     "resets_at": resets_at,
+                    "last_activity_at": mtime,
                     "detected_at": now,
                     "last_seen": now,
                     "enabled": False,       # <-- default OFF; only the widget can flip this
@@ -499,6 +524,15 @@ def scan_cowork_sessions(state: dict) -> None:
 
         title = meta.get("title") or "Cowork session"
 
+        # Item 5: same real-activity signal as the CLI branch above (mtime
+        # there, lastActivityAt here) — meta's lastActivityAt is epoch
+        # milliseconds, converted to seconds to match every other timestamp
+        # field in state.json. Falls back to `now` in the rare case the
+        # field was missing/unparsable (last_activity_ms == 0 above) rather
+        # than storing an epoch-0 timestamp that would render as a
+        # nonsensical multi-decade-old age.
+        last_activity_at = (last_activity_ms / 1000.0) if last_activity_ms else now
+
         if existing:
             existing["project_dir"] = str(session_dir)
             existing["project_name"] = "Cowork"
@@ -507,6 +541,7 @@ def scan_cowork_sessions(state: dict) -> None:
             existing["status"] = "active"
             existing["resets_at"] = None
             existing["last_seen"] = now
+            existing["last_activity_at"] = last_activity_at
         else:
             log(f"Detected active Cowork session {session_id} ({title!r}) — added to widget")
             state[session_id] = {
@@ -517,6 +552,7 @@ def scan_cowork_sessions(state: dict) -> None:
                 "resets_at": None,
                 "detected_at": now,
                 "last_seen": now,
+                "last_activity_at": last_activity_at,
                 "enabled": False,
                 "force_resume": False,
                 "handled": False,

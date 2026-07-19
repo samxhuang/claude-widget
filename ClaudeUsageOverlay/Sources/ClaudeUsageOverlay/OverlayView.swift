@@ -1,6 +1,34 @@
 import SwiftUI
 import AppKit
 
+/// Single source of truth for the fixed heights each collapsible section's
+/// expanded ScrollView content occupies. AppDelegate's currentPanelHeight()
+/// composes these (plus `siblingSpacing`, matching this file's outer
+/// `VStack(spacing: 8)` that every top-level row below is spliced into) into
+/// its `sessionsExpandedExtra`/`chatsExpandedExtra` constants, so the
+/// panel's reserved height and the SwiftUI frame that actually consumes it
+/// can never drift apart.
+///
+/// Item 4 fix: Sessions' and Chats' expanded ScrollViews used to be sized
+/// with `.frame(maxHeight:)`, which is flexible — SwiftUI treats a ScrollView
+/// like that as wanting to grow to fill whatever vertical slack is left over
+/// in the panel's (fixed, AppDelegate-driven) height once the fixed-size
+/// rows are accounted for. With Sessions expanded and Chats collapsed,
+/// Sessions' ScrollView was the *only* flexible child, so it absorbed all of
+/// that slack; expanding Chats added a second flexible child and changed how
+/// the same slack got split between the two, which is what made Sessions
+/// visibly grow/shrink purely as a side effect of Chats' state. Giving each
+/// ScrollView a true fixed `.frame(height:)` removes it from that shared
+/// slack pool entirely — its rendered height depends only on this constant,
+/// never on any sibling section's expanded/collapsed state.
+enum SectionLayout {
+    /// VStack sibling spacing shared by every top-level row spliced into
+    /// OverlayView.body's outer `VStack(spacing: 8)`.
+    static let siblingSpacing: CGFloat = 8
+    static let sessionsContentHeight: CGFloat = 137
+    static let chatsContentHeight: CGFloat = 132
+}
+
 struct OverlayView: View {
     @ObservedObject var model: UsageModel
     @ObservedObject var sessions: SessionsModel
@@ -130,6 +158,18 @@ struct OverlayView: View {
                     .padding(.vertical, 1)
                     .background(Capsule().fill(Color.white.opacity(0.18)))
             }
+            if sessions.sessionsExpanded && !sessions.sessions.isEmpty {
+                // Item 1: a column-header-style caption over the toggle
+                // column, so it's clear those switches don't just "show" a
+                // session — they ARM auto-resume for it (CLI resume-on-reset,
+                // or Cowork's dry-run UI-automation resume). Folded into the
+                // existing header row (rather than a dedicated row below it)
+                // so it doesn't add height that would need to be re-added to
+                // sessionsExpandedExtra/SectionLayout.
+                Text("auto-resume")
+                    .font(.system(size: 7.5, weight: .medium))
+                    .foregroundColor(.white.opacity(0.4))
+            }
         }
         .contentShape(Rectangle())
         .onTapGesture {
@@ -137,20 +177,25 @@ struct OverlayView: View {
         }
 
         if sessions.sessionsExpanded {
-            if sessions.sessions.isEmpty {
-                Text("No sessions")
-                    .font(.system(size: 9))
-                    .foregroundColor(.white.opacity(0.4))
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(sessions.sessions) { entry in
-                            sessionRow(entry)
+            // Item 4: fixed height (see SectionLayout's doc comment) instead
+            // of the old `.frame(maxHeight: 300)`, so this block's rendered
+            // height never depends on whether Recent chats is expanded.
+            Group {
+                if sessions.sessions.isEmpty {
+                    Text("No sessions")
+                        .font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.4))
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(sessions.sessions) { entry in
+                                sessionRow(entry)
+                            }
                         }
                     }
                 }
-                .frame(maxHeight: 300)
             }
+            .frame(height: SectionLayout.sessionsContentHeight, alignment: .top)
         }
     }
 
@@ -185,7 +230,13 @@ struct OverlayView: View {
 
             Spacer()
 
-            Text(sessions.resetText(for: entry.resetsAt))
+            // Item 5: waiting (rate-limited) sessions still show the reset
+            // countdown; active sessions show how long since their last
+            // real activity instead of the old, always-identical
+            // "active now".
+            Text(entry.resetsAt != nil
+                 ? sessions.resetText(for: entry.resetsAt)
+                 : sessions.activityAgeText(entry.lastActivityAt))
                 .font(.system(size: 8.5))
                 .foregroundColor(readyToResume(entry) ? .green : .white.opacity(0.45))
 
@@ -240,12 +291,24 @@ struct OverlayView: View {
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06)))
+        .background(RoundedRectangle(cornerRadius: 6).fill(rowTint(entry)))
     }
 
     private func readyToResume(_ entry: SessionEntry) -> Bool {
         guard let resetsAt = entry.resetsAt else { return false }
         return resetsAt <= sessions.now
+    }
+
+    /// Item 2: makes the armed/unarmed state readable at a glance without
+    /// having to read switch positions. Cowork rows keep their red/bolt
+    /// identity when armed (red = the more dangerous automation, since it's
+    /// live UI automation rather than a CLI relaunch); CLI rows get a green
+    /// tint when `enabled`. Off rows fall back to the original neutral tint.
+    private func rowTint(_ entry: SessionEntry) -> Color {
+        if entry.isCowork {
+            return entry.resumeArmed ? Color.red.opacity(0.15) : Color.white.opacity(0.06)
+        }
+        return entry.enabled ? Color.green.opacity(0.15) : Color.white.opacity(0.06)
     }
 
     // MARK: - Recent chats
@@ -279,31 +342,36 @@ struct OverlayView: View {
         }
 
         if chats.chatsExpanded {
-            if chats.isLoggedOut {
-                Text("Sign in needed")
-                    .font(.system(size: 9))
-                    .foregroundColor(.orange.opacity(0.85))
-            } else if chats.lastError != nil {
-                // Undocumented endpoint — on any failure (auth aside), show
-                // one muted line rather than surfacing raw error text or an
-                // empty-looking list that reads as "you have no chats".
-                Text("chats unavailable")
-                    .font(.system(size: 9))
-                    .foregroundColor(.white.opacity(0.4))
-            } else if chats.chats.isEmpty {
-                Text("No recent chats")
-                    .font(.system(size: 9))
-                    .foregroundColor(.white.opacity(0.4))
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(chats.chats.prefix(8)) { entry in
-                            chatRow(entry)
+            // Item 4: fixed height (see SectionLayout's doc comment) instead
+            // of the old `.frame(maxHeight: 260)`, so this block's rendered
+            // height never depends on whether Sessions is expanded.
+            Group {
+                if chats.isLoggedOut {
+                    Text("Sign in needed")
+                        .font(.system(size: 9))
+                        .foregroundColor(.orange.opacity(0.85))
+                } else if chats.lastError != nil {
+                    // Undocumented endpoint — on any failure (auth aside), show
+                    // one muted line rather than surfacing raw error text or an
+                    // empty-looking list that reads as "you have no chats".
+                    Text("chats unavailable")
+                        .font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.4))
+                } else if chats.chats.isEmpty {
+                    Text("No recent chats")
+                        .font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.4))
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(chats.chats.prefix(8)) { entry in
+                                chatRow(entry)
+                            }
                         }
                     }
                 }
-                .frame(maxHeight: 260)
             }
+            .frame(height: SectionLayout.chatsContentHeight, alignment: .top)
         }
     }
 

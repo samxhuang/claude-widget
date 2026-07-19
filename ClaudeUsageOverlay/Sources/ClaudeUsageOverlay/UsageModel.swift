@@ -53,13 +53,7 @@ final class UsageModel: ObservableObject {
         guard let date = date else { return "—" }
         let interval = date.timeIntervalSince(now)
         if interval <= 0 { return "resets soon" }
-        let totalMinutes = Int(interval) / 60
-        let hours = totalMinutes / 60
-        let minutes = totalMinutes % 60
-        if hours > 0 {
-            return "resets in \(hours)h \(minutes)m"
-        }
-        return "resets in \(minutes)m"
+        return "resets in \(DurationFormat.compact(interval))"
     }
 
     var lastUpdatedText: String {
