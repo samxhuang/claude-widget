@@ -670,5 +670,178 @@ class BudgetBlockTests(TempStateDirTestCase):
         self.assertEqual(m["period_start"], "2026-07-01T00:00:00+00:00")
 
 
+# ---------------------------------------------------------------------------
+# Remote usage merge (WS-6)
+# ---------------------------------------------------------------------------
+
+class RemoteUsageMergeTests(TempStateDirTestCase):
+    # opus cost per hour = input_tok * 5 / 1e6, priced by the bundled chain.
+    def _tok_for(self, cost_usd: float) -> int:
+        return int(cost_usd * 1_000_000 / 5)
+
+    def _local_hours(self, hour_key: str, cost_usd: float) -> dict:
+        return {hour_key: {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(cost_usd), "output": 0}}}}
+
+    def _remote_store(self, hours: dict) -> dict:
+        return {"version": 1, "hours": hours, "progress": {}}
+
+    def _write_remote(self, host: str, hours: dict) -> Path:
+        path = self.usage_dir / "remote" / f"{host}_tokens_hourly.json"
+        _write_json(path, self._remote_store(hours))
+        return path
+
+    def _remote_host_cfg(self, name, enabled=True, collect_usage=True):
+        return {"name": name, "ssh": f"sam@{name}", "enabled": enabled, "collect_usage": collect_usage}
+
+    def _compute(self, local_hours, remote_hosts=None, budget=None, now=None):
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly(local_hours))
+        cfg = _config(budget=budget)
+        if remote_hosts is not None:
+            cfg["remote_hosts"] = remote_hosts
+        _write_json(self.state_dir / "config.json", cfg)
+        return plan_fit.compute(self.state_dir, now or datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
+
+    def test_two_host_summed_costs_and_at_host_surfaces(self):
+        # Local $10, hostA $20, hostB $30, all in the same July hour bucket.
+        local = self._local_hours("2026-07-14T09", 10.0)
+        self._write_remote("hosta", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(20.0), "output": 0}}}})
+        self._write_remote("hostb", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(30.0), "output": 0}}}})
+        hosts = [self._remote_host_cfg("hosta"), self._remote_host_cfg("hostb")]
+        result = self._compute(local, remote_hosts=hosts,
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        # Total cost = 10 + 20 + 30 = 60, summed across machines.
+        self.assertAlmostEqual(result["totals"]["all_models_cost_usd"], 60.0, places=2)
+        # Budget spend includes the remote spend.
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 60.0, places=2)
+        # Per-host attribution visible via @host surface labels in the merged hours.
+        hourly = result["cost_series"]["hourly"]
+        self.assertAlmostEqual(hourly["2026-07-14T09:00:00+00:00"], 60.0, places=2)
+        # Assumptions name each merged host with its store's fetch time.
+        self.assertTrue(any("Remote host hosta usage last fetched" in a for a in result["assumptions"]))
+        self.assertTrue(any("Remote host hostb usage last fetched" in a for a in result["assumptions"]))
+        # Model-level total aggregates across all three machines' opus usage.
+        self.assertAlmostEqual(result["totals"]["by_model"]["claude-opus-4-5-x"]["cost_usd"], 60.0, places=2)
+
+    def test_at_host_surface_labels_present_in_merged_hours(self):
+        local = self._local_hours("2026-07-14T09", 10.0)
+        self._write_remote("devbox", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(5.0), "output": 0}}}})
+        stores = plan_fit.load_remote_tokens(self.usage_dir)
+        merged = plan_fit._merge_remote_hours(_tokens_hourly(local)["hours"], stores)
+        surfaces = merged["2026-07-14T09"]
+        self.assertIn("code_cli", surfaces)           # local surface preserved
+        self.assertIn("code_cli@devbox", surfaces)    # remote surface renamed with @host
+
+    def test_includes_remote_true_when_merged(self):
+        local = self._local_hours("2026-07-14T09", 10.0)
+        self._write_remote("hosta", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(20.0), "output": 0}}}})
+        result = self._compute(local, remote_hosts=[self._remote_host_cfg("hosta")],
+                               budget={"weekly_usd": 100.0, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        self.assertTrue(result["budget"]["weekly"]["includes_remote"])
+        self.assertTrue(result["budget"]["monthly"]["includes_remote"])
+
+    def test_includes_remote_false_without_remote_hosts(self):
+        local = self._local_hours("2026-07-14T09", 10.0)
+        result = self._compute(local, remote_hosts=None,
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        self.assertFalse(result["budget"]["monthly"]["includes_remote"])
+        # No remote assumptions/warnings when there are no remote hosts at all.
+        self.assertFalse(any("Remote host" in a for a in result["assumptions"]))
+        self.assertFalse(any("remote usage store" in w for w in result["warnings"]))
+
+    def test_includes_remote_false_when_configured_host_store_missing(self):
+        # Host is configured to collect usage but no store file exists yet.
+        local = self._local_hours("2026-07-14T09", 10.0)
+        result = self._compute(local, remote_hosts=[self._remote_host_cfg("ghost")],
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        self.assertFalse(result["budget"]["monthly"]["includes_remote"])
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 10.0, places=2)
+        self.assertTrue(any("ghost" in w and "no usage store" in w for w in result["warnings"]))
+
+    def test_stale_store_warns_but_still_merges(self):
+        local = self._local_hours("2026-07-14T09", 10.0)
+        path = self._write_remote("hosta", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(20.0), "output": 0}}}})
+        # Backdate the store's mtime to 5 hours ago (> 3h stale threshold).
+        import os
+        old = datetime(2026, 7, 16, 7, 0, tzinfo=timezone.utc).timestamp()
+        os.utime(path, (old, old))
+        result = self._compute(local, remote_hosts=[self._remote_host_cfg("hosta")],
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
+        # Warned about staleness…
+        self.assertTrue(any("hosta" in w and "stale" in w for w in result["warnings"]))
+        # …but still merged (spend includes the stale host).
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 30.0, places=2)
+        self.assertTrue(result["budget"]["monthly"]["includes_remote"])
+
+    def test_orphan_file_ignored_with_warning(self):
+        # A store exists on disk but the host is NOT enabled+collect_usage.
+        local = self._local_hours("2026-07-14T09", 10.0)
+        self._write_remote("oldhost", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(99.0), "output": 0}}}})
+        # Case 1: host absent from config entirely.
+        result = self._compute(local, remote_hosts=[],
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 10.0, places=2)  # orphan NOT merged
+        self.assertFalse(result["budget"]["monthly"]["includes_remote"])
+        self.assertTrue(any("orphan" in w and "oldhost" in w for w in result["warnings"]))
+
+    def test_disabled_host_store_not_merged(self):
+        # Leftover file for a host that is present in config but disabled.
+        local = self._local_hours("2026-07-14T09", 10.0)
+        self._write_remote("devbox", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(99.0), "output": 0}}}})
+        result = self._compute(local, remote_hosts=[self._remote_host_cfg("devbox", enabled=False)],
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 10.0, places=2)
+        self.assertFalse(result["budget"]["monthly"]["includes_remote"])
+        self.assertTrue(any("orphan" in w and "devbox" in w for w in result["warnings"]))
+
+    def test_collect_usage_false_host_store_not_merged(self):
+        local = self._local_hours("2026-07-14T09", 10.0)
+        self._write_remote("devbox", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(99.0), "output": 0}}}})
+        result = self._compute(local, remote_hosts=[self._remote_host_cfg("devbox", collect_usage=False)],
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 10.0, places=2)
+        self.assertTrue(any("orphan" in w for w in result["warnings"]))
+
+    def test_remote_cowork_surface_renamed_per_host(self):
+        # Remote Macs can carry Cowork usage; it must rename cowork@<host>.
+        local = self._local_hours("2026-07-14T09", 10.0)
+        self._write_remote("macmini", {"2026-07-14T09": {"cowork": {"claude-opus-4-5-x": {"input": self._tok_for(7.0), "output": 0}}}})
+        result = self._compute(local, remote_hosts=[self._remote_host_cfg("macmini")],
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 17.0, places=2)
+        stores = plan_fit.load_remote_tokens(self.usage_dir)
+        merged = plan_fit._merge_remote_hours(_tokens_hourly(local)["hours"], stores)
+        self.assertIn("cowork@macmini", merged["2026-07-14T09"])
+
+    def test_load_remote_tokens_skips_malformed_and_missing_dir(self):
+        # No remote/ dir at all.
+        self.assertEqual(plan_fit.load_remote_tokens(self.usage_dir), {})
+        # Malformed file is skipped, well-formed one is loaded.
+        (self.usage_dir / "remote").mkdir(parents=True, exist_ok=True)
+        (self.usage_dir / "remote" / "bad_tokens_hourly.json").write_text("{not json")
+        self._write_remote("good", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": 1, "output": 0}}}})
+        stores = plan_fit.load_remote_tokens(self.usage_dir)
+        self.assertIn("good", stores)
+        self.assertNotIn("bad", stores)
+
+    def test_remote_only_spend_when_no_local_usage(self):
+        # No local usage at all; a remote host carries all the spend.
+        self._write_remote("hosta", {"2026-07-14T09": {"code_cli": {"claude-opus-4-5-x": {"input": self._tok_for(25.0), "output": 0}}}})
+        result = self._compute({}, remote_hosts=[self._remote_host_cfg("hosta")],
+                               budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                       "week_start": "monday", "timezone": "utc"})
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 25.0, places=2)
+        self.assertTrue(result["budget"]["monthly"]["includes_remote"])
+
+
 if __name__ == "__main__":
     unittest.main()

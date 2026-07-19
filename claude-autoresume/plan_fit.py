@@ -75,6 +75,17 @@ MONTHLY_RUN_RATE_DAYS = 30.44
 # Budget (API-account dollar limits) — see _budget_block / autoresume_config C1.
 BUDGET_PROJECTION_MIN_ELAPSED_SECONDS = 3600  # suppress linear projection in a period's first hour
 
+# Remote usage merge (WS-6) — remote Claude Code bills the same API account, so
+# its token usage folds into the same cost/budget math. remote_sync.py writes
+# each collect_usage host's hourly store to usage/remote/<host>_tokens_hourly.json
+# (same schema as the local tokens_hourly.json). See load_remote_tokens /
+# _merge_remote_hours below.
+REMOTE_STORE_SUFFIX = "_tokens_hourly.json"
+REMOTE_USAGE_STALE_SECONDS = 3 * 3600  # warn if a to-be-merged host's store is older than this
+# Summable per-(hour, surface, model) usage fields — mirrors usage_collector's
+# USAGE_FIELDS (plan_fit stays independent of that module; it only reads stores).
+_USAGE_SUM_KEYS = ("input", "output", "cache_write", "cache_read", "web_searches", "messages")
+
 # ---------------------------------------------------------------------------
 # Pricing — resolution chain: override > fetched cache > bundled defaults
 # ---------------------------------------------------------------------------
@@ -363,6 +374,177 @@ def load_tokens_hourly(usage_dir: Path) -> dict:
         return {}
     hours = raw.get("hours")
     return hours if isinstance(hours, dict) else {}
+
+
+def load_remote_tokens(usage_dir: Path) -> dict[str, dict]:
+    """Reads every usage/remote/<host>_tokens_hourly.json store (written by
+    remote_sync.fetch_host_usage, same schema as the local tokens_hourly.json).
+
+    Returns {host_name: {"hours": {...}, "mtime": float}} for each parseable
+    file, host_name derived from the filename by stripping the store suffix.
+    Missing remote/ dir, unreadable/malformed files, and files without an
+    "hours" dict are silently skipped — no config gating happens here; the
+    caller (compute) decides which hosts to actually merge vs. treat as orphans.
+    """
+    remote_dir = usage_dir / "remote"
+    result: dict[str, dict] = {}
+    if not remote_dir.is_dir():
+        return result
+    for path in sorted(remote_dir.glob("*" + REMOTE_STORE_SUFFIX)):
+        name = path.name[: -len(REMOTE_STORE_SUFFIX)]
+        if not name:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+            raw = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        hours = raw.get("hours")
+        if not isinstance(hours, dict):
+            continue
+        result[name] = {"hours": hours, "mtime": mtime}
+    return result
+
+
+def _add_usage(dst: dict, src: dict) -> None:
+    """Sum the numeric usage fields of `src` into `dst` in place."""
+    for k in _USAGE_SUM_KEYS:
+        v = src.get(k)
+        if isinstance(v, (int, float)):
+            dst[k] = dst.get(k, 0) + v
+
+
+def _copy_hours(hours: dict) -> dict:
+    """Deep copy of an hours store's {hour: {surface: {model: usage}}} shape,
+    keeping only well-formed nested dicts and fresh (summable) usage dicts."""
+    out: dict = {}
+    for hour_key, surfaces in hours.items():
+        if not isinstance(surfaces, dict):
+            continue
+        out_surfaces: dict = {}
+        for surface, models in surfaces.items():
+            if not isinstance(models, dict):
+                continue
+            out_models: dict = {}
+            for model_id, usage in models.items():
+                if isinstance(usage, dict):
+                    fresh: dict = {}
+                    _add_usage(fresh, usage)
+                    out_models[model_id] = fresh
+            out_surfaces[surface] = out_models
+        out[hour_key] = out_surfaces
+    return out
+
+
+def _merge_remote_hours(local_hours: dict, remote_by_host: dict[str, dict]) -> dict:
+    """Fold each remote host's token hours into a fresh copy of `local_hours`.
+
+    Every remote surface is renamed "<surface>@<host>" (e.g. "code_cli@devbox",
+    or "cowork@devbox" if a remote Mac ever carries Cowork usage), so per-host
+    attribution stays visible in the merged hours dict and there is zero
+    double-count risk — different machines' transcripts never share a surface
+    label. Usage fields are summed per (hour, surface, model); after the rename
+    the sum is only ever exercised if a single host store repeats a bucket.
+    Inputs are not mutated.
+    """
+    merged = _copy_hours(local_hours)
+    for host_name, store in remote_by_host.items():
+        remote_hours = store.get("hours")
+        if not isinstance(remote_hours, dict):
+            continue
+        for hour_key, surfaces in remote_hours.items():
+            if not isinstance(surfaces, dict):
+                continue
+            dst_surfaces = merged.setdefault(hour_key, {})
+            for surface, models in surfaces.items():
+                if not isinstance(models, dict):
+                    continue
+                labelled = f"{surface}@{host_name}"
+                dst_models = dst_surfaces.setdefault(labelled, {})
+                for model_id, usage in models.items():
+                    if not isinstance(usage, dict):
+                        continue
+                    _add_usage(dst_models.setdefault(model_id, {}), usage)
+    return merged
+
+
+def _merge_remote_usage(usage_dir: Path, config: dict, local_hours: dict,
+                        now: datetime, warnings: list, assumptions: list) -> tuple[dict, bool]:
+    """Config-gated remote-usage merge orchestrator (WS-6).
+
+    Merge gating (documented decision): only hosts *currently* configured with
+    both `enabled` and `collect_usage` (default True) are folded in. A leftover
+    store file for a host that is disabled, has collect_usage off, or is no
+    longer in config at all is an *orphan* — never merged (so a stale file from
+    a removed/disabled host can't silently distort spend), and flagged with a
+    warning. A configured-to-merge host whose store is missing, or older than
+    REMOTE_USAGE_STALE_SECONDS, also warns (the stale store is still merged as
+    the best available data). Each merged host contributes an assumptions line
+    naming it and its store's last-fetch time.
+
+    Returns (merged_hours, includes_remote). includes_remote is True iff at
+    least one remote store was actually merged. When nothing merges, returns the
+    original local_hours unchanged so default-config output stays byte-compatible.
+    """
+    stores = load_remote_tokens(usage_dir)  # {host: {"hours","mtime"}}
+
+    merge_names: list[str] = []
+    for h in config.get("remote_hosts", []) or []:
+        if not isinstance(h, dict):
+            continue
+        name = h.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if not h.get("enabled"):
+            continue
+        if not h.get("collect_usage", True):
+            continue
+        merge_names.append(name)
+
+    merge_set = set(merge_names)
+    to_merge: dict[str, dict] = {}
+    now_epoch = now.timestamp()
+
+    for name in merge_names:
+        store = stores.get(name)
+        if store is None:
+            warnings.append(
+                f"Remote host {name!r} has collect_usage enabled but no usage store "
+                f"({name}{REMOTE_STORE_SUFFIX} under usage/remote/) has synced yet — "
+                "its spend is not included in cost/budget figures."
+            )
+            continue
+        to_merge[name] = store
+        age = now_epoch - store["mtime"]
+        if age > REMOTE_USAGE_STALE_SECONDS:
+            fetched = datetime.fromtimestamp(store["mtime"], tz=timezone.utc).isoformat()
+            warnings.append(
+                f"Remote host {name!r} usage store is stale (last fetched {fetched}, "
+                f"{age / 3600.0:.1f}h ago); its spend may be undercounted."
+            )
+
+    # Orphan store files: on disk but not a currently-merged host.
+    for name in sorted(stores):
+        if name not in merge_set:
+            warnings.append(
+                f"Ignoring orphan remote usage store {name}{REMOTE_STORE_SUFFIX} — "
+                f"host {name!r} is not a currently enabled collect_usage remote host; "
+                "its spend is excluded from cost/budget figures."
+            )
+
+    if not to_merge:
+        return local_hours, False
+
+    for name in sorted(to_merge):
+        fetched = datetime.fromtimestamp(to_merge[name]["mtime"], tz=timezone.utc).isoformat()
+        assumptions.append(
+            f"Remote host {name} usage last fetched {fetched}, folded into cost/budget "
+            f"as surface code_cli@{name} (per-host attribution; no cross-machine double-count)."
+        )
+
+    return _merge_remote_hours(local_hours, to_merge), True
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -770,14 +952,15 @@ def _budget_period_bounds(now: datetime, kind: str, week_start: str, tzname: str
 
 
 def _budget_window(hourly_cost: dict, now: datetime, limit_usd, kind: str,
-                   week_start: str, tzname: str) -> dict | None:
+                   week_start: str, tzname: str, includes_remote: bool = False) -> dict | None:
     """One budget window (C2) or None when its limit is unconfigured.
 
     Spend = sum of the already-priced `hourly_cost` UTC hour buckets falling
     within the current calendar period (downstream of the pricing chain — this
     never re-resolves rates). Projection is linear (spent / elapsed fraction),
     suppressed in the period's first hour where too little has elapsed to
-    extrapolate. `includes_remote` is False until the remote-token merge lands.
+    extrapolate. `includes_remote` is True when at least one remote host's usage
+    store was folded into the cost series (WS-6), False otherwise.
     """
     if limit_usd is None:
         return None
@@ -807,20 +990,24 @@ def _budget_window(hourly_cost: dict, now: datetime, limit_usd, kind: str,
         "projected_pct": projected_pct,
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
-        "includes_remote": False,
+        "includes_remote": bool(includes_remote),
     }
 
 
-def _budget_block(hourly_cost: dict, now: datetime, config: dict) -> dict:
+def _budget_block(hourly_cost: dict, now: datetime, config: dict,
+                  includes_remote: bool = False) -> dict:
     """The `budget` top-level block (C2): weekly/monthly windows, each null
     when its limit is unconfigured. Emitted for every account type (the widget
-    decides whether to surface it)."""
+    decides whether to surface it). `includes_remote` flags whether the
+    `hourly_cost` it sums already folds in remote hosts' usage (WS-6)."""
     budget = config.get("budget", {}) or {}
     week_start = budget.get("week_start", "monday")
     tzname = budget.get("timezone", "local")
     return {
-        "weekly": _budget_window(hourly_cost, now, budget.get("weekly_usd"), "weekly", week_start, tzname),
-        "monthly": _budget_window(hourly_cost, now, budget.get("monthly_usd"), "monthly", week_start, tzname),
+        "weekly": _budget_window(hourly_cost, now, budget.get("weekly_usd"),
+                                 "weekly", week_start, tzname, includes_remote),
+        "monthly": _budget_window(hourly_cost, now, budget.get("monthly_usd"),
+                                  "monthly", week_start, tzname, includes_remote),
     }
 
 
@@ -858,6 +1045,12 @@ def compute(state_dir: Path, now: datetime) -> dict:
     hours = load_tokens_hourly(usage_dir)
     if not hours:
         warnings.append("tokens_hourly.json is missing, empty, or unreadable — cost figures are unavailable.")
+
+    # Remote usage merge (WS-6): fold each enabled+collect_usage host's token
+    # store into the hourly totals so cost/budget math covers the whole (shared)
+    # API account. Surfaces are renamed code_cli@<host> during the merge, so the
+    # per-host cost stays attributable and there is no cross-machine double-count.
+    hours, includes_remote = _merge_remote_usage(usage_dir, config, hours, now, warnings, assumptions)
 
     override = load_pricing_override(usage_dir)
     cache = load_pricing_cache(usage_dir)
@@ -950,7 +1143,7 @@ def compute(state_dir: Path, now: datetime) -> dict:
         }
     all_models_cost_usd = round(sum(t["cost_usd"] for t in totals_by_model.values()), 2)
 
-    budget = _budget_block(hourly_cost, now, config)
+    budget = _budget_block(hourly_cost, now, config, includes_remote)
     # Only extend assumptions when a budget is actually configured, so the
     # default-config output stays byte-compatible with the pre-budget file.
     if budget["weekly"] is not None or budget["monthly"] is not None:
