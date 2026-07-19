@@ -72,6 +72,8 @@ import plan_fit        # Usage analytics: plan-fit computation + pricing refresh
 import usage_collector  # Usage analytics: token collection from transcripts + snapshot compaction
 import cowork_resume  # Track 1: Cowork resume automation scaffolding — see that module's
                        # docstring. Hardcoded dry-run; see DRY_RUN there.
+import autoresume_config  # Feature 2: config.json (account/budget/remote_hosts) reader
+import remote_sync    # Feature 2 "Shape C": fetch+merge remote hosts' state over ssh
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1098,6 +1100,13 @@ def merge_cowork_records(state: dict, records: dict, now: float) -> None:
 def resume_due_sessions(state: dict) -> None:
     now = time.time()
     for session_id, entry in state.items():
+        # CRITICAL (Feature 2): a remote session's auto-resume fires natively on
+        # its own host (full classification fidelity there). The Mac must NEVER
+        # run `claude --resume` for a remote entry — its transcript/session id
+        # don't even exist locally. remote_sync relays the widget's toggles to
+        # the remote daemon, which does the resume.
+        if "host" in entry:
+            continue
         if entry.get("handled"):
             continue
         if entry.get("status") != "waiting" or entry.get("resets_at") is None:
@@ -1200,6 +1209,14 @@ def prune_deleted_sessions(state: dict) -> None:
 
     stale = []
     for session_id, entry in state.items():
+        # Remote entries (Feature 2) are keyed "<host>::<sid>" and their backing
+        # transcript lives on the remote host, never in local PROJECTS_DIR — so
+        # their stem is never in existing_jsonl_stems. Without this guard the
+        # CLI branch below would flag EVERY remote entry stale and delete it on
+        # every cycle. Remote lifecycle (including deletion) is owned by
+        # remote_sync's dump-driven merge, not this local-disk check.
+        if "host" in entry:
+            continue
         if entry.get("handled"):
             continue
         # Prefer the explicit "kind" sentinel the daemon now writes on every
@@ -1228,6 +1245,12 @@ def prune_old_entries(state: dict) -> None:
 
     stale = []
     for sid, e in state.items():
+        # Remote entries (Feature 2): their lifecycle (freshness, staleness,
+        # 24h-unreachable drop) is owned by remote_sync, not this local-clock
+        # pruner. Skip so a remote session that's simply idle on its host isn't
+        # aged out from under the sync thread.
+        if "host" in e:
+            continue
         if e.get("handled") and (e.get("handled_at") or 0) < handled_cutoff:
             stale.append(sid)
             continue
@@ -1253,18 +1276,30 @@ def _usage_analytics_worker() -> None:
     # store immediately instead of waiting a full interval.
     last_usage_run = 0.0
     last_pricing_run = 0.0
+    # Feature 2: on a REMOTE host (deploy_remote.sh sets AUTORESUME_REMOTE=1 in
+    # the service env), this daemon only needs to COLLECT tokens — the Mac
+    # daemon fetches those via the usage lane and owns plan_fit.json + pricing
+    # for the whole fleet. So skip the network pricing refresh and the plan_fit
+    # write here, but keep collect()/compact() so the remote's tokens are still
+    # gathered for the budget bar.
+    remote_mode = os.environ.get("AUTORESUME_REMOTE") == "1"
     while True:
         try:
             now_mono = time.time()
-            if now_mono - last_pricing_run >= PRICING_REFRESH_INTERVAL_SECONDS:
+            if (not remote_mode
+                    and now_mono - last_pricing_run >= PRICING_REFRESH_INTERVAL_SECONDS):
                 last_pricing_run = now_mono
                 plan_fit.refresh_pricing(STATE_DIR)
             if now_mono - last_usage_run >= USAGE_COLLECT_INTERVAL_SECONDS:
                 last_usage_run = now_mono
                 usage_collector.collect(STATE_DIR, quiet=True)
                 usage_collector.compact(STATE_DIR, quiet=True)
-                plan_fit.write_plan_fit(STATE_DIR, datetime.now().astimezone())
-                log("usage analytics: collected, compacted, plan_fit.json refreshed")
+                if remote_mode:
+                    log("usage analytics: collected, compacted "
+                        "(AUTORESUME_REMOTE=1 — plan_fit/pricing skipped)")
+                else:
+                    plan_fit.write_plan_fit(STATE_DIR, datetime.now().astimezone())
+                    log("usage analytics: collected, compacted, plan_fit.json refreshed")
         except Exception as e:
             log(f"ERROR in usage analytics cycle: {e!r}")
         time.sleep(POLL_INTERVAL_SECONDS)
@@ -1279,6 +1314,20 @@ def main() -> None:
     # can't stall the session poll below (P6). daemon=True so it dies with the
     # process; it holds no state.json lock, so nothing to clean up on exit.
     threading.Thread(target=_usage_analytics_worker, name="usage-analytics", daemon=True).start()
+
+    # Feature 2 "Shape C": if config.json declares any enabled remote host, run
+    # the remote-sync thread (same daemon-thread pattern — dies with the
+    # process, takes the StateLock only for its own merges/write-backs). Not
+    # started at all when there are no enabled hosts, so a default-config Mac is
+    # byte-for-byte unchanged. Hosts added/removed later while the thread is
+    # running are picked up via config mtime; going from zero to some hosts is
+    # the one case that needs a daemon restart (which the widget's deploy flow
+    # triggers anyway).
+    if remote_sync.has_enabled_hosts(STATE_DIR):
+        threading.Thread(target=remote_sync._remote_sync_worker,
+                         name="remote-sync", daemon=True).start()
+    else:
+        log("remote-sync: no enabled remote hosts in config — thread not started")
 
     while True:
         try:
