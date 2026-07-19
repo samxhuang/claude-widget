@@ -85,6 +85,16 @@ struct OverlayView: View {
     /// hunting for the panel later. Reopen via the menu-bar gauge icon →
     /// "Show Overlay" (AppDelegate keeps that menu item's checkmark in sync).
     var onHide: () -> Void = {}
+    /// WS-2: opens the Settings window (gear button on the title row, and the
+    /// "No budget set — open Settings" prompt on an API account's main tab).
+    var onOpenSettings: () -> Void = {}
+    /// WS-2: resolves a remote session's config host NAME (state.json's
+    /// `host`, e.g. "devbox") to its ssh target (config's `ssh`, e.g.
+    /// "sam@devbox" or an ~/.ssh/config alias) so openLocalSession can build
+    /// the exact `ssh -t <target> …` command. Falls back to the host name
+    /// itself when unresolved (works when name == an ssh alias). Wired from
+    /// AppDelegate's ConfigStore.
+    var resolveHostSSH: (String) -> String? = { _ in nil }
 
     /// Sort-deadband state (see combinedSessionRows): an ordered list of row
     /// ids from the last computed arrangement, used as the tiebreak below.
@@ -155,6 +165,19 @@ struct OverlayView: View {
                 .frame(minHeight: 19)
                 .background(MoveHandleRepresentable(onDragChanged: onMoveDragChanged, onDragEnded: onMoveDragEnded))
                 tabSwitch
+                // WS-2: Settings gear — also a sibling of tabSwitch (outside
+                // the MoveHandle scope) so its click opens Settings rather
+                // than starting a window drag. Pairs with the status-item
+                // menu's "Settings…" entry.
+                Button(action: onOpenSettings) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.white.opacity(0.45))
+                        .frame(width: 14, height: 14)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open Settings — account type, budget, and remote hosts")
                 // Hide (not quit): sits OUTSIDE the MoveHandle background's
                 // scope (a sibling of tabSwitch, same as the pills) so its
                 // click can't start a window drag.
@@ -451,11 +474,21 @@ struct OverlayView: View {
 
     @ViewBuilder
     private var mainTabContent: some View {
-        row(label: "Session (5h)", percent: model.sessionPercent, estimatedPercent: model.sessionEstimatedPercent, resetText: model.resetText(for: model.sessionResetsAt))
-        // Item 2: the standalone "updated Xm" line is gone — folded onto the
-        // Weekly row's reset caption line instead (right-aligned, italic),
-        // saving the row entirely.
-        row(label: "Weekly", percent: model.weeklyPercent, estimatedPercent: model.weeklyEstimatedPercent, resetText: model.resetText(for: model.weeklyResetsAt), trailingCaption: model.lastUpdatedText)
+        // WS-2: on an API-billed account the Max session/weekly percentages
+        // are meaningless — swap in 1-2 dollar budget bars (reusing row(...)
+        // so the projection dot / red-pinning / 70/90 thresholds all carry
+        // over), or a "No budget set" prompt when none is configured. A
+        // missing/`"max"` account block (old daemon or Max plan) falls
+        // through to exactly today's two percentage rows.
+        if let data = planFit.data, data.isApiAccount {
+            apiBudgetSection(data)
+        } else {
+            row(label: "Session (5h)", percent: model.sessionPercent, estimatedPercent: model.sessionEstimatedPercent, resetText: model.resetText(for: model.sessionResetsAt))
+            // Item 2: the standalone "updated Xm" line is gone — folded onto the
+            // Weekly row's reset caption line instead (right-aligned, italic),
+            // saving the row entirely.
+            row(label: "Weekly", percent: model.weeklyPercent, estimatedPercent: model.weeklyEstimatedPercent, resetText: model.resetText(for: model.weeklyResetsAt), trailingCaption: model.lastUpdatedText)
+        }
 
         Divider().background(Color.white.opacity(0.15))
 
@@ -466,6 +499,53 @@ struct OverlayView: View {
         // sorted into the idle/done bucket like a finished session. See
         // combinedSessionRows/chatRow for the row-level details.
         sessionsSection
+    }
+
+    // MARK: - API budget bars (WS-2)
+
+    /// API accounts: 1-2 dollar budget bars in place of the Session/Weekly
+    /// percentage rows, or a muted "No budget set" prompt that opens Settings
+    /// when neither period is configured. `UsageFetcher` keeps running behind
+    /// this regardless (it still feeds SnapshotLogger/the Graph tab) — only
+    /// the display of its percentages is suppressed here.
+    @ViewBuilder
+    private func apiBudgetSection(_ data: PlanFitData) -> some View {
+        if data.hasBudget {
+            if let w = data.budgetWeekly, w.limitUsd != nil {
+                budgetRow(label: "Weekly budget", window: w)
+            }
+            if let m = data.budgetMonthly, m.limitUsd != nil {
+                budgetRow(label: "Monthly budget", window: m)
+            }
+        } else {
+            Button(action: onOpenSettings) {
+                HStack(spacing: 4) {
+                    Image(systemName: "dollarsign.circle")
+                        .font(.system(size: 10))
+                    Text("No budget set — open Settings")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .foregroundColor(.white.opacity(0.5))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Set a weekly or monthly dollar budget in Settings to show budget bars here")
+        }
+    }
+
+    /// One dollar budget bar built on the shared row(...): pct drives the bar
+    /// fill (with its 70/90 color thresholds), projected pct drives the
+    /// projection dot + red-pinning, period_end drives the reset countdown,
+    /// and the "$61.34 / $200" spent/limit caption rides the reset line as
+    /// the trailing caption. `sessions.now` (already observed by this view,
+    /// ticked off the shared UI cadence) is the clock for the countdown.
+    @ViewBuilder
+    private func budgetRow(label: String, window w: BudgetWindow) -> some View {
+        row(label: label,
+            percent: planFit.budgetPct(w),
+            estimatedPercent: planFit.budgetProjectedPct(w),
+            resetText: planFit.budgetResetText(w, now: sessions.now),
+            trailingCaption: planFit.budgetSpentText(w))
     }
 
     // MARK: - Interrupted sessions
@@ -792,7 +872,22 @@ struct OverlayView: View {
             // there's no classification to draw from in that case, and
             // idle is the safer default (never wrongly implies the row
             // needs attention).
-            StatusIndicator(workStatus: entry.workStatus)
+            //
+            // WS-2: a disconnected remote session's last-known work_status is
+            // frozen and can't be trusted (the host stopped syncing), so
+            // suppress the live dot entirely (nil → idle/no-dot) rather than
+            // show a stale pulsing-green "running".
+            StatusIndicator(workStatus: entry.remoteStale ? nil : entry.workStatus)
+
+            // WS-2: remote-session badge — a desktopcomputer glyph in the
+            // same icon slot cloudSessionRow uses for its cloud badge, so a
+            // glance tells local / remote / cloud rows apart. Dimmed further
+            // when the host is disconnected.
+            if entry.isRemote {
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 9))
+                    .foregroundColor(.white.opacity(entry.remoteStale ? 0.3 : 0.6))
+            }
 
             // Item 3B (click-to-open): tap targets ONLY this title/subtitle
             // column, not the whole row — the row also hosts the Resume
@@ -808,12 +903,22 @@ struct OverlayView: View {
                 // this used to show.
                 Text(entry.displayTitle)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(titleColor(entry.workStatus))
+                    // WS-2: a disconnected remote row grays out regardless of
+                    // its (now-stale) work_status.
+                    .foregroundColor(entry.remoteStale ? .white.opacity(0.35) : titleColor(entry.workStatus))
                     .lineLimit(1)
                 if entry.displayTitle != entry.projectName {
                     Text(entry.projectName)
                         .font(.system(size: 8.5))
                         .foregroundColor((entry.workStatus ?? .idle) == .idle ? .white.opacity(0.25) : .white.opacity(0.4))
+                        .lineLimit(1)
+                }
+                // WS-2: "on <host>" for remote rows, with a "disconnected"
+                // note when the host stopped syncing.
+                if let host = entry.host {
+                    Text(entry.remoteStale ? "on \(host) · disconnected" : "on \(host)")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundColor(.white.opacity(entry.remoteStale ? 0.3 : 0.45))
                         .lineLimit(1)
                 }
                 if entry.needsAttention {
@@ -826,18 +931,27 @@ struct OverlayView: View {
             .onTapGesture {
                 openLocalSession(entry)
             }
+            // WS-2: remote rows copy an `ssh … claude --resume` command to the
+            // clipboard on click (there's nothing local to foreground); local
+            // rows foreground Claude Desktop. Disclose which via the tooltip.
+            .help(entry.isRemote
+                  ? "Copy an ssh resume command for this remote session to the clipboard"
+                  : "Open Claude Desktop")
 
             Spacer()
 
             // Item 5: waiting (rate-limited) sessions still show the reset
             // countdown; active sessions show how long since their last
             // real activity instead of the old, always-identical
-            // "active now".
-            Text(entry.resetsAt != nil
-                 ? sessions.resetText(for: entry.resetsAt)
-                 : sessions.activityAgeText(entry.lastActivityAt))
+            // "active now". WS-2: a disconnected remote row shows
+            // "disconnected" instead of a stale age.
+            Text(entry.remoteStale
+                 ? "disconnected"
+                 : (entry.resetsAt != nil
+                    ? sessions.resetText(for: entry.resetsAt)
+                    : sessions.activityAgeText(entry.lastActivityAt)))
                 .font(.system(size: 8.5))
-                .foregroundColor(readyToResume(entry) ? .green : .white.opacity(0.45))
+                .foregroundColor(entry.remoteStale ? .white.opacity(0.3) : (readyToResume(entry) ? .green : .white.opacity(0.45)))
 
             if !entry.isActive {
                 Button("Resume") {
@@ -1063,7 +1177,24 @@ struct OverlayView: View {
     /// Desktop's own import path, not a wrong query param — so ALL local
     /// rows (CLI and Cowork alike) now just foreground Claude Desktop and
     /// leave tab selection to the user.
+    ///
+    /// WS-2 (remote rows): a remote session has nothing local to foreground —
+    /// its transcript lives on the remote host's `~/.claude/projects`. Instead
+    /// of a dead click, copy a ready-to-run resume command
+    /// (`ssh -t <target> 'cd <dir> && claude --resume <remoteId>'`) to the
+    /// pasteboard so the user can paste it into a terminal. `<target>` is the
+    /// config ssh target resolved from the entry's host name (falling back to
+    /// the host name itself when unresolved — works when it's an ssh alias).
     private func openLocalSession(_ entry: SessionEntry) {
+        if entry.isRemote, let host = entry.host {
+            let target = resolveHostSSH(host) ?? host
+            let remoteId = entry.remoteId ?? entry.id
+            let command = "ssh -t \(target) 'cd \(entry.projectDir) && claude --resume \(remoteId)'"
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(command, forType: .string)
+            return
+        }
         if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.anthropic.claudefordesktop") {
             NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration())
         }
@@ -1089,12 +1220,16 @@ struct OverlayView: View {
     @ViewBuilder
     private var planFitTabContent: some View {
         if let data = planFit.data {
+            let isApi = data.isApiAccount
             VStack(alignment: .leading, spacing: 9) {
                 // Current-plan identity used to live in the section header's
                 // trailing badge; kept here (rather than dropped) since the
                 // tab pill alone doesn't say which plan the numbers below
-                // are being judged against.
-                if let plan = data.currentPlan {
+                // are being judged against. WS-2: hidden on API accounts —
+                // the plan/tier comparison isn't the relevant framing there
+                // (a dollar budget is), so it's replaced by the budget
+                // summary line below.
+                if let plan = data.currentPlan, !isApi {
                     HStack {
                         Text("Current plan")
                             .font(.system(size: 9.5))
@@ -1107,6 +1242,14 @@ struct OverlayView: View {
                             .padding(.vertical, 2)
                             .background(Capsule().fill(Color.white.opacity(0.18)))
                     }
+                }
+
+                // WS-2: compact budget summary for API accounts — the
+                // moving-averages / run-rate / cost-peaks below stay
+                // (they're account-type-agnostic), but the tier grid and Max
+                // recommendation are suppressed further down.
+                if isApi {
+                    apiBudgetSummary(data)
                 }
 
                 // Moving averages — one line per window, coverage annotation
@@ -1132,7 +1275,10 @@ struct OverlayView: View {
                 // rather than one line, so nothing truncates.
                 peaksGrid(data)
 
-                if !data.tiers.isEmpty {
+                // WS-2: the plan-tier comparison grid is Max-plan framing —
+                // hidden on API accounts, where the budget summary above is
+                // the relevant number instead.
+                if !data.tiers.isEmpty && !isApi {
                     tierGrid(data.tiers)
                 }
             }
@@ -1140,6 +1286,32 @@ struct OverlayView: View {
             Text("collecting data…")
                 .font(.system(size: 9))
                 .foregroundColor(.white.opacity(0.4))
+        }
+    }
+
+    /// WS-2: compact budget summary for the Plan-fit tab on API accounts —
+    /// one line per configured period ("Weekly $61 / $200 (31%)"). Replaces
+    /// the plan capsule / tier grid framing, which doesn't apply to a
+    /// dollar-billed account. Shows a muted prompt when no budget is set.
+    @ViewBuilder
+    private func apiBudgetSummary(_ data: PlanFitData) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if data.hasBudget {
+                if let line = planFit.budgetSummaryLine(label: "Weekly", window: data.budgetWeekly) {
+                    Text(line)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                }
+                if let line = planFit.budgetSummaryLine(label: "Monthly", window: data.budgetMonthly) {
+                    Text(line)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                }
+            } else {
+                Text("No budget set")
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.white.opacity(0.4))
+            }
         }
     }
 

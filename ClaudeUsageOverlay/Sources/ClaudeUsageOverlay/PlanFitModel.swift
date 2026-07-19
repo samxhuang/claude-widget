@@ -34,12 +34,41 @@ struct TierVerdict {
     }
 }
 
+/// One budget period (weekly or monthly) from plan_fit.json's `budget` block
+/// (contract C2). `nil` for the whole struct means the period is unconfigured
+/// — the Python side emits `"weekly": null` / `"monthly": null` when there's
+/// no dollar limit set, and old daemon builds emit no `budget` key at all;
+/// both cases must degrade to today's percentage-bar UI (see PlanFitData.hasBudget).
+///
+/// `projected*` are `null` in the first hour of a period (too little elapsed
+/// time to extrapolate) — decoded here as `nil`, which the view renders as no
+/// projection dot / no "(N%)" annotation, exactly as UsageModel does for a
+/// just-opened usage window.
+struct BudgetWindow {
+    var limitUsd: Double?
+    var spentUsd: Double?
+    var pct: Double?
+    var projectedUsd: Double?
+    var projectedPct: Double?
+    var periodStart: Date?
+    var periodEnd: Date?
+    /// Whether the spend total already folds in remote-host Claude Code usage
+    /// (WS-6). Purely informational for the widget — display-only.
+    var includesRemote: Bool
+}
+
 /// Parsed, defensively-decoded snapshot of ~/.claude-autoresume/usage/plan_fit.json.
 /// Every field is optional except the ones structurally guaranteed by how we
 /// build it — a missing/malformed key in the source JSON just means that
 /// field (and, in the view, that row) is absent, never a crash.
 struct PlanFitData {
     var currentPlan: String?
+    /// Contract C2's `account` block. `accountType` is `"max"` / `"api"`
+    /// (config-sourced), `accountPlan` mirrors `current_plan` for API-tier
+    /// comparison math. Both `nil` for an old daemon build with no `account`
+    /// key — callers treat a nil/`"max"` type as today's Max-plan UI.
+    var accountType: String?
+    var accountPlan: String?
     var movingAverages: [String: MovingAverageWindow] = [:]
     var monthlyRunRateUsd: Double?
     var monthlyRunRateBasis: String?
@@ -50,6 +79,23 @@ struct PlanFitData {
     var tiers: [TierVerdict] = []
     var recommendation: String?
     var dataMaturity: String?
+    /// Contract C2 budget block. Either can be `nil` (period unconfigured or
+    /// old daemon build with no `budget` key).
+    var budgetWeekly: BudgetWindow?
+    var budgetMonthly: BudgetWindow?
+
+    /// True when this account is API-billed (config account.type == "api").
+    /// Drives mainTabContent's dollar-budget-bars-instead-of-percent gating
+    /// and planFitTabContent's tier-grid-hidden layout. A missing/`"max"`
+    /// account block reads false ⇒ exactly today's UI.
+    var isApiAccount: Bool { accountType == "api" }
+
+    /// Whether at least one budget period is configured (has a dollar limit).
+    /// API accounts with no budget set render the "No budget set" prompt
+    /// instead of bars.
+    var hasBudget: Bool {
+        (budgetWeekly?.limitUsd != nil) || (budgetMonthly?.limitUsd != nil)
+    }
 }
 
 /// Reads ~/.claude-autoresume/usage/plan_fit.json — written hourly by the
@@ -90,6 +136,24 @@ final class PlanFitModel: ObservableObject {
     private static func parse(_ json: [String: Any]) -> PlanFitData {
         var d = PlanFitData()
         d.currentPlan = json["current_plan"] as? String
+
+        // Contract C2: new `account` block. Backward compatible — an old
+        // plan_fit.json without this key leaves both nil, and isApiAccount
+        // (accountType == "api") then reads false, so the whole account is
+        // treated as a Max plan exactly as before.
+        if let account = json["account"] as? [String: Any] {
+            d.accountType = account["type"] as? String
+            d.accountPlan = account["plan"] as? String
+        }
+
+        // Contract C2: new `budget` block. Each period is `null` when
+        // unconfigured (decoded as nil here) and the whole block is absent on
+        // old daemon builds — both leave budgetWeekly/budgetMonthly nil, which
+        // hasBudget/mainTabContent read as "no budget bars, show today's UI".
+        if let budget = json["budget"] as? [String: Any] {
+            d.budgetWeekly = parseBudget(budget["weekly"])
+            d.budgetMonthly = parseBudget(budget["monthly"])
+        }
 
         if let ma = json["moving_averages"] as? [String: Any] {
             for key in ["1d", "7d", "30d", "90d"] {
@@ -146,6 +210,40 @@ final class PlanFitModel: ObservableObject {
         }
 
         return d
+    }
+
+    /// One period out of the `budget` block. Returns nil when the value is
+    /// JSON `null`/absent/malformed (period unconfigured), so hasBudget
+    /// reflects only genuinely-configured periods.
+    private static func parseBudget(_ any: Any?) -> BudgetWindow? {
+        guard let b = any as? [String: Any] else { return nil }
+        return BudgetWindow(
+            limitUsd: doubleValue(b["limit_usd"]),
+            spentUsd: doubleValue(b["spent_usd"]),
+            pct: doubleValue(b["pct"]),
+            projectedUsd: doubleValue(b["projected_usd"]),
+            projectedPct: doubleValue(b["projected_pct"]),
+            periodStart: dateValue(b["period_start"]),
+            periodEnd: dateValue(b["period_end"]),
+            includesRemote: b["includes_remote"] as? Bool ?? false
+        )
+    }
+
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoFormatterNoFraction = ISO8601DateFormatter()
+
+    /// Period bounds arrive as ISO8601 strings (C2's "..." placeholders), but
+    /// tolerate an epoch number too — same defensive spirit as doubleValue.
+    private static func dateValue(_ any: Any?) -> Date? {
+        if let s = any as? String {
+            return isoFormatter.date(from: s) ?? isoFormatterNoFraction.date(from: s)
+        }
+        if let n = any as? NSNumber { return Date(timeIntervalSince1970: n.doubleValue) }
+        return nil
     }
 
     private static func doubleValue(_ any: Any?) -> Double? {
@@ -217,5 +315,63 @@ final class PlanFitModel: ObservableObject {
     func ratioText(_ tier: TierVerdict) -> String? {
         guard let ratio = tier.apiEquivRatio else { return nil }
         return String(format: "%.0f×", ratio)
+    }
+
+    // MARK: - Budget display formatting
+
+    /// "$61.34 / $200" — spent vs. limit for a budget bar's caption. Spent
+    /// keeps cents (it's the live, moving number the user watches); the limit
+    /// shows whole dollars when it's a round figure (most budgets are) and
+    /// cents otherwise. Missing spend reads as "$0.00"; a period with no
+    /// limit shouldn't reach here (hasBudget gates it), but degrades to
+    /// "$X / —" rather than crashing if it does.
+    func budgetSpentText(_ w: BudgetWindow) -> String {
+        let spent = String(format: "$%.2f", w.spentUsd ?? 0)
+        guard let limit = w.limitUsd else { return "\(spent) / —" }
+        let limitText = (limit == limit.rounded())
+            ? String(format: "$%.0f", limit)
+            : String(format: "$%.2f", limit)
+        return "\(spent) / \(limitText)"
+    }
+
+    /// The integer percent for reusing OverlayView.row(...)'s bar — pct is a
+    /// Double in the JSON, the bar takes Int. nil when the period reports no
+    /// pct (e.g. limit present but spend not yet computed).
+    func budgetPct(_ w: BudgetWindow) -> Int? {
+        w.pct.map { Int($0.rounded()) }
+    }
+
+    /// Integer projected percent for the bar's projection dot / "(N%)"
+    /// annotation. nil in the first hour of a period (Python suppresses it),
+    /// which row(...) renders as no dot, same as UsageModel's first-minute
+    /// suppression.
+    func budgetProjectedPct(_ w: BudgetWindow) -> Int? {
+        w.projectedPct.map { Int($0.rounded()) }
+    }
+
+    /// "resets in 3d 4h" from a period's `period_end`, reusing the same
+    /// DurationFormat every other countdown in the widget uses. `now` is
+    /// passed in (PlanFitModel holds no clock of its own) so the caller can
+    /// tick it off the shared UI timer. nil period_end ⇒ no countdown text.
+    func budgetResetText(_ w: BudgetWindow, now: Date) -> String {
+        guard let end = w.periodEnd else { return "" }
+        let interval = end.timeIntervalSince(now)
+        if interval <= 0 { return "resets now" }
+        return "resets in \(DurationFormat.compact(interval))"
+    }
+
+    /// Compact one-liner for the Plan-fit tab's API-account budget summary,
+    /// e.g. "Weekly $61 / $200 (31%)". Whole dollars only — the tab is a
+    /// reference view, not the live bar. Returns nil when the period is
+    /// unconfigured so the caller can omit the line.
+    func budgetSummaryLine(label: String, window: BudgetWindow?) -> String? {
+        guard let w = window, let limit = w.limitUsd else { return nil }
+        let spent = String(format: "$%.0f", w.spentUsd ?? 0)
+        let limitText = String(format: "$%.0f", limit)
+        var line = "\(label) \(spent) / \(limitText)"
+        if let pct = w.pct {
+            line += String(format: " (%.0f%%)", pct)
+        }
+        return line
     }
 }

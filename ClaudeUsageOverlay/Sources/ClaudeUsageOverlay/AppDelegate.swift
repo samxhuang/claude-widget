@@ -33,6 +33,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let cloudSessionsModel = CloudSessionsModel()
     private let planFitModel = PlanFitModel()
     private let graphModel = GraphModel()
+    // WS-2: config.json store (sole writer, contract C1) + the Settings
+    // window it backs. The store is shared into the Settings window and used
+    // to resolve remote-session host names to ssh targets for OverlayView's
+    // remote openLocalSession branch.
+    private let configStore = ConfigStore()
+    private var settingsWindowController: SettingsWindowController?
     // One hidden, authenticated WKWebView shared by both fetchers — see
     // ClaudeWebSession's header comment for why this isn't two webviews.
     private let webSession = ClaudeWebSession()
@@ -102,6 +108,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // `NSHostingView.fittingSize` at width 280. +3pt breathing room, same
     // rationale as before, = 154.
     private let collapsedPanelHeight: CGFloat = 154
+    // WS-2: collapsedPanelHeight was measured against the Main tab's TWO
+    // percentage rows (Session + Weekly). On an API account those are
+    // replaced by 1-2 dollar budget bars (each the same row(...) as a
+    // percentage row) or a single "No budget set" prompt line — so the tab's
+    // top block can be one row shorter. This is the per-row height (row
+    // content plus the outer VStack(spacing: 8) gap between top-level
+    // children) subtracted per missing row in apiRowCountDelta(). Approximate
+    // (not probe-measured like the other constants — a shorter panel here
+    // just leaves a little slack, never clips), erring slightly tall.
+    private let mainUsageRowHeight: CGFloat = 34
     // Both sections are wrapped in a ScrollView, so these only need to cover
     // a handful of visible rows — the ScrollView absorbs any overflow rather
     // than the panel growing to fit every entry. Halved from their original
@@ -307,6 +323,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.updatePanelSize()
             }
             .store(in: &cancellables)
+
+        // WS-2: the Main tab's height depends on the account type and how
+        // many budget bars an API account shows (apiRowCountDelta) — both
+        // read from plan_fit.json — so re-size the panel when that data
+        // refreshes. PlanFitData isn't Equatable, so no removeDuplicates;
+        // updatePanelSize is idempotent (a no-op setFrame when nothing
+        // changed), and this only emits on the 120s plan-fit refresh cadence.
+        planFitModel.$data
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updatePanelSize()
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Status bar menu
@@ -406,6 +435,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(lockPositionItem)
 
         menu.addItem(.separator())
+        // WS-2: Settings window (account type, budget, remote hosts) — also
+        // reachable from the gear button on the panel title row.
+        menu.addItem(withTitle: "Settings…", action: #selector(presentSettingsWindow), keyEquivalent: ",").target = self
+        menu.addItem(.separator())
         menu.addItem(withTitle: "Sign In…", action: #selector(presentLoginWindow), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Sign Out", action: #selector(signOut), keyEquivalent: "").target = self
         menu.addItem(.separator())
@@ -469,6 +502,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         graphWindowController?.show()
     }
 
+    /// WS-2: opens (or re-shows) the Settings window. One shared controller
+    /// kept alive singleton-style, same pattern as presentLoginWindow /
+    /// presentGraphWindow above, so the window and its ConfigStore survive
+    /// being closed and reopened.
+    @objc private func presentSettingsWindow() {
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController(configStore: configStore)
+        }
+        settingsWindowController?.show()
+    }
+
     @objc private func signOut() {
         fetcher.signOut { [weak self] in
             self?.model.isLoggedOut = true
@@ -498,6 +542,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.moveDragStartOrigin = nil
         }, onHide: { [weak self] in
             self?.hideOverlay()
+        }, onOpenSettings: { [weak self] in
+            self?.presentSettingsWindow()
+        }, resolveHostSSH: { [weak self] name in
+            self?.configStore.config.remoteHosts.first(where: { $0.name == name })?.ssh
         }))
         // Without this, NSHostingView installs Auto Layout min/max-size
         // constraints on itself (macOS 13+ default: .standardBounds) that
@@ -629,10 +677,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .planFit:
             return planFitPanelHeight
         case .main:
-            var height = collapsedPanelHeight
+            var height = collapsedPanelHeight - apiRowCountDelta()
             if sessionsModel.sessionsExpanded { height += sessionsExpandedExtra }
             return height
         }
+    }
+
+    /// WS-2: how much SHORTER the Main tab's top block is than the two
+    /// percentage rows `collapsedPanelHeight` was measured against. Zero for
+    /// Max accounts (still two rows). For API accounts the top block is 1-2
+    /// budget bars (or a single "No budget set" prompt), so this returns the
+    /// height of the row(s) no longer present.
+    private func apiRowCountDelta() -> CGFloat {
+        guard let data = planFitModel.data, data.isApiAccount else { return 0 }
+        let barCount: Int
+        if data.hasBudget {
+            barCount = [data.budgetWeekly?.limitUsd, data.budgetMonthly?.limitUsd]
+                .compactMap { $0 }.count
+        } else {
+            // The single "No budget set — open Settings" line.
+            barCount = 1
+        }
+        return CGFloat(max(0, 2 - barCount)) * mainUsageRowHeight
     }
 
     /// Item 2 bug fix: the smallest height a manual drag can shrink the

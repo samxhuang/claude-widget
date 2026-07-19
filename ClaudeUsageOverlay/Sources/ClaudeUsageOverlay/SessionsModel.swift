@@ -79,6 +79,23 @@ struct SessionEntry: Identifiable, Equatable, Hashable {
     /// (on a subsequent successful resume) does.
     var needsAttention: Bool
 
+    /// Contract C3 remote-session fields. A remote entry is keyed
+    /// `"<host>::<remote_session_id>"` in state.json and carries `host` (the
+    /// config host name, e.g. "devbox"), `remoteId` (the session id on the
+    /// remote's own `~/.claude/projects`, used to build the ssh --resume
+    /// command), and `remoteStale` (the Mac-side sync couldn't reach the host
+    /// this cycle). All `nil`/false for ordinary local rows, so `isRemote`
+    /// below is the single gate that switches on remote treatment.
+    var host: String?
+    var remoteId: String?
+    var remoteStale: Bool = false
+
+    /// True for a session running on a remote host (synced in over ssh by the
+    /// Mac daemon), false for everything local. Drives the desktopcomputer
+    /// badge + "on <host>" subtitle and the ssh-command-to-pasteboard
+    /// click behavior in OverlayView.
+    var isRemote: Bool { host != nil }
+
     var isActive: Bool { status == "active" }
 
     /// Cowork sessions have no rate-limit/resume cycle — Cowork manages its
@@ -185,7 +202,13 @@ final class SessionsModel: ObservableObject {
                     workStatus: (dict["work_status"] as? String).flatMap(SessionWorkStatus.init(rawValue:)),
                     kind: dict["kind"] as? String,
                     resumeArmed: dict["resume_armed"] as? Bool ?? false,
-                    needsAttention: dict["needs_attention"] as? Bool ?? false
+                    needsAttention: dict["needs_attention"] as? Bool ?? false,
+                    // Contract C3: present only on remote-synced entries;
+                    // absent on ordinary local rows (host stays nil ⇒ isRemote
+                    // false ⇒ no remote treatment).
+                    host: dict["host"] as? String,
+                    remoteId: dict["remote_id"] as? String,
+                    remoteStale: dict["remote_stale"] as? Bool ?? false
                 ))
             }
             // Crash-continuation dedupe (local-local rule): if a Claude Code
