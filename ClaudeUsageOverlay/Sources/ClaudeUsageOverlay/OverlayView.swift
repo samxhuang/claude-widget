@@ -7,6 +7,9 @@ struct OverlayView: View {
     @ObservedObject var chats: ChatsModel
     @ObservedObject var planFit: PlanFitModel
     @ObservedObject var graph: GraphModel
+    /// Opens the larger, resizable graph window (item 3) — forwarded down to
+    /// GraphView's expand button.
+    var onExpandGraph: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -32,7 +35,7 @@ struct OverlayView: View {
             if graph.selectedTab == .main {
                 mainTabContent
             } else {
-                GraphView(model: graph)
+                GraphView(model: graph, onExpand: onExpandGraph)
             }
         }
         .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
@@ -389,30 +392,16 @@ struct OverlayView: View {
                             .foregroundColor(.white.opacity(0.9))
                     }
 
-                    if let peaks = planFit.peaksText(data) {
-                        Text(peaks)
-                            .font(.system(size: 9))
-                            .foregroundColor(.white.opacity(0.7))
-                    }
+                    // Item 6: was a single Text(peaksText) trying to cram
+                    // four values onto one line — with all four present it
+                    // overflowed the panel width and the last value (peak 7d
+                    // util) got clipped by SwiftUI's default truncation.
+                    // Split into two label-prefixed rows (cost, then
+                    // utilization) so nothing ever truncates.
+                    peaksGrid(data)
 
                     if !data.tiers.isEmpty {
-                        VStack(alignment: .leading, spacing: 3) {
-                            ForEach(data.tiers, id: \.key) { tier in
-                                tierRow(tier)
-                            }
-                        }
-                    }
-
-                    if let maturity = data.dataMaturity {
-                        Text(maturity)
-                            .font(.system(size: 8))
-                            .foregroundColor(.white.opacity(0.35))
-                    }
-                    if let rec = data.recommendation {
-                        Text(rec)
-                            .font(.system(size: 8))
-                            .foregroundColor(.white.opacity(0.35))
-                            .fixedSize(horizontal: false, vertical: true)
+                        tierGrid(data.tiers)
                     }
                 }
             } else {
@@ -423,33 +412,83 @@ struct OverlayView: View {
         }
     }
 
+    /// Item 4: fixed-column Grid so plan name / price / ratio / peaks line up
+    /// vertically across tier rows instead of drifting per-row with an
+    /// HStack + Spacer. The "× API" header labels the ratio column so each
+    /// row's number reads unambiguously as "N times the price of API-metered
+    /// usage" (item 4a) without repeating "API value" on every row.
     @ViewBuilder
-    private func tierRow(_ tier: TierVerdict) -> some View {
-        HStack(spacing: 4) {
+    private func tierGrid(_ tiers: [TierVerdict]) -> some View {
+        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
+            GridRow {
+                Text("Plan")
+                Text("Price").gridColumnAlignment(.trailing)
+                Text("× API").gridColumnAlignment(.trailing)
+                Text("Peaks")
+            }
+            .font(.system(size: 7.5, weight: .semibold))
+            .foregroundColor(.white.opacity(0.4))
+
+            ForEach(tiers, id: \.key) { tier in
+                tierGridRow(tier)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tierGridRow(_ tier: TierVerdict) -> some View {
+        let color: Color = tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.85)
+        GridRow {
             Text(tier.name)
                 .font(.system(size: 9, weight: .semibold))
-                .foregroundColor(tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.85))
-            if let price = planFit.priceText(tier) {
-                Text(price)
-                    .font(.system(size: 9))
-                    .foregroundColor(.white.opacity(0.55))
+                .foregroundColor(color)
+            Text(planFit.priceText(tier) ?? "—")
+                .font(.system(size: 9).monospacedDigit())
+                .foregroundColor(.white.opacity(0.55))
+            Text(planFit.ratioText(tier) ?? "—")
+                .font(.system(size: 9, weight: .medium).monospacedDigit())
+                .foregroundColor(.white.opacity(0.8))
+            Text(tierPeaksText(tier))
+                .font(.system(size: 8.5).monospacedDigit())
+                .foregroundColor(tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.5))
+        }
+    }
+
+    private func tierPeaksText(_ tier: TierVerdict) -> String {
+        let p5 = tier.projectedPeak5hUtil.map { String(format: "5h %.0f%%", $0) } ?? "—"
+        let p7 = tier.projectedPeak7dUtil.map { String(format: "7d %.0f%%", $0) } ?? "—"
+        return "\(p5) / \(p7)"
+    }
+
+    /// Item 6: two short label-prefixed rows (cost, then utilization) in
+    /// place of the old single-line "peak 1h: … · peak 5h: … · peak 5h
+    /// util: … · peak 7d util: …" which truncated the last value. Grid keeps
+    /// each row's two values column-aligned the same way the tier rows are.
+    /// Returns nothing (not even the label column) if there's genuinely no
+    /// peak data at all, same as the old peaksText's nil-hides-the-row
+    /// behavior.
+    @ViewBuilder
+    private func peaksGrid(_ data: PlanFitData) -> some View {
+        let hasCost = data.peakOneHourUsd != nil || data.peakFiveHourUsd != nil
+        let hasUtil = data.utilFiveHourPeakPct != nil || data.utilSevenDayPeakPct != nil
+        if hasCost || hasUtil {
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 1) {
+                if hasCost {
+                    GridRow {
+                        Text("peak cost").foregroundColor(.white.opacity(0.4))
+                        Text(planFit.formatPeak("1h", "$%.2f", data.peakOneHourUsd)).foregroundColor(.white.opacity(0.7))
+                        Text(planFit.formatPeak("5h", "$%.2f", data.peakFiveHourUsd)).foregroundColor(.white.opacity(0.7))
+                    }
+                }
+                if hasUtil {
+                    GridRow {
+                        Text("peak util").foregroundColor(.white.opacity(0.4))
+                        Text(planFit.formatPeak("5h", "%.0f%%", data.utilFiveHourPeakPct)).foregroundColor(.white.opacity(0.7))
+                        Text(planFit.formatPeak("7d", "%.0f%%", data.utilSevenDayPeakPct)).foregroundColor(.white.opacity(0.7))
+                    }
+                }
             }
-            Spacer()
-            if let ratio = planFit.ratioText(tier) {
-                Text(ratio)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.white.opacity(0.8))
-            }
-            if let p5 = tier.projectedPeak5hUtil {
-                Text(String(format: "5h %.0f%%", p5))
-                    .font(.system(size: 8.5))
-                    .foregroundColor(tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.5))
-            }
-            if let p7 = tier.projectedPeak7dUtil {
-                Text(String(format: "7d %.0f%%", p7))
-                    .font(.system(size: 8.5))
-                    .foregroundColor(tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.5))
-            }
+            .font(.system(size: 8.5).monospacedDigit())
         }
     }
 

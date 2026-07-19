@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var fetcher: UsageFetcher!
     private var chatsFetcher: ChatsFetcher!
     private var loginWindowController: LoginWindowController?
+    private var graphWindowController: GraphWindowController?
 
     private var dataTimer: Timer?
     private var uiTimer: Timer?
@@ -27,27 +28,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Anchored to the top-right corner of the screen — resizing only moves
     // the bottom edge, never the top-right one.
     private let panelWidth: CGFloat = 280
-    // +3pt so the collapsed Plan fit row (the last thing in the card) isn't
-    // flush against the panel's bottom edge — pairs with the matching
-    // .padding(.bottom, 3) on planFitSection's header row in OverlayView.
-    private let collapsedPanelHeight: CGFloat = 217
+    // Item 1 audit: every constant below was calibrated against SwiftUI's
+    // own ground-truth fitting size (NSHostingView.intrinsicContentSize for
+    // OverlayView at panelWidth), captured via a temporary probe during
+    // development rather than eyeballed — see the commit that introduced
+    // this comment for the raw log output. The collapsed Main tab's real
+    // content height is 255pt (header row + the tab switch row added later
+    // + 2 usage rows + last-updated line + 3 dividers + 3 section headers,
+    // at 8pt VStack spacing + 20pt outer padding); the previous constant of
+    // 217 predated the tab switch row and was never bumped for it, which is
+    // exactly why the collapsed "Plan fit" header was clipped at the
+    // panel's bottom edge. +3pt breathing room below that, same rationale
+    // as before (pairs with planFitSection's .padding(.bottom, 3)).
+    private let collapsedPanelHeight: CGFloat = 258
     // Both sections are wrapped in a ScrollView, so these only need to cover
     // a handful of visible rows — the ScrollView absorbs any overflow rather
     // than the panel growing to fit every entry. Halved from their original
     // values, which left roughly 2x the space actually needed on screen.
+    // Audited (item 1): with a couple of live rows each, real extra height
+    // measured 80pt (sessions) / 19pt (chats) — both comfortably under
+    // these, confirming the ScrollView-absorbs-overflow design is working
+    // as intended rather than silently under-covering. Left unchanged.
     private let sessionsExpandedExtra: CGFloat = 145
     private let chatsExpandedExtra: CGFloat = 140
     // Plan fit isn't wrapped in a ScrollView (unlike Sessions/Chats) since
     // its content is a fixed handful of lines, so this needs to cover the
     // full expanded height: up to 4 moving-average lines, the API-equivalent
-    // line, the peaks line, up to 3 tier lines, and the (possibly
-    // two-line-wrapped) maturity + recommendation text.
-    private let planFitExpandedExtra: CGFloat = 260
+    // line, the two-row peaks grid (item 6), and up to 3 tier rows (item 4's
+    // Grid). Audited (item 1) against real (worst-case, all-fields-present)
+    // data: expanded content measured 156pt beyond the collapsed base, down
+    // from the old 260pt now that items 4/5/6 replaced the maturity +
+    // recommendation prose (removed entirely) and the loose tier HStacks
+    // with a tighter column-aligned Grid. +4pt buffer.
+    private let planFitExpandedExtra: CGFloat = 160
     // The Graph tab replaces the collapsible-sections layout entirely with a
     // period picker plus two stacked mini-charts, so it gets its own fixed
     // height rather than participating in the collapsed/expanded-extras math
-    // above.
-    private let graphPanelHeight: CGFloat = 400
+    // above. Audited (item 1): real content measured 295pt with no coverage
+    // note, ~314pt worst-case with one (the "collecting since …" line that
+    // appears for periods still filling up) — the old 400 constant left
+    // ~100pt of dead space at the bottom. Item 2's y-axis label gutters sit
+    // inside the charts' existing frame(height:) and don't add any height.
+    private let graphPanelHeight: CGFloat = 316
     private var panelTopY: CGFloat = 0
     private var panelRightX: CGFloat = 0
 
@@ -237,6 +259,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loginWindowController?.show()
     }
 
+    /// Item 3: opens (or re-shows) the larger, resizable graph window from
+    /// the Graph tab's expand button. One shared instance, same pattern as
+    /// presentLoginWindow/LoginWindowController above.
+    private func presentGraphWindow() {
+        if graphWindowController == nil {
+            graphWindowController = GraphWindowController(graphModel: graphModel)
+        }
+        graphWindowController?.show()
+    }
+
     @objc private func signOut() {
         fetcher.signOut { [weak self] in
             self?.model.isLoggedOut = true
@@ -256,7 +288,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupOverlayPanel() {
         let initialHeight = currentPanelHeight()
 
-        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, planFit: planFitModel, graph: graphModel))
+        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, planFit: planFitModel, graph: graphModel, onExpandGraph: { [weak self] in
+            self?.presentGraphWindow()
+        }))
         // Without this, NSHostingView installs Auto Layout min/max-size
         // constraints on itself (macOS 13+ default: .standardBounds) that
         // reflect the SwiftUI content's intrinsic size — and since it's the

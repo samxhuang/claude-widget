@@ -215,23 +215,13 @@ final class PlanFitModel: ObservableObject {
         return s
     }
 
-    /// "peak 1h: $30.79 · peak 5h: $100.99" — with utilization peaks appended
-    /// when present. Returns nil (hide the row) if nothing at all is available.
-    func peaksText(_ data: PlanFitData) -> String? {
-        var parts: [String] = []
-        if let oh = data.peakOneHourUsd {
-            parts.append(String(format: "peak 1h: $%.2f", oh))
-        }
-        if let fh = data.peakFiveHourUsd {
-            parts.append(String(format: "peak 5h: $%.2f", fh))
-        }
-        if let u5 = data.utilFiveHourPeakPct {
-            parts.append(String(format: "peak 5h util: %.0f%%", u5))
-        }
-        if let u7 = data.utilSevenDayPeakPct {
-            parts.append(String(format: "peak 7d util: %.0f%%", u7))
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    /// "5h $30.79" / "5h 24%" — one cell of the peaks grid (item 6). `spec`
+    /// is a single-value format string (`"$%.2f"` or `"%.0f%%"`); returns
+    /// "label —" when the value itself is missing, so the row's column
+    /// alignment holds even with partial data.
+    func formatPeak(_ label: String, _ spec: String, _ value: Double?) -> String {
+        guard let value = value else { return "\(label) —" }
+        return "\(label) " + String(format: spec, value)
     }
 
     func priceText(_ tier: TierVerdict) -> String? {
@@ -239,8 +229,12 @@ final class PlanFitModel: ObservableObject {
         return "$\(Int(price))"
     }
 
+    /// "163×" — the tier's price expressed as a multiple of what the same
+    /// usage would cost metered through the API. Item 4a: the "× API"
+    /// column header (see OverlayView.tierGrid) supplies the "of API value"
+    /// half of the label so each cell can stay this short.
     func ratioText(_ tier: TierVerdict) -> String? {
         guard let ratio = tier.apiEquivRatio else { return nil }
-        return String(format: "%.0fx", ratio)
+        return String(format: "%.0f×", ratio)
     }
 }
