@@ -280,6 +280,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         uiTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.model.tick()
             self?.chatsModel.tick()
+            // mtime-guarded (a stat when nothing changed), so this 30s lane
+            // picks up daemon-side plan_fit.json rewrites — e.g. the
+            // config-change-triggered one — without waiting for the 120s
+            // full-refresh lane.
+            self?.planFitModel.refreshIfChanged()
             self?.cloudSessionsModel.tick()
         }
 
@@ -356,6 +361,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.updatePanelSize()
+                // A config change (account plan, budget) makes the daemon
+                // rewrite plan_fit.json within one ~10s poll tick — but this
+                // model otherwise only re-reads that file on the 120s lane,
+                // which reads as "the Plan-fit tab didn't update" after a
+                // Settings change. Burst a few mtime-guarded refreshes timed
+                // around the daemon's rewrite so verdict/tier text catches up
+                // within seconds. (The plan capsule itself reads live config
+                // and doesn't need this.)
+                for delay: TimeInterval in [3, 13, 24] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        self?.planFitModel.refreshIfChanged()
+                    }
+                }
             }
             .store(in: &cancellables)
     }

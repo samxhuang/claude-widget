@@ -124,6 +124,7 @@ final class PlanFitModel: ObservableObject {
     /// (daemon hasn't run yet, mid-write, etc.) just clears `data`, which
     /// the view renders as "collecting data…" rather than an error.
     func refresh() {
+        lastSeenMtime = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationDate] as? Date) ?? nil
         guard let raw = try? Data(contentsOf: fileURL),
               let json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
             DispatchQueue.main.async { self.data = nil }
@@ -131,6 +132,22 @@ final class PlanFitModel: ObservableObject {
         }
         let parsed = Self.parse(json)
         DispatchQueue.main.async { self.data = parsed }
+    }
+
+    /// mtime of plan_fit.json at the last `refresh()`. Used by
+    /// `refreshIfChanged()` so cheap high-frequency lanes (30s UI tick,
+    /// post-config-change burst) can poll without re-parsing an unchanged
+    /// file.
+    private var lastSeenMtime: Date?
+
+    /// `refresh()` only if plan_fit.json's mtime moved since the last read —
+    /// a single stat() in the common no-change case. A missing file counts as
+    /// changed only if we previously had data (so it clears once, not every
+    /// tick).
+    func refreshIfChanged() {
+        let mtime = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationDate] as? Date) ?? nil
+        if mtime == lastSeenMtime { return }
+        refresh()
     }
 
     private static func parse(_ json: [String: Any]) -> PlanFitData {

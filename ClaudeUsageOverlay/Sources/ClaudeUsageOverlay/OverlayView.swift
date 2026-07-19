@@ -1281,13 +1281,21 @@ struct OverlayView: View {
                 // the plan/tier comparison isn't the relevant framing there
                 // (a dollar budget is), so it's replaced by the budget
                 // summary line below.
-                if let plan = data.currentPlan, !isApi {
+                // The capsule reads the LIVE config plan, not plan_fit.json's
+                // current_plan — the latter only updates after the daemon's
+                // config-triggered rewrite lands AND this model re-reads the
+                // file, which made a Max pro/5x/20x switch in Settings look
+                // like it didn't take. (Same live-config treatment the
+                // API/Max framing already got.) The verdict/tier text below
+                // still comes from plan_fit.json and catches up within
+                // seconds via the post-config-change refresh burst.
+                if !isApi {
                     HStack {
                         Text("Current plan")
                             .font(.system(size: 9.5))
                             .foregroundColor(.white.opacity(0.5))
                         Spacer()
-                        Text(planFit.displayName(forPlanKey: plan))
+                        Text(planFit.displayName(forPlanKey: configStore.config.accountPlan))
                             .font(.system(size: 9.5, weight: .bold))
                             .foregroundColor(.white)
                             .padding(.horizontal, 6)
