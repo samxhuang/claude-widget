@@ -770,7 +770,8 @@ def _parse_cli_transcript(jsonl_path: Path, file_stat, project_folder: Path) -> 
     }
 
 
-def compute_cli_records(now: float, runtime: dict, cache: dict) -> dict:
+def compute_cli_records(now: float, runtime: dict, cache: dict,
+                        retention_minutes: float = ACTIVE_WINDOW_MINUTES) -> dict:
     """OUTSIDE StateLock: scan recent CLI transcripts and return
     {session_id: record}. This does NOT read or mutate state.json — it only
     computes what the files say; merge_cli_records() applies that to state
@@ -788,8 +789,13 @@ def compute_cli_records(now: float, runtime: dict, cache: dict) -> dict:
     if not PROJECTS_DIR.is_dir():
         return records
 
-    scan_cutoff = now - SCAN_WINDOW_MINUTES * 60
-    active_window_seconds = ACTIVE_WINDOW_MINUTES * 60
+    # Configurable idle retention (config.json sessions.idle_retention_minutes)
+    # replaces the hardcoded ACTIVE_WINDOW_MINUTES as the "how long does an
+    # idle session stay listed" knob. The scan window stretches with it (it
+    # must stay >= the active window — see the lockstep comment on
+    # SCAN_WINDOW_MINUTES) but never shrinks below the historical 30m floor.
+    scan_cutoff = now - max(SCAN_WINDOW_MINUTES, retention_minutes) * 60
+    active_window_seconds = retention_minutes * 60
     in_window_paths = set()
 
     for project_folder in PROJECTS_DIR.iterdir():
@@ -968,7 +974,8 @@ def _truthy(value) -> bool:
     return bool(value)
 
 
-def compute_cowork_records(now: float) -> dict:
+def compute_cowork_records(now: float,
+                           retention_minutes: float = ACTIVE_WINDOW_MINUTES) -> dict:
     """OUTSIDE StateLock: scan Cowork sessions (including Claude Desktop's
     Cowork mode) and return {session_id: record}. Cowork sessions don't write
     into ~/.claude/projects — they get their own metadata file plus an
@@ -983,7 +990,10 @@ def compute_cowork_records(now: float) -> dict:
     if not COWORK_SESSIONS_DIR.is_dir():
         return records
 
-    scan_cutoff_ms = (now - SCAN_WINDOW_MINUTES * 60) * 1000
+    # Same configurable retention as the CLI scan: the scan window stretches
+    # with it (floor 30m), and "gone quiet" is judged at the retention edge.
+    scan_cutoff_ms = (now - max(SCAN_WINDOW_MINUTES, retention_minutes) * 60) * 1000
+    quiet_cutoff_ms = (now - retention_minutes * 60) * 1000
 
     for meta_path in COWORK_SESSIONS_DIR.rglob("local_*.json"):
         # Sibling directory of the same name holds audit.jsonl; if it's not
@@ -1008,7 +1018,7 @@ def compute_cowork_records(now: float) -> dict:
             last_activity_ms = float(meta.get("lastActivityAt", 0))
         except (TypeError, ValueError):
             last_activity_ms = 0
-        if last_activity_ms and last_activity_ms < scan_cutoff_ms:
+        if last_activity_ms and last_activity_ms < quiet_cutoff_ms:
             records[session_id] = {"status": None}  # gone quiet — drop if tracked
             continue
 
@@ -1238,10 +1248,13 @@ def prune_deleted_sessions(state: dict) -> None:
         del state[session_id]
 
 
-def prune_old_entries(state: dict) -> None:
+def prune_old_entries(state: dict,
+                      retention_minutes: float = ACTIVE_WINDOW_MINUTES) -> None:
     now = time.time()
     handled_cutoff = now - PRUNE_AFTER_HOURS * 3600
-    active_cutoff = now - ACTIVE_STALE_MINUTES * 60
+    # Safety-net stale cutoff scales with the configured retention (same 2x
+    # ratio ACTIVE_STALE_MINUTES always had over the active window).
+    active_cutoff = now - retention_minutes * 2 * 60
 
     stale = []
     for sid, e in state.items():
@@ -1367,6 +1380,12 @@ def main() -> None:
     threading.Thread(target=remote_sync._remote_sync_worker,
                      name="remote-sync", daemon=True).start()
 
+    # Session idle-retention is user-configurable (Settings → Sessions →
+    # config.json sessions.idle_retention_minutes). Cached on config mtime so
+    # the 10s loop stats one file instead of re-parsing JSON every cycle.
+    retention_minutes: float = float(autoresume_config.DEFAULT_IDLE_RETENTION_MINUTES)
+    retention_cfg_mtime: object = None
+
     while True:
         try:
             # File reading, JSON parsing and work_status classification all
@@ -1376,9 +1395,17 @@ def main() -> None:
             # resume/prune steps, and save — not across a full re-read of every
             # in-window transcript, every 10s, as it used to be.
             now = time.time()
+            cfg_mtime = autoresume_config.config_mtime(STATE_DIR)
+            if cfg_mtime != retention_cfg_mtime:
+                retention_cfg_mtime = cfg_mtime
+                new_retention = float(autoresume_config.load_config(STATE_DIR)
+                                      ["sessions"]["idle_retention_minutes"])
+                if new_retention != retention_minutes:
+                    log(f"session idle retention: {retention_minutes:g}m -> {new_retention:g}m (config.json)")
+                    retention_minutes = new_retention
             runtime = collect_runtime_snapshot()
-            cli_records = compute_cli_records(now, runtime, _PARSE_CACHE)
-            cowork_records = compute_cowork_records(now)
+            cli_records = compute_cli_records(now, runtime, _PARSE_CACHE, retention_minutes)
+            cowork_records = compute_cowork_records(now, retention_minutes)
             with StateLock():
                 state = load_state()
                 merge_cli_records(state, cli_records, now)
@@ -1390,7 +1417,7 @@ def main() -> None:
                 # of performing any live UI automation.
                 cowork_resume.process_armed_sessions(state, log)
                 prune_deleted_sessions(state)
-                prune_old_entries(state)
+                prune_old_entries(state, retention_minutes)
                 save_state(state)
         except Exception as e:  # daemon must never die from a single bad cycle
             log(f"ERROR in poll cycle: {e!r}")

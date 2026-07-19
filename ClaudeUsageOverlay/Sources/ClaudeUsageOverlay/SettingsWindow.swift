@@ -44,6 +44,8 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 20) {
                 AccountBudgetSection(configStore: configStore)
                 Divider()
+                SessionsSection(configStore: configStore)
+                Divider()
                 RemoteHostsSection(configStore: configStore)
             }
             .padding(20)
@@ -99,6 +101,56 @@ private enum AccountChoice: String, CaseIterable, Identifiable {
 // while the UI would have shown the chosen day. Restrict the picker to the two
 // the daemon actually honors rather than offering all seven.
 private let weekdayOptions = ["monday", "sunday"]
+
+// MARK: - Sessions
+
+/// How long an idle session stays in the Sessions list before the daemon
+/// drops it (config.json `sessions.idle_retention_minutes`). A discrete
+/// picker rather than a free-text field, so — unlike the typed budget fields
+/// above — selecting IS applying; no Apply/Cancel ambiguity to resolve. The
+/// daemon picks the change up within one 10s poll.
+struct SessionsSection: View {
+    @ObservedObject var configStore: ConfigStore
+
+    /// (minutes, label). 30 is the historical default; the daemon clamps
+    /// anything outside 5–1440.
+    private static let options: [(Int, String)] = [
+        (15, "15 minutes"),
+        (30, "30 minutes (default)"),
+        (60, "1 hour"),
+        (120, "2 hours"),
+        (240, "4 hours"),
+        (720, "12 hours"),
+        (1440, "24 hours"),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Sessions")
+                .font(.headline)
+            Picker("Keep idle sessions listed for", selection: Binding(
+                get: { nearestOption(configStore.config.idleRetentionMinutes) },
+                set: { configStore.setIdleRetention(minutes: $0) }
+            )) {
+                ForEach(Self.options, id: \.0) { minutes, label in
+                    Text(label).tag(minutes)
+                }
+            }
+            .pickerStyle(.menu)
+            Text("A session that goes quiet stays in the widget's Sessions list this long before it's dropped. Applies immediately; sessions cut off by a rate limit are kept regardless until resumed.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    /// A hand-edited config can hold any clamped value (e.g. 45); snap the
+    /// picker to the nearest option for display without rewriting the file.
+    private func nearestOption(_ minutes: Int) -> Int {
+        Self.options.min(by: {
+            abs($0.0 - minutes) < abs($1.0 - minutes)
+        })?.0 ?? 30
+    }
+}
 
 struct AccountBudgetSection: View {
     @ObservedObject var configStore: ConfigStore

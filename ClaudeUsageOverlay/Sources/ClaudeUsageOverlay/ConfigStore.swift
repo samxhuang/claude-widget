@@ -45,6 +45,10 @@ struct AppConfig: Equatable {
     var weekStart: String = "monday"
     var timezone: String = "local"
     var remoteHosts: [RemoteHostConfig] = []
+    /// How long an idle session stays in the Sessions list before the daemon
+    /// drops it (config.json `sessions.idle_retention_minutes`; daemon clamps
+    /// to 5–1440).
+    var idleRetentionMinutes: Int = 30
 
     var isApiAccount: Bool { accountType == "api" }
 }
@@ -162,6 +166,17 @@ final class ConfigStore: ObservableObject {
             budget["week_start"] = weekStart
             budget["timezone"] = timezone
             root["budget"] = budget
+        }
+    }
+
+    /// Sessions-list idle retention (minutes). Clamped to the daemon's
+    /// accepted range so what's shown is what takes effect.
+    func setIdleRetention(minutes: Int) {
+        let clamped = min(1440, max(5, minutes))
+        mutate { root in
+            var sessions = (root["sessions"] as? [String: Any]) ?? [:]
+            sessions["idle_retention_minutes"] = clamped
+            root["sessions"] = sessions
         }
     }
 
@@ -318,6 +333,10 @@ final class ConfigStore: ObservableObject {
             c.monthlyUsd = (budget["monthly_usd"] as? NSNumber)?.doubleValue
             if let ws = budget["week_start"] as? String { c.weekStart = ws }
             if let tz = budget["timezone"] as? String { c.timezone = tz }
+        }
+        if let sessions = root["sessions"] as? [String: Any],
+           let retention = (sessions["idle_retention_minutes"] as? NSNumber)?.intValue {
+            c.idleRetentionMinutes = retention
         }
         if let hosts = root["remote_hosts"] as? [[String: Any]] {
             c.remoteHosts = hosts.compactMap { h in

@@ -52,6 +52,13 @@ DEFAULT_PLAN = "max_20x"
 DEFAULT_HOST_POLL_SECONDS = 30
 MIN_HOST_POLL_SECONDS = 10
 
+# How long an idle (never-rate-limited) session stays in the widget's
+# Sessions list before the daemon drops it. Default matches the historical
+# hardcoded ACTIVE_WINDOW_MINUTES = 30.
+DEFAULT_IDLE_RETENTION_MINUTES = 30
+MIN_IDLE_RETENTION_MINUTES = 5
+MAX_IDLE_RETENTION_MINUTES = 24 * 60
+
 
 def _default_config() -> dict:
     return {
@@ -64,6 +71,7 @@ def _default_config() -> dict:
             "timezone": "local",
         },
         "remote_hosts": [],
+        "sessions": {"idle_retention_minutes": DEFAULT_IDLE_RETENTION_MINUTES},
     }
 
 
@@ -161,5 +169,13 @@ def load_config(state_dir: Path) -> dict:
     if isinstance(hosts, list):
         seen: set = set()
         cfg["remote_hosts"] = [h for h in (_clean_host(r, seen) for r in hosts) if h is not None]
+
+    sessions = raw.get("sessions")
+    if isinstance(sessions, dict):
+        retention = sessions.get("idle_retention_minutes")
+        if not isinstance(retention, bool) and isinstance(retention, (int, float)):
+            cfg["sessions"]["idle_retention_minutes"] = int(
+                min(MAX_IDLE_RETENTION_MINUTES,
+                    max(MIN_IDLE_RETENTION_MINUTES, retention)))
 
     return cfg
