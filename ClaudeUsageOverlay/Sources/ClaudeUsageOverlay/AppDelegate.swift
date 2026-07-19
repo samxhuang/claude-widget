@@ -2,7 +2,18 @@ import Cocoa
 import SwiftUI
 import Combine
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+/// Item 2 (user-resizable panel height): how much taller the user has
+/// dragged the panel beyond its content-computed base height. `0` means the
+/// panel is exactly its computed (base) size — the normal, un-resized state.
+/// An `ObservableObject` (rather than a plain struct threaded through) so
+/// OverlayView's Sessions ScrollView can react live as AppDelegate updates
+/// this from `windowDidResize` during an in-progress drag, without
+/// AppDelegate needing any reference into the SwiftUI view tree itself.
+final class PanelSizeState: ObservableObject {
+    @Published var userExtraHeight: CGFloat = 0
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private var overlayPanel: NSPanel!
     private let model = UsageModel()
@@ -41,8 +52,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var stateWatchDebounce: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
 
-    // Panel sizing: fixed width, height computed from which of the three
-    // collapsible sections (Sessions, Recent chats, Plan fit) are expanded.
+    // Panel sizing: fixed width, height computed from which tab is showing
+    // and, on the Main tab, whether Sessions (now inclusive of chat rows —
+    // see item 3's merge) is expanded.
     // Anchored to the panel's own top-right corner — resizing only moves the
     // bottom edge, never the top-right one. Item 1 fix: this used to be a
     // screen-relative anchor computed once at launch (panelTopY/panelRightX)
@@ -63,15 +75,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // row, (b) folding the "updated Xm" caption onto the Weekly row's reset
     // line instead of its own line, and (c) removing the Plan fit section
     // (header + divider) from the Main tab entirely — it's a tab now, not a
-    // collapsible section. Collapsed Main tab content (header/tab row + 2
-    // usage rows + 2 dividers + 2 section headers, at 8pt VStack spacing +
-    // 20pt outer padding) measured 181pt via the temporary probe
-    // (NSHostingView.intrinsicContentSize({280, 181})), down from the
-    // previous 255pt real-content figure now that the tab-switch row and the
-    // standalone "updated" line are both gone and Plan fit's header/divider
-    // no longer live on this tab. +3pt breathing room below that, same
-    // rationale as before.
-    private let collapsedPanelHeight: CGFloat = 184
+    // collapsible section. Collapsed Main tab content at that point (header/
+    // tab row + 2 usage rows + 2 dividers + 2 section headers) measured
+    // 181pt, +3pt breathing room = 184.
+    //
+    // Item 3 (merge) re-audit: Recent chats' own always-visible header row
+    // (chevron/title/badge) and the divider separating it from Sessions are
+    // both gone now — chat rows joined the unified Sessions list instead
+    // (see OverlayView.CombinedSessionRow). Re-measured via a temporary
+    // NSHostingView.fittingSize probe (same technique as the item-1 audit
+    // above, this time using a throwaway GraphModel forced to .main and
+    // sessionsModel.sessionsExpanded forced false for the duration of the
+    // measurement, both restored immediately after, so the live panel and
+    // persisted defaults were never actually disturbed): collapsed Main tab
+    // content (header/tab row + 2 usage rows + 1 divider + 1 section header,
+    // at 8pt VStack spacing + 20pt outer padding) now measures 151pt via
+    // `NSHostingView.fittingSize` at width 280. +3pt breathing room, same
+    // rationale as before, = 154.
+    private let collapsedPanelHeight: CGFloat = 154
     // Both sections are wrapped in a ScrollView, so these only need to cover
     // a handful of visible rows — the ScrollView absorbs any overflow rather
     // than the panel growing to fit every entry. Halved from their original
@@ -82,14 +103,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // as intended rather than silently under-covering. Left unchanged.
     //
     // Item 4 fix: derived from OverlayView.SectionLayout (the single source
-    // of truth also used by the `.frame(height:)` on each section's actual
-    // ScrollView) rather than restated as separate literals, so this sum can
-    // never silently drift out of sync with what OverlayView actually
+    // of truth also used by the `.frame(height:)` on the section's actual
+    // ScrollView) rather than restated as a separate literal, so this sum
+    // can never silently drift out of sync with what OverlayView actually
     // renders. `siblingSpacing` accounts for the VStack(spacing: 8) gap
     // OverlayView.body inserts between the section's header row and its
-    // expanded content block. Evaluates to the same 145 / 140 as before.
+    // expanded content block.
+    //
+    // Item 3 (merge): Recent chats is no longer a second, independently
+    // collapsible section — its rows joined the unified Sessions list (see
+    // OverlayView.CombinedSessionRow) — so `chatsExpandedExtra` and
+    // `SectionLayout.chatsContentHeight` are gone; `collapsedPanelHeight`
+    // below has also been re-audited down since Recent chats' own
+    // always-visible header row + divider no longer exist to account for.
     private let sessionsExpandedExtra: CGFloat = SectionLayout.sessionsContentHeight + SectionLayout.siblingSpacing
-    private let chatsExpandedExtra: CGFloat = SectionLayout.chatsContentHeight + SectionLayout.siblingSpacing
     // Plan fit item 3: no longer a Main-tab collapsible section — it's its
     // own tab now, with a fixed panel height (same pattern as
     // graphPanelHeight below) rather than a collapsed-base-plus-extra. Full
@@ -110,6 +137,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // ~100pt of dead space at the bottom. Item 2's y-axis label gutters sit
     // inside the charts' existing frame(height:) and don't add any height.
     private let graphPanelHeight: CGFloat = 316
+
+    private static let userExtraHeightDefaultsKey = "panelUserExtraHeight"
+    /// Item 2: created eagerly (not lazily on first resize) so OverlayView
+    /// always has a live object to observe from the very first frame,
+    /// seeded from whatever extra height the user last dragged in (0 if
+    /// never resized, or on first launch).
+    private let panelSizeState: PanelSizeState = {
+        let state = PanelSizeState()
+        let saved = UserDefaults.standard.double(forKey: AppDelegate.userExtraHeightDefaultsKey)
+        state.userExtraHeight = max(0, CGFloat(saved))
+        return state
+    }()
 
     private static let panelLockedDefaultsKey = "panelPositionLocked"
     /// Persisted; defaults to unlocked so existing drag-to-move behavior is
@@ -217,14 +256,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        chatsModel.$chatsExpanded
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] expanded in
-                self?.updatePanelSize()
-                self?.statusItem.menu?.item(withTitle: "Show Chats")?.state = expanded ? .on : .off
-            }
-            .store(in: &cancellables)
+        // Item 3 (merge): Recent chats no longer has its own expand/collapse
+        // state to watch here — chat rows ride along with Sessions'
+        // sessionsExpanded above.
 
         // The Graph and Plan fit tabs each use their own fixed panel height
         // distinct from the collapsed/expanded-extras math the Main tab
@@ -293,10 +327,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionsToggleItem.state = sessionsModel.sessionsExpanded ? .on : .off
         menu.addItem(sessionsToggleItem)
 
-        let chatsToggleItem = NSMenuItem(title: "Show Chats", action: #selector(toggleChatsSection), keyEquivalent: "")
-        chatsToggleItem.target = self
-        chatsToggleItem.state = chatsModel.chatsExpanded ? .on : .off
-        menu.addItem(chatsToggleItem)
+        // Item 3 (merge): no more standalone "Show Chats" toggle — chat rows
+        // are part of the unified Sessions list now, governed by "Show
+        // Sessions" above.
 
         menu.addItem(.separator())
 
@@ -330,10 +363,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleSessionsSection() {
         sessionsModel.sessionsExpanded.toggle()
-    }
-
-    @objc private func toggleChatsSection() {
-        chatsModel.chatsExpanded.toggle()
     }
 
     @objc private func toggleLockPosition() {
@@ -388,7 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupOverlayPanel() {
         let initialHeight = currentPanelHeight()
 
-        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, cloudSessions: cloudSessionsModel, planFit: planFitModel, graph: graphModel, onExpandGraph: { [weak self] in
+        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, cloudSessions: cloudSessionsModel, planFit: planFitModel, graph: graphModel, panelSize: panelSizeState, onExpandGraph: { [weak self] in
             self?.presentGraphWindow()
         }))
         // Without this, NSHostingView installs Auto Layout min/max-size
@@ -403,9 +432,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hosting.sizingOptions = []
         hosting.frame = NSRect(x: 0, y: 0, width: panelWidth, height: initialHeight)
 
+        // Item 2: `.resizable` lets the user drag the panel's bottom edge
+        // (or a corner — width is pinned via minSize/maxSize below, so any
+        // drag only ever changes height) to show more Sessions rows at
+        // once. See applyResizeConstraints/windowDidResize for the
+        // min/max-height plumbing and currentPanelHeight()'s doc comment
+        // for how the resulting extra height flows into the SwiftUI view.
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: initialHeight),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless, .nonactivatingPanel, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -417,12 +452,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false
         panel.contentView = hosting
+        // NSWindowDelegate: windowDidResize below is what turns a live user
+        // drag into a published `userExtraHeight`. Note `isMovable`/
+        // `isMovableByWindowBackground` (toggled by Lock Position, see
+        // applyPanelLockState) only govern *moving* the window — they have
+        // no effect on `.resizable`'s drag-to-resize, so a locked panel
+        // stays resizable by design.
+        panel.delegate = self
+        applyResizeConstraints(to: panel)
 
         panel.setFrame(initialPanelFrame(height: initialHeight), display: false)
 
         panel.orderFrontRegardless()
         self.overlayPanel = panel
         applyPanelLockState()
+    }
+
+    /// Item 2: width is fixed (min == max == panelWidth, so a drag can only
+    /// ever change height); height's floor is whatever the CURRENT tab's
+    /// content actually needs (`computedContentHeight()`, i.e. without any
+    /// user extra) so a resize can never clip content, and its ceiling is
+    /// the screen's visible height. Re-applied from updatePanelSize()
+    /// whenever the floor might have changed (tab switch, section
+    /// expand/collapse) — not just once at launch — since minSize is a
+    /// hard AppKit constraint that would otherwise still reflect the old
+    /// tab/section's requirements.
+    private func applyResizeConstraints(to panel: NSPanel) {
+        let minHeight = computedContentHeight()
+        let screenHeight = (panel.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame.height ?? 2000
+        panel.minSize = NSSize(width: panelWidth, height: minHeight)
+        panel.maxSize = NSSize(width: panelWidth, height: max(minHeight, screenHeight))
     }
 
     /// Reflects `panelPositionLocked` onto the live panel. Both `isMovable`
@@ -453,13 +512,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSRect(x: x, y: y, width: panelWidth, height: height)
     }
 
-    /// On the Main tab, Sessions and Recent chats are independently
-    /// collapsible, so the panel's height is the collapsed base plus
-    /// whichever of the two sections' extra heights currently apply. The
-    /// Graph and Plan fit tabs (item 3: Plan fit is no longer a Main-tab
-    /// collapsible section) each replace all of that with their own fixed
-    /// height.
-    private func currentPanelHeight() -> CGFloat {
+    /// On the Main tab, Sessions is collapsible, so the panel's height is
+    /// the collapsed base plus its extra height when expanded. The Graph and
+    /// Plan fit tabs (item 3: Plan fit is no longer a Main-tab collapsible
+    /// section) each replace all of that with their own fixed height. This
+    /// is the pure CONTENT-driven height — it deliberately excludes
+    /// `panelSizeState.userExtraHeight` (item 2) so it can double as the
+    /// resize floor in `applyResizeConstraints`; `currentPanelHeight()`
+    /// below is the one that adds the user's extra back in for actually
+    /// sizing/placing the panel.
+    private func computedContentHeight() -> CGFloat {
         switch graphModel.selectedTab {
         case .graph:
             return graphPanelHeight
@@ -468,9 +530,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .main:
             var height = collapsedPanelHeight
             if sessionsModel.sessionsExpanded { height += sessionsExpandedExtra }
-            if chatsModel.chatsExpanded { height += chatsExpandedExtra }
             return height
         }
+    }
+
+    /// Item 2: `computedContentHeight()` plus however much extra height the
+    /// user has dragged the panel to on the Main tab (see
+    /// `PanelSizeState`/`windowDidResize`) — the Sessions ScrollView is the
+    /// only thing that can absorb that extra space (OverlayView adds it to
+    /// `SectionLayout.sessionsContentHeight`), so it only applies there; the
+    /// Graph/Plan fit tabs always get exactly their fixed content height.
+    private func currentPanelHeight() -> CGFloat {
+        let base = computedContentHeight()
+        guard graphModel.selectedTab == .main else { return base }
+        return base + panelSizeState.userExtraHeight
     }
 
     /// Item 1 fix: resizes the panel while preserving its TOP-RIGHT corner,
@@ -502,6 +575,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// applyPanelLockState already handles separately.
     private func updatePanelSize() {
         guard let panel = overlayPanel else { return }
+        // Item 2: the content-driven floor (minSize) can change with this
+        // same call (e.g. Sessions just expanded, or the tab switched to
+        // one with a different fixed height) — refresh it BEFORE computing
+        // newFrame below, so AppKit's own min/max clamping (setFrame is
+        // constrained by minSize/maxSize) can't fight the frame we're about
+        // to request using a now-stale floor from the previous tab/section
+        // state.
+        applyResizeConstraints(to: panel)
         let oldFrame = panel.frame
         let newHeight = currentPanelHeight()
         let newOrigin = NSPoint(x: oldFrame.maxX - panelWidth, y: oldFrame.maxY - newHeight)
@@ -510,6 +591,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // in-flight state that could interact oddly with the click that
         // triggered it.
         panel.setFrame(newFrame, display: true, animate: false)
+    }
+
+    // MARK: - NSWindowDelegate (item 2: user-resizable panel height)
+
+    /// Fires continuously while the user drags the panel's resizable bottom
+    /// edge (width can't change — minSize.width == maxSize.width — so every
+    /// live resize is purely a height change), AND once for each of our own
+    /// programmatic `setFrame` calls (`updatePanelSize`, `snapToTopRight`).
+    /// The `abs(...) > 0.5` guard is what keeps those programmatic
+    /// round-trips from perturbing the persisted value: a programmatic
+    /// resize always sets `frame.height = computedContentHeight() +
+    /// panelSizeState.userExtraHeight` (see `currentPanelHeight()`), so
+    /// recomputing `extra` from the resulting frame lands back on the same
+    /// value modulo floating-point noise, rather than double-counting it.
+    ///
+    /// Only the Main tab has anywhere to put extra height (the Sessions
+    /// ScrollView — see OverlayView's `panelSize.userExtraHeight` use) and
+    /// its minSize == maxSize on the Graph/Plan fit tabs make those
+    /// effectively non-resizable, so this early-returns there rather than
+    /// recording a meaningless "extra" against those tabs' fixed height.
+    func windowDidResize(_ notification: Notification) {
+        guard let panel = notification.object as? NSPanel, panel === overlayPanel else { return }
+        guard graphModel.selectedTab == .main else { return }
+        let base = computedContentHeight()
+        let extra = max(0, panel.frame.height - base)
+        guard abs(extra - panelSizeState.userExtraHeight) > 0.5 else { return }
+        panelSizeState.userExtraHeight = extra
+        UserDefaults.standard.set(Double(extra), forKey: Self.userExtraHeightDefaultsKey)
     }
 
     /// Item 1: moves the panel flush to the top-right corner of whichever

@@ -31,28 +31,11 @@ final class ChatsModel: ObservableObject {
 
     @Published var now: Date = Date()
 
-    private static let expandedDefaultsKey = "chatsExpanded"
-    /// Persisted across launches, same pattern as SessionsModel.sessionsExpanded.
-    /// Starts collapsed.
-    @Published var chatsExpanded: Bool {
-        didSet { UserDefaults.standard.set(chatsExpanded, forKey: Self.expandedDefaultsKey) }
-    }
-
-    private var lastToggleAt: Date = .distantPast
-
-    init() {
-        self.chatsExpanded = UserDefaults.standard.object(forKey: Self.expandedDefaultsKey) as? Bool ?? false
-    }
-
-    /// Debounced the same way SessionsModel.toggleSessionsExpanded is — a
-    /// click delivered twice in quick succession inside a non-activating
-    /// panel would otherwise expand and immediately re-collapse in one frame.
-    func toggleChatsExpanded() {
-        let now = Date()
-        guard now.timeIntervalSince(lastToggleAt) > 0.35 else { return }
-        lastToggleAt = now
-        chatsExpanded.toggle()
-    }
+    // Item 3 (merge): `chatsExpanded`/`toggleChatsExpanded` used to back
+    // Recent chats' own collapsible section header. That section is gone —
+    // chat rows now join the unified Sessions list unconditionally (subject
+    // to Sessions' own expand/collapse) — so this model no longer tracks
+    // any expand state of its own.
 
     func tick() {
         now = Date()

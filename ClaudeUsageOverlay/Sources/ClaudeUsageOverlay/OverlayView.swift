@@ -1,32 +1,34 @@
 import SwiftUI
 import AppKit
 
-/// Single source of truth for the fixed heights each collapsible section's
+/// Single source of truth for the fixed height the Sessions section's
 /// expanded ScrollView content occupies. AppDelegate's currentPanelHeight()
-/// composes these (plus `siblingSpacing`, matching this file's outer
+/// composes this (plus `siblingSpacing`, matching this file's outer
 /// `VStack(spacing: 8)` that every top-level row below is spliced into) into
-/// its `sessionsExpandedExtra`/`chatsExpandedExtra` constants, so the
-/// panel's reserved height and the SwiftUI frame that actually consumes it
-/// can never drift apart.
+/// its `sessionsExpandedExtra` constant, so the panel's reserved height and
+/// the SwiftUI frame that actually consumes it can never drift apart.
 ///
-/// Item 4 fix: Sessions' and Chats' expanded ScrollViews used to be sized
-/// with `.frame(maxHeight:)`, which is flexible — SwiftUI treats a ScrollView
-/// like that as wanting to grow to fill whatever vertical slack is left over
-/// in the panel's (fixed, AppDelegate-driven) height once the fixed-size
-/// rows are accounted for. With Sessions expanded and Chats collapsed,
-/// Sessions' ScrollView was the *only* flexible child, so it absorbed all of
-/// that slack; expanding Chats added a second flexible child and changed how
-/// the same slack got split between the two, which is what made Sessions
-/// visibly grow/shrink purely as a side effect of Chats' state. Giving each
-/// ScrollView a true fixed `.frame(height:)` removes it from that shared
-/// slack pool entirely — its rendered height depends only on this constant,
-/// never on any sibling section's expanded/collapsed state.
+/// Item 4 fix: this ScrollView used to be sized with `.frame(maxHeight:)`,
+/// which is flexible — SwiftUI treats a ScrollView like that as wanting to
+/// grow to fill whatever vertical slack is left over in the panel's (fixed,
+/// AppDelegate-driven) height once the fixed-size rows are accounted for.
+/// Back when Recent chats was a second, independently-expandable section,
+/// that made Sessions' rendered height drift depending on Chats' state.
+/// Giving the ScrollView a true fixed `.frame(height:)` removed it from any
+/// shared slack pool entirely — its rendered height depends only on this
+/// constant (plus item 2's user-resize extra, added at the call site).
+///
+/// Item 3 (merge): Recent chats is no longer its own collapsible section —
+/// chat conversations now join the unified Sessions list as their own row
+/// kind (see OverlayView.CombinedSessionRow), so `chatsContentHeight` and
+/// its own header row/divider are gone. `sessionsContentHeight` is bumped
+/// up from the old 137 to comfortably fit a mix of session and chat rows
+/// now that this is the only list.
 enum SectionLayout {
     /// VStack sibling spacing shared by every top-level row spliced into
     /// OverlayView.body's outer `VStack(spacing: 8)`.
     static let siblingSpacing: CGFloat = 8
-    static let sessionsContentHeight: CGFloat = 137
-    static let chatsContentHeight: CGFloat = 132
+    static let sessionsContentHeight: CGFloat = 220
 }
 
 struct OverlayView: View {
@@ -38,9 +40,24 @@ struct OverlayView: View {
     @ObservedObject var cloudSessions: CloudSessionsModel
     @ObservedObject var planFit: PlanFitModel
     @ObservedObject var graph: GraphModel
+    /// Item 2 (resizable panel): the panel's user-dragged "extra" height
+    /// beyond its content-computed base — see AppDelegate.PanelSizeState's
+    /// doc comment. Read by sessionsSection to grow the Sessions ScrollView
+    /// live as the user resizes.
+    @ObservedObject var panelSize: PanelSizeState
     /// Opens the larger, resizable graph window (item 3) — forwarded down to
     /// GraphView's expand button.
     var onExpandGraph: () -> Void = {}
+
+    /// Sort-deadband state (see combinedSessionRows): an ordered list of row
+    /// ids from the last computed arrangement, used as the tiebreak below.
+    /// Held as a plain (non-@Published) reference type inside @State so the
+    /// same instance — and thus the memory — survives across SwiftUI
+    /// recreating this View struct on every re-render; mutating its
+    /// property doesn't itself trigger a redraw (only the @ObservedObject
+    /// models above do that), which is exactly what's wanted here: this is
+    /// a derived cache, not source-of-truth state.
+    @State private var sessionOrderMemory = SessionOrderMemory()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -136,11 +153,13 @@ struct OverlayView: View {
 
         Divider().background(Color.white.opacity(0.15))
 
+        // Item 3 (merge): Recent chats used to be its own collapsible
+        // section here (its own header row + divider + ScrollView). It's
+        // gone — chat conversations now join the unified list inside
+        // sessionsSection as their own row kind (see CombinedSessionRow),
+        // sorted into the idle/done bucket like a finished session. See
+        // combinedSessionRows/chatRow for the row-level details.
         sessionsSection
-
-        Divider().background(Color.white.opacity(0.15))
-
-        chatsSection
     }
 
     // MARK: - Interrupted sessions
@@ -186,34 +205,53 @@ struct OverlayView: View {
             // of the old `.frame(maxHeight: 300)`, so this block's rendered
             // height never depends on whether Recent chats is expanded.
             Group {
-                if sessions.sessions.isEmpty && cloudSessions.sessions.isEmpty {
+                // Item 3 (merge): chats folded in here too, so "no rows at
+                // all" now depends on all three sources being empty. Chat
+                // fetch failures (isLoggedOut/lastError) are deliberately
+                // not surfaced with their own message here anymore (unlike
+                // the old standalone Recent chats section) — both fetchers
+                // share the same underlying webview session, so a real
+                // sign-out is already flagged at the title row's
+                // `model.isLoggedOut`/`model.lastError`; a chats-only
+                // hiccup just means zero chat rows join the list below,
+                // which reads fine on its own.
+                if sessions.sessions.isEmpty && cloudSessions.sessions.isEmpty && chats.chats.isEmpty {
                     Text("No sessions")
                         .font(.system(size: 9))
                         .foregroundColor(.white.opacity(0.4))
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 6) {
-                            // Status classification item: local and cloud
-                            // rows are merged into one list and sorted by
-                            // status (needs-input first, then running, then
-                            // idle) rather than rendered as two separate,
-                            // independently-ordered blocks — a needs-input
-                            // cloud session shouldn't be buried below a pile
-                            // of idle local ones just because of which model
-                            // it came from.
+                            // Status classification item: local, cloud, and
+                            // (item 3) chat rows are merged into one list and
+                            // sorted by status (needs-input first, then
+                            // running, then idle/done — chats always fall
+                            // into idle/done) rather than rendered as
+                            // separate, independently-ordered blocks — a
+                            // needs-input cloud session shouldn't be buried
+                            // below a pile of idle local ones just because of
+                            // which model it came from.
                             ForEach(combinedSessionRows) { row in
                                 switch row {
                                 case .local(let entry):
                                     sessionRow(entry)
                                 case .cloud(let entry):
                                     cloudSessionRow(entry)
+                                case .chat(let entry):
+                                    chatRow(entry)
                                 }
                             }
                         }
                     }
                 }
             }
-            .frame(height: SectionLayout.sessionsContentHeight, alignment: .top)
+            // Item 2 (resizable panel): `panelSize.userExtraHeight` is
+            // whatever the user has dragged the panel taller than its
+            // content-computed base — see AppDelegate.PanelSizeState and
+            // updatePanelSize()'s doc comments. Added ONLY here (not to
+            // Recent chats or any other section) per the resize spec: extra
+            // height the user drags in always goes to Sessions.
+            .frame(height: SectionLayout.sessionsContentHeight + panelSize.userExtraHeight, alignment: .top)
         }
     }
 
@@ -222,11 +260,16 @@ struct OverlayView: View {
     private enum CombinedSessionRow: Identifiable {
         case local(SessionEntry)
         case cloud(CloudSessionEntry)
+        /// Item 3 (merge): a claude.ai web conversation, folded into the
+        /// unified list as its own row kind rather than living in a
+        /// separate "Recent chats" section.
+        case chat(ChatEntry)
 
         var id: String {
             switch self {
             case .local(let e): return "local-\(e.id)"
             case .cloud(let e): return "cloud-\(e.id)"
+            case .chat(let e): return "chat-\(e.uuid)"
             }
         }
 
@@ -234,21 +277,99 @@ struct OverlayView: View {
             switch self {
             case .local(let e): return OverlayView.priority(for: e.workStatus)
             case .cloud(let e): return OverlayView.priority(for: e.workStatus)
+            // Item 3 (merge): a chat conversation is never "in progress"
+            // work the way a session is — it always sorts into the same
+            // bucket as an idle/done session, regardless of how recently it
+            // was touched.
+            case .chat: return OverlayView.priority(for: .idle)
+            }
+        }
+
+        /// Sort deadband: the recency signal the secondary sort quantizes —
+        /// local rows use the daemon's last-activity timestamp, cloud rows
+        /// and chats their respective `updated_at`. `nil` (e.g. a
+        /// pre-work_status daemon build) sorts as if it has no recency
+        /// signal at all, i.e. last within its bucket rather than crashing
+        /// the comparator.
+        var recencyDate: Date? {
+            switch self {
+            case .local(let e): return e.lastActivityAt
+            case .cloud(let e): return e.updatedAt
+            case .chat(let e): return e.updatedAt
             }
         }
     }
 
-    /// Local rows (already de-duped/ordered by SessionsModel) plus cloud
-    /// rows (already de-duped against local ids/titles and capped by
-    /// CloudSessionsModel), merged and re-sorted needs-input-first /
-    /// running-next / idle-last. Swift's `sorted(by:)` is a stable sort, so
-    /// within each status bucket the original per-model ordering (soonest
-    /// reset first for local waiting sessions; newest-updated first for
-    /// cloud) is preserved.
+    /// Sort-deadband tiebreak state (ITEM 1): holds the row-id order from the
+    /// last time `combinedSessionRows` was computed. A plain class (not
+    /// ObservableObject) — it's mutated as a side effect of computing the
+    /// sort, not a publisher anything observes — wrapped in `@State` on
+    /// OverlayView so the instance itself persists across body
+    /// re-evaluations.
+    private final class SessionOrderMemory {
+        var order: [String] = []
+    }
+
+    /// Local rows (already de-duped by SessionsModel) plus cloud rows
+    /// (already de-duped against local ids/titles and capped by
+    /// CloudSessionsModel), merged and sorted:
+    ///
+    /// 1. Primary: needs-input < running < idle/done — a status-bucket
+    ///    change (e.g. running -> needs_input) reorders immediately.
+    /// 2. Secondary, WITHIN a status bucket: recency, but quantized to
+    ///    60-second buckets (`floor(timestamp / 60)`) rather than raw
+    ///    timestamps. Two rows whose activity lands in the same bucket are
+    ///    NOT reordered by recency at all — a row must lead by a full
+    ///    minute-bucket to overtake another. This is the fix for the report
+    ///    that two running sessions trading activity within ~1s of each
+    ///    other kept swapping rows on every refresh.
+    /// 3. Tertiary, for rows in the same bucket: the row's position in the
+    ///    PREVIOUSLY DISPLAYED arrangement (`sessionOrderMemory.order`)
+    ///    rather than raw recency or insertion order — SwiftUI recomputing
+    ///    this computed property gives no implicit stability of its own
+    ///    (unlike, say, a `List` diffing by id), so the last arrangement is
+    ///    persisted explicitly and used as the tiebreak. A row not present
+    ///    in the previous arrangement (brand new this refresh) sorts after
+    ///    every row that was already showing, rather than jumping in ahead
+    ///    of them by chance.
+    ///
+    /// Idempotent by construction: re-running this against the SAME
+    /// `sessionOrderMemory.order` it just wrote reproduces the identical
+    /// arrangement (the tiebreak is a fixed point), which matters because
+    /// SwiftUI may evaluate this computed property more than once per
+    /// render pass.
     private var combinedSessionRows: [CombinedSessionRow] {
         let rows: [CombinedSessionRow] =
-            sessions.sessions.map { .local($0) } + cloudSessions.sessions.map { .cloud($0) }
-        return rows.sorted { $0.sortPriority < $1.sortPriority }
+            sessions.sessions.map { .local($0) }
+            + cloudSessions.sessions.map { .cloud($0) }
+            // Item 3 (merge): same display cap (8) the old standalone
+            // Recent chats section used — chats always sort into the
+            // idle/done bucket regardless, so this only bounds how long the
+            // scrollable list can get, never pushes out a running/
+            // needs-input row.
+            + chats.chats.prefix(8).map { .chat($0) }
+
+        let previousIndex: [String: Int] = Dictionary(
+            uniqueKeysWithValues: sessionOrderMemory.order.enumerated().map { ($1, $0) }
+        )
+        func bucket(_ row: CombinedSessionRow) -> Int {
+            guard let date = row.recencyDate else { return Int.min }
+            return Int(floor(date.timeIntervalSince1970 / 60))
+        }
+
+        let sorted = rows.sorted { a, b in
+            if a.sortPriority != b.sortPriority { return a.sortPriority < b.sortPriority }
+            let bucketA = bucket(a)
+            let bucketB = bucket(b)
+            if bucketA != bucketB { return bucketA > bucketB } // more-recent bucket first
+            let indexA = previousIndex[a.id] ?? Int.max
+            let indexB = previousIndex[b.id] ?? Int.max
+            if indexA != indexB { return indexA < indexB }
+            return false // genuinely tied (both new, same bucket): sorted(by:) is stable, so the local-then-cloud concatenation order above stands
+        }
+
+        sessionOrderMemory.order = sorted.map { $0.id }
+        return sorted
     }
 
     /// needs-input < running < idle. A local row with no `workStatus` (daemon
@@ -280,8 +401,17 @@ struct OverlayView: View {
     private var sessionNeedsInputCount: Int {
         sessions.sessions.filter { OverlayView.priority(for: $0.workStatus) == 0 }.count + cloudSessions.needsInputCount
     }
+    /// Item 3 (merge) design choice: chat rows are folded into the "done"
+    /// count rather than left uncounted. They aren't "work" in the
+    /// running/needs-input sense the header's breakdown is really about,
+    /// but the badge's total should still match how many rows are actually
+    /// in the list below it — leaving them out risks the badge reading e.g.
+    /// "2 running" while several more (chat) rows sit unaccounted-for
+    /// beneath. Capped the same way the list itself is (prefix(8)).
     private var sessionIdleCount: Int {
-        sessions.sessions.filter { OverlayView.priority(for: $0.workStatus) == 2 }.count + cloudSessions.idleCount
+        sessions.sessions.filter { OverlayView.priority(for: $0.workStatus) == 2 }.count
+            + cloudSessions.idleCount
+            + chats.chats.prefix(8).count
     }
 
     /// Status classification item: compact "N running · N input · N done"
@@ -330,6 +460,13 @@ struct OverlayView: View {
             // needs attention).
             StatusIndicator(workStatus: entry.workStatus)
 
+            // Item 3B (click-to-open): tap targets ONLY this title/subtitle
+            // column, not the whole row — the row also hosts the Resume
+            // button and the auto-resume/arm toggle, which must keep
+            // working as independent tap targets. `contentShape` makes the
+            // VStack's whole bounding box (including its own vertical
+            // padding-free gaps between the title/subtitle lines) tappable
+            // rather than only the glyphs' own tight text bounds.
             VStack(alignment: .leading, spacing: 1) {
                 // The session's own title (e.g. "Test session do nothing")
                 // — much more useful for telling sessions in the same repo
@@ -350,6 +487,10 @@ struct OverlayView: View {
                         .font(.system(size: 8, weight: .semibold))
                         .foregroundColor(.red.opacity(0.9))
                 }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                openLocalSession(entry)
             }
 
             Spacer()
@@ -480,85 +621,55 @@ struct OverlayView: View {
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.cyan.opacity(isDone ? 0.05 : (active ? 0.14 : 0.06))))
-    }
-
-    // MARK: - Recent chats
-
-    @ViewBuilder
-    private var chatsSection: some View {
-        HStack {
-            Image(systemName: chats.chatsExpanded ? "chevron.down" : "chevron.right")
-                .font(.system(size: 8, weight: .bold))
-                .foregroundColor(.white.opacity(0.6))
-            Text("Recent chats")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(.white.opacity(0.85))
-            Spacer()
-            if chats.isLoggedOut {
-                Text("Sign in needed")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.orange)
-            } else if !chats.chats.isEmpty {
-                Text("\(chats.chats.count)")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.white.opacity(0.18)))
-            }
-        }
+        // Item 3B: no competing interactive controls on this row (unlike
+        // sessionRow's Resume button/toggle), so the whole row is the tap
+        // target — same pattern chatRow uses.
         .contentShape(Rectangle())
         .onTapGesture {
-            chats.toggleChatsExpanded()
-        }
-
-        if chats.chatsExpanded {
-            // Item 4: fixed height (see SectionLayout's doc comment) instead
-            // of the old `.frame(maxHeight: 260)`, so this block's rendered
-            // height never depends on whether Sessions is expanded.
-            Group {
-                if chats.isLoggedOut {
-                    Text("Sign in needed")
-                        .font(.system(size: 9))
-                        .foregroundColor(.orange.opacity(0.85))
-                } else if chats.lastError != nil {
-                    // Undocumented endpoint — on any failure (auth aside), show
-                    // one muted line rather than surfacing raw error text or an
-                    // empty-looking list that reads as "you have no chats".
-                    Text("chats unavailable")
-                        .font(.system(size: 9))
-                        .foregroundColor(.white.opacity(0.4))
-                } else if chats.chats.isEmpty {
-                    Text("No recent chats")
-                        .font(.system(size: 9))
-                        .foregroundColor(.white.opacity(0.4))
-                } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(chats.chats.prefix(8)) { entry in
-                                chatRow(entry)
-                            }
-                        }
-                    }
-                }
-            }
-            .frame(height: SectionLayout.chatsContentHeight, alignment: .top)
+            openCloudSession(entry)
         }
     }
 
+    // MARK: - Chats (item 3: merged into the unified Sessions list — see
+    // CombinedSessionRow.chat/combinedSessionRows above; this is now just
+    // one row kind rendered inside sessionsSection's ForEach, no longer its
+    // own collapsible section)
+
+    /// A claude.ai web conversation row. Styled like a permanently
+    /// idle/done session — no StatusIndicator dot (a conversation is never
+    /// "in progress" the way a running session is), dimmed title, and a
+    /// chat-bubble glyph in the icon slot cloudSessionRow uses for its cloud
+    /// badge, so a glance tells the three row kinds apart (plain row =
+    /// local, cloud icon = cloud session, bubble = chat). Click-to-open
+    /// behavior (opens https://claude.ai/chat/{uuid} in the default
+    /// browser) is unchanged from the old standalone Recent chats section.
     @ViewBuilder
     private func chatRow(_ entry: ChatEntry) -> some View {
         HStack(spacing: 6) {
-            Text(entry.displayTitle)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(.white.opacity(0.95))
-                .lineLimit(1)
+            // Same idle placeholder every idle/done sessionRow/
+            // cloudSessionRow uses, so the leading column stays aligned
+            // across all three row kinds in the merged list.
+            StatusIndicator(workStatus: .idle)
+
+            Image(systemName: "bubble.left.fill")
+                .font(.system(size: 9))
+                .foregroundColor(.white.opacity(0.3))
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.displayTitle)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.45))
+                    .lineLimit(1)
+                Text("chat")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundColor(.white.opacity(0.25))
+            }
 
             Spacer()
 
             Text(chats.relativeText(for: entry.updatedAt))
                 .font(.system(size: 8.5))
-                .foregroundColor(.white.opacity(0.45))
+                .foregroundColor(.white.opacity(0.3))
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
@@ -575,6 +686,36 @@ struct OverlayView: View {
     /// end up reading/replying anyway.
     private func openChat(_ uuid: String) {
         guard let url = URL(string: "https://claude.ai/chat/\(uuid)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Item 3B (click-to-open, local CLI/Cowork rows): deep-links into
+    /// Claude Desktop's own `claude://resume?session={id}` route, which
+    /// imports this CLI transcript into the Desktop app and brings it to
+    /// the foreground — reverse-engineered from
+    /// /Applications/Claude.app/Contents/Resources/app.asar and verified
+    /// empirically (see this repo's item-3 report for the exact strings and
+    /// the main.log confirmation of a real, successful import against a
+    /// live session id). `entry.id` is the same session_id/UUID key
+    /// state.json is keyed by, which is exactly what the `session` query
+    /// param expects (the app validates it as a UUID before doing anything
+    /// with it). Applied to both plain CLI and Cowork rows uniformly, since
+    /// both are stored under the same session_id shape — only the plain-CLI
+    /// case was independently confirmed against a live import, though.
+    private func openLocalSession(_ entry: SessionEntry) {
+        guard let url = URL(string: "claude://resume?session=\(entry.id)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Item 3B (click-to-open, cloud session rows): see the "Item 3B
+    /// click-to-open findings" block at the bottom of ChatsFetcher.swift for
+    /// what was actually probed/confirmed about claude.ai's URL shape for a
+    /// `/recents` code/cowork session — no reliable per-session deep link
+    /// was found (candidate paths 200'd identically for real vs. bogus
+    /// ids), so this opens the claude.ai home page rather than guessing a
+    /// path that might 404 or land somewhere confusing.
+    private func openCloudSession(_ entry: CloudSessionEntry) {
+        guard let url = URL(string: "https://claude.ai") else { return }
         NSWorkspace.shared.open(url)
     }
 

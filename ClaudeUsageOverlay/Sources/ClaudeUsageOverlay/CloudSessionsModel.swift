@@ -150,6 +150,15 @@ final class CloudSessionsModel: ObservableObject {
     /// — a false "idle" undersells a session's activity but never wrongly
     /// demands the user's attention, which is the safer direction to err
     /// for a field whose full value space isn't confirmed.
+    ///
+    /// Item 3B update (2026-07-19): `worker_status: "requires_action"` was
+    /// subsequently observed on a real, live session with a pending
+    /// permission-prompt-style action (a Bash tool call awaiting approval)
+    /// — a genuine needs-input case the keyword list above didn't catch (it
+    /// doesn't contain "wait"/"input"/"pending"/"blocked" and isn't
+    /// "paused"). Added as an explicit exact match now that it's
+    /// empirically confirmed, rather than folded into the fuzzier
+    /// `.contains` checks meant for still-unverified guesses.
     static func mapWorkStatus(status: String?, workerStatus: String?) -> SessionWorkStatus {
         let w = workerStatus?.trimmingCharacters(in: .whitespaces).lowercased()
         let s = status?.trimmingCharacters(in: .whitespaces).lowercased()
@@ -158,7 +167,7 @@ final class CloudSessionsModel: ObservableObject {
             if w == "running" || w == "active" || w == "executing" || w == "working" {
                 return .running
             }
-            if w.contains("wait") || w.contains("input") || w.contains("pending") || w.contains("blocked") || w == "paused" {
+            if w == "requires_action" || w.contains("wait") || w.contains("input") || w.contains("pending") || w.contains("blocked") || w == "paused" {
                 return .needsInput
             }
         }

@@ -309,3 +309,44 @@ final class ChatsFetcher {
         }
     }
 }
+
+// MARK: - Item 3B click-to-open findings (cloud session rows)
+//
+// Investigated whether a `/recents` code/cowork-session item carries (or
+// claude.ai otherwise exposes) a reliable per-session deep link, so
+// OverlayView's cloudSessionRow could open the actual session instead of
+// just claude.ai's home page. Findings, captured 2026-07-19 against a real,
+// live `code_session` item (id `cse_01X5hALQTXdpLkt6giaVJW3Y`):
+//
+// 1. Raw item keys (no URL/permalink-ish field present):
+//    bound_device_uuid, chat_project_id, created_at, id, is_agent_owned,
+//    model, pending_action, permission_mode, preview, project_uuid,
+//    scheduled_task_id, status, title, type, unread, updated_at,
+//    worker_status. Nothing resembling `url`/`permalink`/`link`/`path`.
+// 2. Probed candidate claude.ai paths from the shared authenticated
+//    webview (GET, credentials included):
+//      https://claude.ai/code/{realId}                -> 200, 13285 bytes
+//      https://claude.ai/session/{realId}              -> 200, 12947 bytes
+//      https://claude.ai/code/definitely-not-a-real-id -> 200, 13285 bytes
+//    The bogus id returned byte-for-byte the SAME response as the real
+//    id's `/code/{id}` (identical length AND leading-HTML sample) — i.e.
+//    the server returns its generic SPA shell for ANY `/code/*` path
+//    regardless of whether the id is real, because routing happens
+//    client-side in JS, not server-side. `/session/{id}`'s slightly
+//    different byte count (not compared against a bogus id) is most
+//    plausibly just a different static meta-tag block for that route
+//    prefix, not evidence of id validation — nothing here is a reliable
+//    "this id exists" signal at the HTTP level.
+//
+// Conclusion: no verifiable per-session claude.ai URL was found. Per the
+// task's own instructed fallback, cloudSessionRow's click handler
+// (OverlayView.openCloudSession) opens https://claude.ai generically rather
+// than a guessed path that may not resolve to anything useful.
+//
+// Bonus finding from the same probe: `worker_status: "requires_action"` was
+// observed on a live session (a permission-prompt-style pending Bash
+// action) — a worker_status value CloudSessionsModel.mapWorkStatus didn't
+// recognize as needs-input at the time (its needs-input branch only matched
+// "wait"/"input"/"pending"/"blocked"/"paused", all previously an
+// "unverified forward guess" per that function's own header comment). Fixed
+// there now that it's empirically confirmed.
