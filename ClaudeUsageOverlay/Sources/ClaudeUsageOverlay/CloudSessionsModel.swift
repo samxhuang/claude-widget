@@ -70,6 +70,17 @@ final class CloudSessionsModel: ObservableObject {
     /// actively-running "right now" (vs. an old/idle one) for the
     /// brighter-text/dot treatment in OverlayView.
     private static let activeWindow: TimeInterval = 10 * 60
+    /// S5(b): cloud titles equal (case-insensitively) to one of these — or
+    /// empty/"untitled" — are too generic to be evidence that a cloud row is
+    /// the same conversation as a local one, so the title-based dedupe is
+    /// skipped for them (it would false-positive and hide real, distinct cloud
+    /// sessions that merely share a default name). Kept lowercased to match
+    /// the normalized comparison below.
+    private static let genericTitles: Set<String> = [
+        "untitled",
+        "cowork session",
+        "general coding session"
+    ]
 
     func tick() {
         now = Date()
@@ -91,13 +102,33 @@ final class CloudSessionsModel: ObservableObject {
     /// continues, but the same conversation still shows up as a cloud
     /// /recents item under yet another id that matches neither the old nor
     /// the new local id, so id-based filtering alone can't catch it.
+    ///
+    /// S5(b): this title match is now GUARDED two ways to stop it hiding
+    /// genuinely distinct cloud sessions. (1) Generic/empty titles ("untitled"
+    /// and the known defaults "cowork session" / "general coding session" —
+    /// see `genericTitles`) are skipped: they false-positive constantly
+    /// because many unrelated sessions share a default name. (2) `localTitles`
+    /// is pre-filtered by the caller (AppDelegate) to only RECENTLY-ACTIVE
+    /// local sessions, since the crash-continuation case it exists for always
+    /// involves a recently-live local row — a stale local row must not hide a
+    /// live cloud one. Residual risk: two truly distinct sessions that share a
+    /// specific, non-generic title AND are both recently active locally/cloud
+    /// would still collapse — accepted as rare (a specific shared title on two
+    /// concurrently-live sessions is unlikely) and strictly narrower than the
+    /// previous any-title-match behavior.
     func apply(raw: [[String: Any]], localIds: Set<String>, localTitles: Set<String>) {
         let cutoff = Date().addingTimeInterval(-Self.lookbackWindow)
         let parsed: [CloudSessionEntry] = raw.compactMap { dict in
             guard let id = dict["id"] as? String, !id.isEmpty, !localIds.contains(id) else { return nil }
             let title = dict["title"] as? String ?? ""
             let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard !localTitles.contains(normalizedTitle) else { return nil }
+            // S5(b): only treat a title match as a dedupe signal when the title
+            // is specific — skip empty/"untitled"/known-generic-default titles
+            // (they'd hide unrelated cloud sessions that merely share a default
+            // name). `localTitles` is already limited to recently-active local
+            // sessions by the caller.
+            let titleIsSpecific = !normalizedTitle.isEmpty && !Self.genericTitles.contains(normalizedTitle)
+            if titleIsSpecific && localTitles.contains(normalizedTitle) { return nil }
             let updatedAt = Self.parseDate(dict["updated_at"] as? String)
             // Same 30-minute lookback as local sessions: idle cloud sessions
             // age out of the list rather than lingering for days. Unparseable

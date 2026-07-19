@@ -38,9 +38,21 @@ Per-cycle behavior:
        - force_resume is true (widget's "Resume Now" button), or
        - enabled is true AND the reported reset time has passed.
      "active" sessions are never auto-resumed (there's nothing to resume —
-     they're still running).
+     they're still running). Resumed sessions run under PERMISSION_MODE,
+     which defaults to "acceptEdits" (NOT bypassPermissions): the safer
+     tradeoff is that an unattended resume may stall on a permission prompt
+     rather than run with every prompt bypassed under full trust. Override
+     with AUTORESUME_PERMISSION_MODE if you knowingly want otherwise.
   3. Prune old handled entries and stale "active" entries (gone quiet for a
      while and never got rate-limited) so state.json doesn't grow forever.
+
+Cost/latency note: file reading, JSON parsing and work_status
+classification all happen OUTSIDE StateLock (see compute_cli_records /
+compute_cowork_records), producing plain records; the lock is then held only
+long enough to load_state -> merge those records in -> resume/prune -> save.
+A per-transcript parse cache (_PARSE_CACHE, keyed on file mtime+size) means a
+transcript is only re-read+re-parsed when it actually changed, so an idle
+in-window session costs a stat, not a full re-read, each poll.
 """
 
 from __future__ import annotations  # keeps `X | None` / `list[str]` hints safe on Python 3.9 (macOS system python3)
@@ -48,8 +60,10 @@ from __future__ import annotations  # keeps `X | None` / `list[str]` hints safe 
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -85,7 +99,7 @@ USAGE_COLLECT_INTERVAL_SECONDS = 60 * 60
 PRICING_REFRESH_INTERVAL_SECONDS = 24 * 60 * 60
 # Only look at session files touched in the last N minutes when scanning at
 # all — no need to re-read your entire session history every cycle. Kept in
-# lockstep with ACTIVE_WINDOW_MINUTES below (>=): scan_sessions() only
+# lockstep with ACTIVE_WINDOW_MINUTES below (>=): compute_cli_records() only
 # explicitly re-evaluates (and prunes) a session while its mtime is inside
 # this window, so if this were smaller than ACTIVE_WINDOW_MINUTES, sessions
 # idle beyond this cutoff but still inside the active window would stop
@@ -96,7 +110,8 @@ SCAN_WINDOW_MINUTES = 30
 # A session touched more recently than this is considered "active" and shown
 # in the widget even though it hasn't hit a rate limit (yet). This is also
 # the *effective session-list lookback*: once a session goes quiet for longer
-# than this, scan_sessions() (see the `status is None` branch below) deletes
+# than this, the scan (compute_cli_records -> merge_cli_records; see the
+# `status is None` branch) deletes
 # its state.json entry outright on the next poll cycle, so it drops out of
 # the widget's Sessions list. Raised from 5 to 30 minutes so recently-idle
 # sessions stay visible long enough to still be found/resumed from the
@@ -444,16 +459,40 @@ def classify_work_status(
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 RESUME_PROMPT = os.environ.get("AUTORESUME_PROMPT", "continue")
+# Permission mode for an auto-resumed session. Default "acceptEdits", NOT
+# "bypassPermissions": a resume fires unattended, and bypassPermissions runs
+# it with EVERY permission prompt suppressed under full trust — an unattended
+# session with no human watching is the worst place to grant that. acceptEdits
+# auto-accepts file edits (the common case for "continue") but still stops on
+# anything that would otherwise prompt (running commands, network, deletes),
+# so the failure mode is a resume that stalls waiting for approval rather than
+# one that barrels ahead with full trust — the safer default. Override via
+# AUTORESUME_PERMISSION_MODE if you knowingly want a different tradeoff.
 # See README's "Known rough edges" section — verify with `claude --help` if
 # resume attempts fail immediately.
-PERMISSION_MODE = os.environ.get("AUTORESUME_PERMISSION_MODE", "bypassPermissions")
+PERMISSION_MODE = os.environ.get("AUTORESUME_PERMISSION_MODE", "acceptEdits")
+
+
+# Rotate daemon.log once it crosses this size. Single generation (.1),
+# overwritten each roll — bounded, never accumulates.
+LOG_MAX_BYTES = 5 * 1024 * 1024
 
 
 def log(msg: str) -> None:
     line = f"[{datetime.now().isoformat(timespec='seconds')}] {msg}"
-    print(line, flush=True)
+    # Only echo to stdout on an interactive TTY. Under launchd, stdout is
+    # redirected to launchd.out.log — print()ing there would store every line
+    # twice (once in launchd.out.log, once in daemon.log below), forever.
+    if sys.stdout.isatty():
+        print(line, flush=True)
     try:
         DAEMON_LOG.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if DAEMON_LOG.exists() and DAEMON_LOG.stat().st_size > LOG_MAX_BYTES:
+                # .replace() atomically overwrites any previous .1 generation.
+                DAEMON_LOG.replace(DAEMON_LOG.with_name(DAEMON_LOG.name + ".1"))
+        except OSError:
+            pass
         with open(DAEMON_LOG, "a") as f:
             f.write(line + "\n")
     except OSError:
@@ -483,8 +522,20 @@ def load_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            log(f"WARNING: could not parse {STATE_FILE}, starting fresh")
+        except (json.JSONDecodeError, OSError) as e:
+            # Starting fresh here silently discards EVERY user toggle
+            # (enabled / resume_armed / force_resume) — the whole point of
+            # this file. Preserve the corrupt copy for post-mortem first, and
+            # log loudly that toggles were lost. Single backup, overwritten
+            # each time, so a persistently-corrupt file can't accumulate.
+            backup = STATE_FILE.parent / (STATE_FILE.name + ".corrupt")
+            try:
+                shutil.copy2(STATE_FILE, backup)
+                log(f"ERROR: {STATE_FILE} is corrupt ({e!r}); copied to {backup} "
+                    f"and starting fresh — all user auto-resume toggles were lost.")
+            except OSError as copy_err:
+                log(f"ERROR: {STATE_FILE} is corrupt ({e!r}) and could not be backed up "
+                    f"({copy_err!r}); starting fresh — all user auto-resume toggles were lost.")
     return {}
 
 
@@ -508,9 +559,17 @@ def parse_reset_timestamp(value) -> float | None:
         return value / 1000.0 if value > 10**12 else float(value)
     if isinstance(value, str):
         try:
-            return float(value)
+            num = float(value)
         except ValueError:
-            pass
+            num = None
+        if num is not None:
+            # Route a stringified epoch through the SAME ms->s normalization
+            # as the numeric branch above. Without this, "1752900000000"
+            # (epoch-milliseconds as a string) returned raw as ~year 57000,
+            # so `due = now >= resets_at` never became true and the session
+            # never resumed. Epoch-seconds strings ("1752900000") are < 10**12
+            # and pass through untouched.
+            return num / 1000.0 if num > 10**12 else num
         try:
             return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
         except ValueError:
@@ -520,7 +579,11 @@ def parse_reset_timestamp(value) -> float | None:
 
 
 def find_cwd_in_lines(objs: list[dict]) -> str | None:
-    for obj in objs:
+    # Iterate newest-first: if the session cd'd partway through, the most
+    # recent cwd is where a resume should land, not the directory it started
+    # in. (The old first-match scan resumed a moved session in its original
+    # directory.)
+    for obj in reversed(objs):
         for key in ("cwd", "cwdPath", "workingDirectory"):
             val = obj.get(key)
             if isinstance(val, str):
@@ -593,168 +656,273 @@ def latest_activity_mtime(jsonl_path: Path) -> float:
     return max(jsonl_path.stat().st_mtime, sidecar_activity_mtime(jsonl_path))
 
 
-def scan_sessions(state: dict) -> None:
-    """Scans recent session files and tracks two kinds of sessions in
-    state.json: currently-active ones (touched in the last
-    ACTIVE_WINDOW_MINUTES) and rate-limited ones (log ends in a
-    rate_limit_event). New sessions start disabled; existing ones get their
-    display fields refreshed but keep whatever enabled/force_resume the
-    user already set — including across an active -> waiting transition."""
-    if not PROJECTS_DIR.is_dir():
-        return
+# In-memory parse cache, keyed by transcript path. This daemon is a
+# long-lived process, so an in-window transcript that hasn't changed since
+# last poll (same file mtime+size) does NOT need re-reading + re-parsing —
+# everything cached below is a pure function of file *content*. Memory is
+# bounded: compute_cli_records() only ever caches files currently inside the
+# scan window and evicts entries whose path has left it. work_status is
+# deliberately NOT cached (it depends on `now`, the per-cycle process-table
+# snapshot, and live sidecar mtimes), so it's recomputed each cycle from the
+# cheap cached objs tail.
+_PARSE_CACHE: dict = {}
 
-    now = time.time()
+
+def _parse_cli_transcript(jsonl_path: Path, file_stat, project_folder: Path) -> dict | None:
+    """Read + parse ONE transcript and return the content-derived fields the
+    scan needs, or None if the file is unreadable. Everything here is a pure
+    function of file content, so the result is valid until the file's
+    (mtime, size) changes — that's what makes it cacheable in _PARSE_CACHE."""
+    try:
+        raw_lines = jsonl_path.read_text(errors="ignore").splitlines()
+    except OSError:
+        return None
+
+    objs = []
+    for raw in raw_lines:
+        try:
+            objs.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+
+    # Claude/Claude Code spawn short-lived internal sessions for things like
+    # the bash-command permission classifier — each one gets its own session
+    # file in the same project directory, sharing entrypoint/promptSource/
+    # isSidechain with real sessions. We previously tried to distinguish them
+    # by model (internal calls run on Haiku) but that broke: trivial real
+    # prompts (e.g. a one-line "test" message) can *also* get routed to Haiku,
+    # so that heuristic hid genuine short conversations. The actual reliable
+    # signal is the "origin" field Claude Code itself stamps on every "user"
+    # event: a message the human actually typed carries origin.kind ==
+    # "human". Internal/synthetic prompts (the classifier's "Classify this
+    # shell command..." calls, task-notifications, etc.) never have it. A
+    # session is "real" if at least one of its user turns is human-originated.
+    has_human_message = any(
+        obj.get("type") == "user"
+        and isinstance(obj.get("origin"), dict)
+        and obj["origin"].get("kind") == "human"
+        for obj in objs
+    )
+
+    # A rate_limit event only reflects the CURRENT state of the session if it
+    # is still the effective TAIL of the transcript. A session that hit a
+    # limit hours ago and was then manually resumed keeps appending ordinary
+    # conversation past that event — the old scan only stopped at
+    # "result"/"session_end" (which interactive transcripts rarely contain),
+    # so it kept classifying such a live session as "waiting" with a long-past
+    # reset time. If the user had pre-enabled auto-resume, resume_due_sessions
+    # would then fire a *second* `claude --resume` straight into the session
+    # they're actively using. So: walk backwards and stop the moment we meet
+    # an ordinary conversational event (a real "user" or "assistant" turn)
+    # before finding a rate_limit event — that event is newer than any limit,
+    # meaning the session moved on. Non-conversational bookkeeping appended
+    # after the limit (ai-title / custom-title / attachments / queue-operation
+    # / ...) is skipped so it can't mask a rate_limit that IS still the tail,
+    # and the limit's own inline synthetic notice line (model "<synthetic>" /
+    # isApiErrorMessage) is skipped for the same reason.
+    rate_limit_obj = None
+    for obj in reversed(objs):
+        obj_type = obj.get("type", "")
+        if "rate_limit" in obj_type.lower():
+            rate_limit_obj = obj
+            break
+        if obj_type in ("result", "session_end"):
+            break  # session ended normally
+        if obj_type in ("user", "assistant"):
+            message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+            if obj.get("isApiErrorMessage") or message.get("model") == "<synthetic>":
+                continue  # the limit's own inline notice, not a resumption
+            break  # a genuine turn newer than any limit — session moved on
+
+    waiting_resets_at = None
+    if rate_limit_obj is not None and has_human_message:
+        info = (
+            rate_limit_obj.get("rateLimitInfo")
+            or rate_limit_obj.get("rate_limit_info")
+            or rate_limit_obj
+        )
+        resets_raw = None
+        for key in ("resetsAt", "resets_at", "reset_at", "resetAt"):
+            if isinstance(info, dict) and key in info:
+                resets_raw = info[key]
+                break
+        waiting_resets_at = parse_reset_timestamp(resets_raw)
+        if waiting_resets_at is None:
+            log(f"Found rate_limit_event in {jsonl_path} but couldn't read a reset time")
+
+    project_dir = find_cwd_in_lines(objs) or guess_project_dir_from_folder(project_folder.name)
+    if not project_dir:
+        log(f"Found session {jsonl_path.stem} but couldn't determine its project directory; skipping")
+
+    return {
+        "mtime": file_stat.st_mtime,       # cache-validity key (file content)
+        "size": file_stat.st_size,
+        "has_human_message": has_human_message,
+        "waiting_resets_at": waiting_resets_at,
+        "project_dir": project_dir or None,
+        "session_title": find_session_title(objs),
+        "prompt_preview": find_prompt_preview(objs),
+        # classify_work_status only ever reads reversed(objs[-400:]); caching
+        # just that tail keeps the cache bounded even for enormous transcripts.
+        "objs_tail": objs[-400:],
+    }
+
+
+def compute_cli_records(now: float, runtime: dict, cache: dict) -> dict:
+    """OUTSIDE StateLock: scan recent CLI transcripts and return
+    {session_id: record}. This does NOT read or mutate state.json — it only
+    computes what the files say; merge_cli_records() applies that to state
+    while the lock is held. Keeping all the file I/O + parsing + work_status
+    classification out here is the whole point (the lock was previously held
+    across a full re-read of every in-window transcript, every 10s).
+
+    A record's "status" is "active", "waiting", or None. None is meaningful:
+    the file is in-window but is not a trackable session right now (no human
+    message, or gone quiet, or no current rate limit) — merge will drop any
+    existing UNHANDLED entry for it, exactly as the old scan's `status is
+    None` branch did. A trackable session whose project dir can't be resolved
+    yields no record at all (same as the old skip)."""
+    records: dict = {}
+    if not PROJECTS_DIR.is_dir():
+        return records
+
     scan_cutoff = now - SCAN_WINDOW_MINUTES * 60
-    runtime = collect_runtime_snapshot()
+    active_window_seconds = ACTIVE_WINDOW_MINUTES * 60
+    in_window_paths = set()
 
     for project_folder in PROJECTS_DIR.iterdir():
         if not project_folder.is_dir():
             continue
         for jsonl_path in project_folder.glob("*.jsonl"):
             try:
-                mtime = latest_activity_mtime(jsonl_path)
+                # latest_activity_mtime() also covers subagent transcripts, so
+                # a session whose work is delegated to a subagent still counts
+                # as in-window; file_stat is the raw file's own stat, used as
+                # the parse-cache validity key.
+                activity_mtime = latest_activity_mtime(jsonl_path)
+                file_stat = jsonl_path.stat()
             except OSError:
                 continue
-            if mtime < scan_cutoff:
+            if activity_mtime < scan_cutoff:
                 continue
 
+            key = str(jsonl_path)
+            in_window_paths.add(key)
             session_id = jsonl_path.stem
-            existing = state.get(session_id)
-            if existing and existing.get("handled"):
-                continue  # already resumed/failed once — don't resurrect it
 
-            try:
-                raw_lines = jsonl_path.read_text(errors="ignore").splitlines()
-            except OSError:
-                continue
-
-            objs = []
-            for raw in raw_lines:
-                try:
-                    objs.append(json.loads(raw))
-                except json.JSONDecodeError:
+            cached = cache.get(key)
+            if (cached is not None
+                    and cached["mtime"] == file_stat.st_mtime
+                    and cached["size"] == file_stat.st_size):
+                derived = cached
+            else:
+                derived = _parse_cli_transcript(jsonl_path, file_stat, project_folder)
+                if derived is None:
                     continue
+                cache[key] = derived
 
-            # Claude/Claude Code spawn short-lived internal sessions for
-            # things like the bash-command permission classifier — each one
-            # gets its own session file in the same project directory,
-            # sharing entrypoint/promptSource/isSidechain with real
-            # sessions. We previously tried to distinguish them by model
-            # (internal calls run on Haiku) but that broke: trivial real
-            # prompts (e.g. a one-line "test" message) can *also* get
-            # routed to Haiku, so that heuristic hid genuine short
-            # conversations. The actual reliable signal is the "origin"
-            # field Claude Code itself stamps on every "user" event: a
-            # message the human actually typed carries
-            # origin.kind == "human". Internal/synthetic prompts (the
-            # classifier's "Classify this shell command..." calls,
-            # task-notifications, etc.) never have it. A session is
-            # "real" if at least one of its user turns is human-originated.
-            has_human_message = any(
-                obj.get("type") == "user"
-                and isinstance(obj.get("origin"), dict)
-                and obj["origin"].get("kind") == "human"
-                for obj in objs
-            )
-
-            rate_limit_obj = None
-            for obj in reversed(objs):
-                obj_type = obj.get("type", "")
-                if "rate_limit" in obj_type.lower():
-                    rate_limit_obj = obj
-                    break
-                if obj_type in ("result", "session_end"):
-                    break  # session ended normally
-
-            resets_at = None
-            status = None
-
-            if rate_limit_obj is not None and has_human_message:
-                info = (
-                    rate_limit_obj.get("rateLimitInfo")
-                    or rate_limit_obj.get("rate_limit_info")
-                    or rate_limit_obj
-                )
-                resets_raw = None
-                for key in ("resetsAt", "resets_at", "reset_at", "resetAt"):
-                    if isinstance(info, dict) and key in info:
-                        resets_raw = info[key]
-                        break
-                resets_at = parse_reset_timestamp(resets_raw)
-                if resets_at is not None:
-                    status = "waiting"
-                else:
-                    log(f"Found rate_limit_event in {jsonl_path} but couldn't read a reset time")
-
-            if status is None and has_human_message and (now - mtime) <= ACTIVE_WINDOW_MINUTES * 60:
+            # Per-cycle status: cheap, depends on now/activity_mtime, not on
+            # file content, so it's recomputed here rather than cached.
+            if derived["waiting_resets_at"] is not None:
+                status = "waiting"
+                resets_at = derived["waiting_resets_at"]
+            elif derived["has_human_message"] and (now - activity_mtime) <= active_window_seconds:
                 status = "active"
-
-            if status is None:
-                if existing and not existing.get("handled"):
-                    # Was tracked as "active" before this filter existed (or
-                    # has simply gone quiet with no rate limit) — drop it.
-                    del state[session_id]
+                resets_at = None
+            else:
+                records[session_id] = {"status": None}
                 continue
 
-            project_dir = find_cwd_in_lines(objs) or guess_project_dir_from_folder(project_folder.name)
-            if not project_dir:
-                log(f"Found session {session_id} ({status}) but couldn't determine its project directory; skipping")
-                continue
+            if derived["project_dir"] is None:
+                continue  # couldn't resolve project dir — skip (as old code did)
 
-            session_title = find_session_title(objs)
             work_status = classify_work_status(
-                objs, mtime, now,
+                derived["objs_tail"], activity_mtime, now,
                 jsonl_path=jsonl_path, session_id=session_id, runtime=runtime,
             )
+            records[session_id] = {
+                "kind": "cli",
+                "status": status,
+                "resets_at": resets_at,
+                "project_dir": derived["project_dir"],
+                "project_name": Path(derived["project_dir"]).name,
+                "session_title": derived["session_title"],
+                "prompt_preview": derived["prompt_preview"],
+                "last_activity_at": activity_mtime,
+                "work_status": work_status,
+            }
 
+    # Bound memory: forget any cached file that has left the scan window.
+    for stale_key in [k for k in cache if k not in in_window_paths]:
+        del cache[stale_key]
+
+    return records
+
+
+def merge_cli_records(state: dict, records: dict, now: float) -> None:
+    """INSIDE StateLock: fold computed CLI records into state, preserving
+    every widget-owned field (enabled / force_resume / handled / handled_at)
+    exactly as the old in-place scan did. New sessions default enabled=False;
+    existing ones keep their user toggles across an active -> waiting
+    transition. Because state is loaded fresh under the lock, a session the
+    widget deleted since the records were computed is simply not present and
+    gets re-added as a fresh disabled entry (same as the old scan); a record
+    that says None drops an existing unhandled entry."""
+    for session_id, rec in records.items():
+        existing = state.get(session_id)
+        if existing and existing.get("handled"):
+            continue  # already resumed/failed once — don't resurrect it
+
+        if rec["status"] is None:
             if existing:
-                was_active = existing.get("status") == "active"
-                existing["project_dir"] = project_dir
-                existing["project_name"] = Path(project_dir).name
-                existing["session_title"] = session_title
-                existing["prompt_preview"] = find_prompt_preview(objs)
-                existing["status"] = status
-                existing["resets_at"] = resets_at
-                existing["last_seen"] = now
-                # Item 5: `last_seen` above is poll-cycle bookkeeping — it
-                # gets bumped to `now` every ~10s cycle (item 3: widget/daemon
-                # cadences tightened from 30s) this session's file is still
-                # inside SCAN_WINDOW_MINUTES, regardless of whether
-                # it was actually touched again, so it's useless as an
-                # "activity age" signal (it would just always read "just
-                # now" until the entry ages out and disappears). `mtime`
-                # (from latest_activity_mtime() above, which also covers
-                # subagent transcripts) is the real last-write time — that's
-                # what the widget shows as "<1m" / "17m" / etc for active
-                # sessions.
-                existing["last_activity_at"] = mtime
-                existing["work_status"] = work_status
-                if was_active and status == "waiting":
-                    log(f"Session {session_id} in {project_dir} transitioned active -> rate-limited "
-                        f"(enabled={existing.get('enabled', False)} preserved), resets at {datetime.fromtimestamp(resets_at)}")
-            else:
-                log(f"Detected {status} session {session_id} ({session_title!r}) in {project_dir}"
-                    + (f", resets at {datetime.fromtimestamp(resets_at)}" if resets_at else "")
-                    + " — added to widget, NOT auto-resuming")
-                state[session_id] = {
-                    "project_dir": project_dir,
-                    "project_name": Path(project_dir).name,
-                    "session_title": session_title,
-                    "prompt_preview": find_prompt_preview(objs),
-                    "resets_at": resets_at,
-                    "last_activity_at": mtime,
-                    "detected_at": now,
-                    "last_seen": now,
-                    "enabled": False,       # <-- default OFF; only the widget can flip this
-                    "force_resume": False,
-                    "handled": False,
-                    "handled_at": None,
-                    "status": status,
-                    # Widget-owned display field, daemon-computed each scan
-                    # cycle (never user-toggled): "running" / "needs_input" /
-                    # "idle". See classify_work_status's docstring.
-                    "work_status": work_status,
-                }
+                del state[session_id]  # gone quiet / no rate limit — drop it
+            continue
+
+        if existing:
+            was_active = existing.get("status") == "active"
+            existing["kind"] = "cli"
+            existing["project_dir"] = rec["project_dir"]
+            existing["project_name"] = rec["project_name"]
+            existing["session_title"] = rec["session_title"]
+            existing["prompt_preview"] = rec["prompt_preview"]
+            existing["status"] = rec["status"]
+            existing["resets_at"] = rec["resets_at"]
+            existing["last_seen"] = now
+            # `last_seen` is poll-cycle bookkeeping (bumped every ~10s while
+            # in-window, regardless of real activity), so it's useless as an
+            # "activity age" signal. `last_activity_at` (from
+            # latest_activity_mtime, which covers subagent transcripts) is the
+            # real last-write time the widget shows as "<1m" / "17m" / etc.
+            existing["last_activity_at"] = rec["last_activity_at"]
+            existing["work_status"] = rec["work_status"]
+            if was_active and rec["status"] == "waiting":
+                log(f"Session {session_id} in {rec['project_dir']} transitioned active -> rate-limited "
+                    f"(enabled={existing.get('enabled', False)} preserved), "
+                    f"resets at {datetime.fromtimestamp(rec['resets_at'])}")
+        else:
+            log(f"Detected {rec['status']} session {session_id} ({rec['session_title']!r}) in {rec['project_dir']}"
+                + (f", resets at {datetime.fromtimestamp(rec['resets_at'])}" if rec["resets_at"] else "")
+                + " — added to widget, NOT auto-resuming")
+            state[session_id] = {
+                "kind": "cli",          # explicit type sentinel (see prune_deleted_sessions)
+                "project_dir": rec["project_dir"],
+                "project_name": rec["project_name"],
+                "session_title": rec["session_title"],
+                "prompt_preview": rec["prompt_preview"],
+                "resets_at": rec["resets_at"],
+                "last_activity_at": rec["last_activity_at"],
+                "detected_at": now,
+                "last_seen": now,
+                "enabled": False,       # <-- default OFF; only the widget can flip this
+                "force_resume": False,
+                "handled": False,
+                "handled_at": None,
+                "status": rec["status"],
+                # Widget-owned display field, daemon-computed each cycle (never
+                # user-toggled): "running" / "needs_input" / "idle". See
+                # classify_work_status's docstring.
+                "work_status": rec["work_status"],
+            }
 
 
 def read_last_jsonl_object(path: Path, initial_chunk: int = 8192) -> dict | None:
@@ -798,18 +966,21 @@ def _truthy(value) -> bool:
     return bool(value)
 
 
-def scan_cowork_sessions(state: dict) -> None:
-    """Cowork sessions (including Claude Desktop's Cowork mode) don't write
-    into ~/.claude/projects at all — they get their own metadata file plus
-    an audit.jsonl activity log under COWORK_SESSIONS_DIR. Unlike Claude
-    Code CLI sessions, there's no rate-limit/resume cycle to track here:
-    Cowork manages its own retries. We only ever add these as "active" (so
-    they show up in the widget with their real title) and drop them the
-    moment their last audit event shows the turn actually finished."""
+def compute_cowork_records(now: float) -> dict:
+    """OUTSIDE StateLock: scan Cowork sessions (including Claude Desktop's
+    Cowork mode) and return {session_id: record}. Cowork sessions don't write
+    into ~/.claude/projects — they get their own metadata file plus an
+    audit.jsonl activity log under COWORK_SESSIONS_DIR — and have no
+    rate-limit/resume cycle: Cowork manages its own retries, so these are only
+    ever tracked as "active". A record's "status" is "active", or None meaning
+    "drop any existing unhandled entry" (archived, gone quiet, or last audit
+    event shows the turn finished). No state.json access here; the audit-tail
+    read is already cheap (read_last_jsonl_object seeks from the end), so no
+    parse cache is needed for these."""
+    records: dict = {}
     if not COWORK_SESSIONS_DIR.is_dir():
-        return
+        return records
 
-    now = time.time()
     scan_cutoff_ms = (now - SCAN_WINDOW_MINUTES * 60) * 1000
 
     for meta_path in COWORK_SESSIONS_DIR.rglob("local_*.json"):
@@ -830,70 +1001,83 @@ def scan_cowork_sessions(state: dict) -> None:
             continue
 
         session_id = meta.get("sessionId") or meta_path.stem
-        existing = state.get(session_id)
-        if existing and existing.get("handled"):
-            continue
 
         try:
             last_activity_ms = float(meta.get("lastActivityAt", 0))
         except (TypeError, ValueError):
             last_activity_ms = 0
         if last_activity_ms and last_activity_ms < scan_cutoff_ms:
-            # Gone quiet a while ago — treat like any other stale "active"
-            # entry: drop it if we were tracking it, otherwise skip.
-            if existing and not existing.get("handled"):
-                del state[session_id]
+            records[session_id] = {"status": None}  # gone quiet — drop if tracked
             continue
 
         last_event = read_last_jsonl_object(audit_path)
-        # A finished turn ends in a "result" event. Anything else at the
-        # tail (assistant/user/tool events, or a "system" event mid-request)
-        # means the session is still actively working.
+        # A finished turn ends in a "result" event. Anything else at the tail
+        # (assistant/user/tool events, or a "system" event mid-request) means
+        # the session is still actively working.
         is_running = bool(last_event) and last_event.get("type") != "result"
         if not is_running:
-            if existing and not existing.get("handled"):
+            records[session_id] = {"status": None}
+            continue
+
+        # meta's lastActivityAt is epoch milliseconds; convert to seconds to
+        # match every other timestamp field in state.json. Fall back to `now`
+        # if the field was missing/unparsable, rather than storing an epoch-0
+        # timestamp that would render as a nonsensical decades-old age.
+        last_activity_at = (last_activity_ms / 1000.0) if last_activity_ms else now
+        records[session_id] = {
+            "kind": "cowork",
+            "status": "active",
+            "project_dir": str(session_dir),
+            "session_title": meta.get("title") or "Cowork session",
+            "last_activity_at": last_activity_at,
+        }
+
+    return records
+
+
+def merge_cowork_records(state: dict, records: dict, now: float) -> None:
+    """INSIDE StateLock: fold computed Cowork records into state. Same
+    contract as merge_cli_records — preserve widget-owned fields
+    (resume_armed / needs_attention / enabled / handled), default new entries
+    off. A None-status record drops an existing unhandled entry."""
+    for session_id, rec in records.items():
+        existing = state.get(session_id)
+        if existing and existing.get("handled"):
+            continue
+
+        if rec["status"] is None:
+            if existing:
                 del state[session_id]
             continue
 
-        title = meta.get("title") or "Cowork session"
-
-        # Item 5: same real-activity signal as the CLI branch above (mtime
-        # there, lastActivityAt here) — meta's lastActivityAt is epoch
-        # milliseconds, converted to seconds to match every other timestamp
-        # field in state.json. Falls back to `now` in the rare case the
-        # field was missing/unparsable (last_activity_ms == 0 above) rather
-        # than storing an epoch-0 timestamp that would render as a
-        # nonsensical multi-decade-old age.
-        last_activity_at = (last_activity_ms / 1000.0) if last_activity_ms else now
-
         if existing:
-            existing["project_dir"] = str(session_dir)
+            existing["kind"] = "cowork"
+            existing["project_dir"] = rec["project_dir"]
             existing["project_name"] = "Cowork"
-            existing["session_title"] = title
+            existing["session_title"] = rec["session_title"]
             existing["prompt_preview"] = ""
             existing["status"] = "active"
             existing["resets_at"] = None
             existing["last_seen"] = now
-            existing["last_activity_at"] = last_activity_at
-            # Cowork entries are only ever kept in state at all while
-            # is_running is True (see the `if not is_running: del` branch
-            # above) — a Cowork session whose last audit event resolves to a
-            # finished turn gets dropped from state on this very poll cycle,
-            # so by construction every surviving entry is "running". There's
-            # no local signal (yet) to distinguish "actively computing" from
-            # "blocked on a permission prompt" for Cowork specifically.
+            existing["last_activity_at"] = rec["last_activity_at"]
+            # Cowork entries only survive in state while still running (a
+            # finished turn yields a None record above and gets dropped this
+            # very cycle), so by construction every surviving entry is
+            # "running". There's no local signal yet to distinguish "actively
+            # computing" from "blocked on a permission prompt" for Cowork.
             existing["work_status"] = "running"
         else:
-            log(f"Detected active Cowork session {session_id} ({title!r}) — added to widget")
+            log(f"Detected active Cowork session {session_id} ({rec['session_title']!r}) — added to widget")
             state[session_id] = {
-                "project_dir": str(session_dir),
+                "kind": "cowork",       # explicit type sentinel (see prune_deleted_sessions)
+                "project_dir": rec["project_dir"],
                 "project_name": "Cowork",
-                "session_title": title,
+                "session_title": rec["session_title"],
                 "prompt_preview": "",
                 "resets_at": None,
                 "detected_at": now,
                 "last_seen": now,
-                "last_activity_at": last_activity_at,
+                "last_activity_at": rec["last_activity_at"],
                 "enabled": False,
                 "force_resume": False,
                 "handled": False,
@@ -902,11 +1086,10 @@ def scan_cowork_sessions(state: dict) -> None:
                 "work_status": "running",
                 # Widget-owned, additive fields (Track 1: Cowork auto-resume
                 # via UI automation — see cowork_resume.py). Same pattern as
-                # enabled/force_resume above: default off, only the widget
-                # flips resume_armed, only cowork_resume.py flips
-                # needs_attention. Since the block below (the `existing`
-                # branch) never touches these keys, they survive every scan
-                # cycle once set, exactly like enabled/force_resume do.
+                # enabled/force_resume: default off, only the widget flips
+                # resume_armed, only cowork_resume.py flips needs_attention.
+                # The `existing` branch above never touches these keys, so they
+                # survive every cycle once set, exactly like enabled does.
                 "resume_armed": False,
                 "needs_attention": False,
             }
@@ -969,12 +1152,12 @@ def prune_deleted_sessions(state: dict) -> None:
     AutoArchiveEngine in Claude.app's own app.asar, which treats isArchived
     as the terminal state for a session).
 
-    Without this, a deleted session lingers: scan_sessions()/
-    scan_cowork_sessions() only ever clean up an entry when they *revisit*
-    its backing file/metadata and find it stale — but scan_cowork_sessions
-    skips archived entries with an early `continue` before reaching that
-    cleanup, and scan_sessions simply never revisits a jsonl file that no
-    longer exists at all. Either way the entry just sits in state.json,
+    Without this, a deleted session lingers: the scan/merge path only ever
+    cleans up an entry when it *revisits* the backing file/metadata and finds
+    it stale — but compute_cowork_records skips archived entries entirely
+    (they never produce a record), and compute_cli_records never revisits a
+    jsonl file that no longer exists at all. Either way the entry just sits in
+    state.json,
     frozen, until prune_old_entries' much looser ACTIVE_STALE_MINUTES
     (60 min) safety net eventually catches it — that's the delay reported as
     "deleted sessions keep showing up in the widget".
@@ -1019,7 +1202,15 @@ def prune_deleted_sessions(state: dict) -> None:
     for session_id, entry in state.items():
         if entry.get("handled"):
             continue
-        if entry.get("project_name") == "Cowork":
+        # Prefer the explicit "kind" sentinel the daemon now writes on every
+        # entry; fall back to the old project_name == "Cowork" check only for
+        # entries written by an older daemon (no "kind" yet). This is why kind
+        # exists: a CLI project directory literally named "Cowork" used to make
+        # its sessions take the Cowork branch here and get deleted every cycle
+        # (never live in live_cowork_ids), so they could never appear.
+        kind = entry.get("kind")
+        is_cowork = (kind == "cowork") if kind is not None else (entry.get("project_name") == "Cowork")
+        if is_cowork:
             if session_id not in live_cowork_ids:
                 stale.append(session_id)
         elif session_id not in existing_jsonl_stems:
@@ -1049,34 +1240,20 @@ def prune_old_entries(state: dict) -> None:
         del state[sid]
 
 
-def main() -> None:
-    log(f"claude-autoresume daemon starting (poll every {POLL_INTERVAL_SECONDS}s). "
-        f"Default is OFF for every detected session — resumes only happen via the widget.")
-    log(f"Watching {PROJECTS_DIR} and {COWORK_SESSIONS_DIR}")
-    # 0 = run on the first cycle after startup, so a fresh deploy bootstraps
-    # the usage store immediately instead of waiting a full interval.
+def _usage_analytics_worker() -> None:
+    """Usage analytics (hourly collect/compact/plan_fit + daily pricing
+    refresh) on its OWN daemon thread, off the poll thread. These passes can
+    be slow (network fetch, whole-store rewrites); running them inline in the
+    poll loop meant a slow pass delayed rate-limit detection by however long
+    it took. Passes run sequentially in this single loop, so there's never an
+    overlapping run to guard against. Everything here touches only
+    STATE_DIR/usage/* (never state.json), and collect()/compact() take their
+    own file locks, so cross-process/-thread safety is unchanged."""
+    # 0 = run on the first iteration, so a fresh deploy bootstraps the usage
+    # store immediately instead of waiting a full interval.
     last_usage_run = 0.0
     last_pricing_run = 0.0
     while True:
-        try:
-            with StateLock():
-                state = load_state()
-                scan_sessions(state)
-                scan_cowork_sessions(state)
-                resume_due_sessions(state)
-                # Track 1 scaffolding: dry-run only (see cowork_resume.DRY_RUN).
-                # Only touches Cowork sessions the widget has explicitly armed
-                # via resume_armed; logs intended actions to daemon.log instead
-                # of performing any live UI automation.
-                cowork_resume.process_armed_sessions(state, log)
-                prune_deleted_sessions(state)
-                prune_old_entries(state)
-                save_state(state)
-        except Exception as e:  # daemon must never die from a single bad cycle
-            log(f"ERROR in poll cycle: {e!r}")
-        # Usage analytics: outside StateLock on purpose — these touch only
-        # STATE_DIR/usage/*, never state.json, and collect() takes its own
-        # lock against concurrent CLI invocations.
         try:
             now_mono = time.time()
             if now_mono - last_pricing_run >= PRICING_REFRESH_INTERVAL_SECONDS:
@@ -1090,6 +1267,46 @@ def main() -> None:
                 log("usage analytics: collected, compacted, plan_fit.json refreshed")
         except Exception as e:
             log(f"ERROR in usage analytics cycle: {e!r}")
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def main() -> None:
+    log(f"claude-autoresume daemon starting (poll every {POLL_INTERVAL_SECONDS}s). "
+        f"Default is OFF for every detected session — resumes only happen via the widget.")
+    log(f"Watching {PROJECTS_DIR} and {COWORK_SESSIONS_DIR}")
+
+    # Usage analytics runs on its own daemon thread so a slow analytics pass
+    # can't stall the session poll below (P6). daemon=True so it dies with the
+    # process; it holds no state.json lock, so nothing to clean up on exit.
+    threading.Thread(target=_usage_analytics_worker, name="usage-analytics", daemon=True).start()
+
+    while True:
+        try:
+            # File reading, JSON parsing and work_status classification all
+            # happen OUT here, before the lock, producing plain records. The
+            # StateLock is then held only long enough to load fresh state,
+            # merge the records in (preserving widget-owned toggles), run the
+            # resume/prune steps, and save — not across a full re-read of every
+            # in-window transcript, every 10s, as it used to be.
+            now = time.time()
+            runtime = collect_runtime_snapshot()
+            cli_records = compute_cli_records(now, runtime, _PARSE_CACHE)
+            cowork_records = compute_cowork_records(now)
+            with StateLock():
+                state = load_state()
+                merge_cli_records(state, cli_records, now)
+                merge_cowork_records(state, cowork_records, now)
+                resume_due_sessions(state)
+                # Track 1 scaffolding: dry-run only (see cowork_resume.DRY_RUN).
+                # Only touches Cowork sessions the widget has explicitly armed
+                # via resume_armed; logs intended actions to daemon.log instead
+                # of performing any live UI automation.
+                cowork_resume.process_armed_sessions(state, log)
+                prune_deleted_sessions(state)
+                prune_old_entries(state)
+                save_state(state)
+        except Exception as e:  # daemon must never die from a single bad cycle
+            log(f"ERROR in poll cycle: {e!r}")
         time.sleep(POLL_INTERVAL_SECONDS)
 
 

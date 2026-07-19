@@ -88,13 +88,21 @@ class SessionMatch:
 # ---------------------------------------------------------------------------
 
 def is_cowork_entry(entry: dict) -> bool:
+    # Prefer the explicit "kind" sentinel the daemon writes on every entry;
+    # fall back to the old project_name == "Cowork" check only for entries
+    # written by an older daemon that predates the field. (A real CLI project
+    # directory named "Cowork" would otherwise be misclassified as a Cowork
+    # session here — the reason "kind" exists.)
+    kind = entry.get("kind")
+    if kind is not None:
+        return kind == "cowork"
     return entry.get("project_name") == "Cowork"
 
 
 def eligible_sessions(state: dict) -> list[tuple[str, dict]]:
     """Armed + rate-limited Cowork sessions that haven't been handled yet.
 
-    Note: as of this build, scan_cowork_sessions() in autoresume.py only
+    Note: as of this build, compute_cowork_records() in autoresume.py only
     ever marks Cowork sessions "active" (Cowork has no rate-limit/resume
     concept exposed today — see that function's docstring), so `status ==
     "waiting"` never actually fires for a Cowork entry yet. This filter is

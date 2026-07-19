@@ -53,11 +53,10 @@ then.
   copies to `~/.claude-autoresume/bin/`, rewrites the LaunchAgent plist, and
   bounces launchd (`bootout` + `bootstrap`). Tail
   `~/.claude-autoresume/daemon.log` to confirm a clean restart.
-- Neither has an automated test runner wired to CI (no CI configured at
-  all — no remote yet, see below). `claude-autoresume/test_plan_fit.py` and
-  `test_usage_collector.py` exist and can be run directly with `python3`.
-- No git remote is configured on this repo yet — pushing needs one added
-  first (`git remote add origin <url>`).
+- Neither has an automated test runner wired to CI (no CI configured).
+  `claude-autoresume/test_autoresume.py`, `test_plan_fit.py` and
+  `test_usage_collector.py` can be run directly with `python3`.
+- Remote: `origin` → github.com/samxhuang/claude-widget.
 
 ## Session/status data flow
 
@@ -78,6 +77,59 @@ executing", subagent/tool-result sidecar mtimes for delegated work, explicit
 `stop_reason == "end_turn"` for a clean finish). If you touch this function,
 re-derive the rules from that comment rather than guessing — it was written
 against live ground-truth sessions, not speculation.
+
+## Robustness hardening pass (2026-07-19, later session)
+
+A full audit → fix → re-audit × 2 cycle over both components. Tests green
+(79 Python tests incl. new `test_autoresume.py`, `swift build -c release`
+clean). Deploy status at commit time: **widget deployed**
+(build_and_run.command run several times since), **daemon NOT redeployed** —
+`install.sh` was sandbox-blocked, so the fixed Python is not live until the
+owner runs it. Note the widget's snapshot appends now take
+`usage/snapshots.lock`, which the still-deployed old compactor doesn't take —
+run install.sh to complete the pair. Highlights (each was empirically
+confirmed before fixing):
+
+1. **Lock actually locks now.** `SessionsModel.withLock` used to call
+   `FileManager.createFile` on the lock file first, which REPLACES the inode
+   every call — flock is per-inode, so widget/daemon mutual exclusion was
+   illusory (verified: inode changed per call; post-fix, a Python flock-holder
+   blocks the Swift acquisition path). Never reintroduce createFile there, or
+   in `SnapshotLogger`'s lock.
+2. **No more spurious auto-resume into live sessions.** The rate-limit scan
+   (`_parse_cli_transcript`) now treats a rate_limit event as current only at
+   the effective transcript tail (breaks on any genuine user/assistant turn;
+   still skips metadata + the limit's own `<synthetic>` notice). Tradeoff
+   accepted: a user message queued after a cutoff cancels "waiting".
+3. `parse_reset_timestamp` normalizes stringified epoch-ms (was parsing
+   "17529…000" as year ~57k → never resumed).
+4. **Resume default is now `acceptEdits`**, not bypassPermissions
+   (AUTORESUME_PERMISSION_MODE still overrides). Widget tooltips disclose it.
+5. **Daemon poll rearchitecture**: all transcript reading/parsing/classifying
+   happens OUTSIDE StateLock (`compute_*_records` → `merge_*_records` under
+   the lock), with an (mtime,size)-keyed parse cache (`_PARSE_CACHE`, ~10x
+   cheaper warm) — merge preserves widget-owned fields exactly. Usage
+   analytics moved to a daemon thread. Widget side: all locked I/O moved off
+   the main thread onto a serial queue.
+6. **snapshots.jsonl append/compact race closed** via a shared flock at
+   `usage/snapshots.lock` — Swift appender holds it per append, Python
+   `compact()` holds it across its stage-1 read→rename. Keep both sides.
+7. **Explicit `kind: "cli"|"cowork"` field** on every state.json entry is now
+   the type sentinel (project_name == "Cowork" is only a legacy fallback).
+8. `ClaudeWebSession` recovers from launch-time navigation failures AND
+   WebContent-process crashes (backoff retry; `didFailProvisionalNavigation`
+   implemented). Backlog cap rejects the NEWEST call with `.backlogFull`
+   (never evicts queued closures — evicting stranded
+   `ChatsFetcher.recentsInFlight` forever).
+9. Title dedupe tightened both layers: local-local only collapses when ≤1 of
+   the group is recently active (mixed groups show only the live rows);
+   cloud-local skips generic titles ("Cowork session", "General coding
+   session", "Untitled") and only matches recently-active local titles.
+10. Smaller: corrupt state.json backed up to `state.json.corrupt` before
+    starting fresh; latest (not first) `cwd` wins for resume; daemon.log
+    rotates at 5MB and no longer double-writes to launchd.out.log; org
+    selection prefers capability-matched org over `orgs[0]`; state-dir
+    watcher survives dir deletion; `mutate()` failures NSLog'd.
 
 ## What changed this session (2026-07-19) — checkpoint before next feature work
 
@@ -177,7 +229,6 @@ picking up new work so you don't re-diagnose the same things.
 
 ## Open threads / things a future session might reasonably pick up
 
-- No git remote configured — first real push needs one added.
 - Click-to-open for local sessions is now a "just foreground Desktop, no
   navigation" fallback (see #2 above) — a genuine fix would need a reliable
   way to detect Desktop's existing native tab for a given CLI session id,

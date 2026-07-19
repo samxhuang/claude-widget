@@ -58,6 +58,12 @@ struct SessionEntry: Identifiable, Equatable, Hashable {
     /// degrade to the legacy blue/orange dot in that case, not treat nil as
     /// idle.
     var workStatus: SessionWorkStatus?
+    /// S7: the daemon's explicit session kind — `"cli"` or `"cowork"`. `nil`
+    /// for entries written by a daemon build that predates this field, in
+    /// which case `isCowork` falls back to the old projectName heuristic.
+    /// Preferred over that heuristic because a CLI project directory literally
+    /// named "Cowork" would otherwise misclassify as a Cowork row.
+    var kind: String?
 
     /// Cowork-only: opt-in "arm" for OS-level UI automation of Claude
     /// Desktop's native Resume space, orchestrated by the daemon's
@@ -78,7 +84,14 @@ struct SessionEntry: Identifiable, Equatable, Hashable {
     /// Cowork sessions have no rate-limit/resume cycle — Cowork manages its
     /// own lifecycle — so the "auto-resume" toggle and Resume button don't
     /// apply to them; the widget just shows they're running.
-    var isCowork: Bool { projectName == "Cowork" }
+    ///
+    /// S7: prefer the daemon's explicit `kind` field; only fall back to the
+    /// projectName heuristic when the daemon predates `kind` (old builds), so
+    /// a CLI project directory named "Cowork" no longer misclassifies.
+    var isCowork: Bool {
+        if let kind = kind { return kind == "cowork" }
+        return projectName == "Cowork"
+    }
 
     /// What to show as the primary line in the widget. The session title
     /// (Claude Code's own auto-generated or user-set title, e.g. "Test
@@ -96,6 +109,12 @@ struct SessionEntry: Identifiable, Equatable, Hashable {
 /// the Python daemon. Every read-modify-write takes the same advisory file
 /// lock (state.json.lock) the daemon uses, so a toggle click here and a
 /// daemon poll cycle can't stomp on each other.
+///
+/// S2: all of that locked file I/O runs off the main thread on a private
+/// serial queue (`ioQueue`). The lock is a real cross-process flock now (see
+/// S1 in `withLock`), and the daemon can hold it while it scans transcripts —
+/// a blocking `flock` on the main thread would beachball the UI for that
+/// whole window. Results are published back on main.
 final class SessionsModel: ObservableObject {
     @Published var sessions: [SessionEntry] = []
     @Published var now: Date = Date()
@@ -138,8 +157,9 @@ final class SessionsModel: ObservableObject {
     /// Re-reads state.json and republishes the list of not-yet-handled
     /// (i.e. still "waiting") sessions, soonest reset first.
     func refresh() {
-        withLock {
-            guard let raw = try? Data(contentsOf: stateURL),
+        withLock { [weak self] in
+            guard let self = self else { return }
+            guard let raw = try? Data(contentsOf: self.stateURL),
                   let json = try? JSONSerialization.jsonObject(with: raw) as? [String: [String: Any]] else {
                 return
             }
@@ -163,6 +183,7 @@ final class SessionsModel: ObservableObject {
                     handled: handled,
                     status: dict["status"] as? String ?? "active",
                     workStatus: (dict["work_status"] as? String).flatMap(SessionWorkStatus.init(rawValue:)),
+                    kind: dict["kind"] as? String,
                     resumeArmed: dict["resume_armed"] as? Bool ?? false,
                     needsAttention: dict["needs_attention"] as? Bool ?? false
                 ))
@@ -174,11 +195,27 @@ final class SessionsModel: ObservableObject {
             // so without this the widget shows both as if they were two
             // separate live sessions. Only collapse pairs that are BOTH
             // "active"; "waiting" (rate-limited) rows are distinct resumable
-            // states and must never be hidden this way. Self-heals once the
-            // old id ages out of the daemon's window, so this only needs to
-            // cover the overlap — keep the one with the most recent activity.
+            // states and must never be hidden this way.
+            //
+            // S5(a): but two genuinely concurrent live sessions can also share
+            // a (project, title) — most obviously the default/auto-generated
+            // title before either has been renamed. Collapsing those hides a
+            // real running session. The distinguishing evidence: a crashed
+            // predecessor by definition STOPS writing, so in a real
+            // crash-continuation at most ONE row of the group is recently
+            // active. So only collapse when ≤1 row in the group has activity
+            // within the last ~3 minutes; if two or more are recently active
+            // they're concurrent live sessions and all are shown. When we do
+            // collapse, keep the most-recently-active row. Self-heals once the
+            // old id ages out of the daemon's window.
+            let recentActivityWindow: TimeInterval = 180
+            let nowRef = Date()
+            func isRecentlyActive(_ e: SessionEntry) -> Bool {
+                guard let last = e.lastActivityAt else { return false }
+                return nowRef.timeIntervalSince(last) < recentActivityWindow
+            }
             var dedupedEntries: [SessionEntry] = []
-            var bestActiveByKey: [String: SessionEntry] = [:]
+            var groupsByKey: [String: [SessionEntry]] = [:]
             var activeKeyOrder: [String] = []
             for entry in entries {
                 guard entry.isActive else {
@@ -186,18 +223,35 @@ final class SessionsModel: ObservableObject {
                     continue
                 }
                 let key = entry.projectName + "\u{0}" + (entry.sessionTitle ?? "")
-                if let existing = bestActiveByKey[key] {
-                    let existingActivity = existing.lastActivityAt ?? .distantPast
-                    let newActivity = entry.lastActivityAt ?? .distantPast
-                    if newActivity > existingActivity {
-                        bestActiveByKey[key] = entry
-                    }
-                } else {
-                    bestActiveByKey[key] = entry
+                if groupsByKey[key] == nil {
+                    groupsByKey[key] = []
                     activeKeyOrder.append(key)
                 }
+                groupsByKey[key]?.append(entry)
             }
-            dedupedEntries.append(contentsOf: activeKeyOrder.compactMap { bestActiveByKey[$0] })
+            for key in activeKeyOrder {
+                let group = groupsByKey[key] ?? []
+                if group.count <= 1 {
+                    dedupedEntries.append(contentsOf: group)
+                    continue
+                }
+                // Two or more recently-active rows sharing a key => genuinely
+                // concurrent live sessions; show them. R2-3: show only the
+                // recently-active ones, NOT the whole group — any additional
+                // quiet rows in the same group are crash-predecessors of one of
+                // those live sessions and must still collapse away (otherwise a
+                // group of {active A, active B, stale C} would render C too).
+                // Otherwise (≤1 recently active) treat it as a
+                // crash-continuation and collapse to the most-recent row.
+                let recentlyActive = group.filter(isRecentlyActive)
+                if recentlyActive.count >= 2 {
+                    dedupedEntries.append(contentsOf: recentlyActive)
+                } else if let best = group.max(by: {
+                    ($0.lastActivityAt ?? .distantPast) < ($1.lastActivityAt ?? .distantPast)
+                }) {
+                    dedupedEntries.append(best)
+                }
+            }
             entries = dedupedEntries
 
             // Rate-limited (waiting) sessions first, soonest reset first; active ones after.
@@ -249,29 +303,69 @@ final class SessionsModel: ObservableObject {
 
     // MARK: - Locked file I/O
 
-    private func withLock(_ body: () -> Void) {
-        FileManager.default.createFile(atPath: lockURL.path, contents: nil)
-        let fd = open(lockURL.path, O_RDWR | O_CREAT, 0o644)
-        guard fd >= 0 else { body(); return }
-        flock(fd, LOCK_EX)
-        body()
-        flock(fd, LOCK_UN)
-        close(fd)
+    /// S2: every locked read-modify-write runs here, off the main thread.
+    /// Serial, so a `mutate()` enqueued immediately before a `refresh()` (see
+    /// setEnabled/resumeNow/setResumeArmed) is guaranteed to run first —
+    /// preserving read-your-writes ordering for the fire-and-forget public API.
+    private let ioQueue = DispatchQueue(label: "com.claude-widget.sessions-io")
+
+    /// Takes the same advisory flock the Python daemon holds around every
+    /// state.json read-modify-write, so a widget toggle and a daemon poll
+    /// cycle can't interleave and clobber each other.
+    ///
+    /// S1 — DO NOT reintroduce `FileManager.default.createFile(atPath:...)`
+    /// here. createFile replaces the lock file's inode on every call (verified
+    /// empirically: the inode number changes each time), and flock is
+    /// per-inode. With createFile in place the widget would take flock on a
+    /// brand-new inode while the daemon still held flock on the OLD inode —
+    /// the two locks referencing different inodes exclude nothing, so a toggle
+    /// racing a daemon poll silently lost. The `open(O_RDWR | O_CREAT)` below
+    /// already creates the file when it's absent WITHOUT replacing an existing
+    /// inode, which is exactly what a shared cross-process flock requires.
+    private func withLock(_ body: @escaping () -> Void) {
+        ioQueue.async { [weak self] in
+            guard let self = self else { return }
+            let fd = open(self.lockURL.path, O_RDWR | O_CREAT, 0o644)
+            guard fd >= 0 else { body(); return }
+            flock(fd, LOCK_EX)
+            body()
+            flock(fd, LOCK_UN)
+            close(fd)
+        }
     }
 
-    private func mutate(sessionId: String, _ change: (inout [String: Any]) -> Void) {
-        withLock {
-            guard let raw = try? Data(contentsOf: stateURL),
-                  var json = try? JSONSerialization.jsonObject(with: raw) as? [String: [String: Any]] else {
+    /// S8: keeps the non-throwing, fire-and-forget signature but NSLogs each
+    /// distinct failure path (read / parse / entry-missing / serialize /
+    /// write) so a toggle that silently reverts — because the write never
+    /// landed — is at least diagnosable from Console.app.
+    private func mutate(sessionId: String, _ change: @escaping (inout [String: Any]) -> Void) {
+        withLock { [weak self] in
+            guard let self = self else { return }
+            guard let raw = try? Data(contentsOf: self.stateURL) else {
+                NSLog("[SessionsModel] mutate(%@): read failed", sessionId)
                 return
             }
-            guard var entry = json[sessionId] else { return }
+            guard var json = try? JSONSerialization.jsonObject(with: raw) as? [String: [String: Any]] else {
+                NSLog("[SessionsModel] mutate(%@): parse failed", sessionId)
+                return
+            }
+            guard var entry = json[sessionId] else {
+                NSLog("[SessionsModel] mutate(%@): entry missing", sessionId)
+                return
+            }
             change(&entry)
             json[sessionId] = entry
-            guard let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]) else { return }
-            let tmpURL = stateURL.appendingPathExtension("tmp")
-            try? out.write(to: tmpURL)
-            _ = try? FileManager.default.replaceItemAt(stateURL, withItemAt: tmpURL)
+            guard let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]) else {
+                NSLog("[SessionsModel] mutate(%@): serialize failed", sessionId)
+                return
+            }
+            let tmpURL = self.stateURL.appendingPathExtension("tmp")
+            do {
+                try out.write(to: tmpURL)
+                _ = try FileManager.default.replaceItemAt(self.stateURL, withItemAt: tmpURL)
+            } catch {
+                NSLog("[SessionsModel] mutate(%@): write failed: %@", sessionId, error.localizedDescription)
+            }
         }
     }
 

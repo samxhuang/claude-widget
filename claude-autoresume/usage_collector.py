@@ -85,6 +85,9 @@ Snapshot compaction: ~/.claude-autoresume/usage/snapshots*.jsonl
 ------------------------------------------------------------------
 snapshots.jsonl (raw, 2-min rows, written by the widget — not this module)
   -> kept 24h, then downsampled into 15-min buckets in snapshots_15m.jsonl
+     (the raw -> 15m stage runs under snapshots.lock, an flock shared with the
+     widget's appender so a snapshot appended mid-compaction isn't lost — see
+     SNAPSHOTS_LOCK_FILENAME)
 snapshots_15m.jsonl
   -> kept 30 days, then downsampled into 1-hour buckets in snapshots_1h.jsonl
 snapshots_1h.jsonl
@@ -132,6 +135,14 @@ COLLECT_LOCK_FILENAME = "usage_collect.lock"
 SNAPSHOTS_RAW_FILENAME = "snapshots.jsonl"
 SNAPSHOTS_15M_FILENAME = "snapshots_15m.jsonl"
 SNAPSHOTS_1H_FILENAME = "snapshots_1h.jsonl"
+# Cross-language lock guarding snapshots.jsonl. AGREED PROTOCOL with the Swift
+# widget: the widget takes fcntl flock(LOCK_EX) on THIS file around each
+# O_APPEND write of a raw snapshot row; the compactor takes it around stage 1
+# (reading snapshots.jsonl through renaming the rewritten file back into
+# place). Without it, an append landing between the compactor's read and its
+# rename is silently lost to the read -> tmp-write -> rename. Do not change
+# this filename without changing the widget in lockstep.
+SNAPSHOTS_LOCK_FILENAME = "snapshots.lock"
 
 STORE_VERSION = 1
 
@@ -186,6 +197,10 @@ def snapshots_1h_path(state_dir: Path) -> Path:
     return usage_dir(state_dir) / SNAPSHOTS_1H_FILENAME
 
 
+def snapshots_lock_path(state_dir: Path) -> Path:
+    return usage_dir(state_dir) / SNAPSHOTS_LOCK_FILENAME
+
+
 def _atomic_write_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
@@ -207,6 +222,29 @@ class _CollectLock:
 
     def __init__(self, state_dir: Path):
         self._path = usage_dir(state_dir) / COLLECT_LOCK_FILENAME
+        self._fh = None
+
+    def __enter__(self):
+        self._fh = open(self._path, "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
+class _SnapshotsLock:
+    """Cross-process / cross-language exclusive lock guarding snapshots.jsonl
+    (see SNAPSHOTS_LOCK_FILENAME). The Swift widget takes flock(LOCK_EX) on
+    this same file around each O_APPEND of a raw snapshot row; the compactor
+    takes it around stage 1 (raw -> 15m) so an append can't be lost between
+    the compactor's read and its rename. Held for as short a window as
+    possible — stage 2 (15m -> 1h) touches only compactor-private files and
+    stays OUTSIDE this lock."""
+
+    def __init__(self, state_dir: Path):
+        self._path = snapshots_lock_path(state_dir)
         self._fh = None
 
     def __enter__(self):
@@ -611,32 +649,39 @@ def compact(state_dir: Path, now: float | None = None, quiet: bool = False) -> N
     total_malformed = 0
 
     # --- Stage 1: raw (snapshots.jsonl) -> 15-min buckets -----------------
-    raw_rows, malformed = _read_jsonl_rows(raw_path)
-    total_malformed += malformed
-
+    # Held under _SnapshotsLock: the widget appends raw rows to snapshots.jsonl
+    # under this same lock, and an append landing between our read and our
+    # rename below would otherwise be silently dropped. Kept as tight as
+    # possible — nothing but the raw read, bucketing, and the two rewrites.
     keep_raw: list[dict] = []
     to_15m: list[tuple[float, dict]] = []
-    for row in raw_rows:
-        epoch = _parse_ts(row.get("ts"))
-        if epoch is None:
-            total_malformed += 1  # can't place it in time -- drop, counted
-            continue
-        if epoch >= raw_cutoff:
-            keep_raw.append(row)
-        else:
-            to_15m.append((epoch, row))
-
-    if to_15m:
-        existing_15m, malformed = _read_jsonl_rows(m15_path)
+    with _SnapshotsLock(state_dir):
+        raw_rows, malformed = _read_jsonl_rows(raw_path)
         total_malformed += malformed
-        bucket_map = _load_bucket_map(existing_15m)
-        _bucket_raw_rows(bucket_map, to_15m, BUCKET_15M_SECONDS)
-        _write_jsonl_rows(m15_path, [bucket_map[k] for k in sorted(bucket_map)])
 
-    if raw_path.exists():
-        _write_jsonl_rows(raw_path, keep_raw)
+        for row in raw_rows:
+            epoch = _parse_ts(row.get("ts"))
+            if epoch is None:
+                total_malformed += 1  # can't place it in time -- drop, counted
+                continue
+            if epoch >= raw_cutoff:
+                keep_raw.append(row)
+            else:
+                to_15m.append((epoch, row))
+
+        if to_15m:
+            existing_15m, malformed = _read_jsonl_rows(m15_path)
+            total_malformed += malformed
+            bucket_map = _load_bucket_map(existing_15m)
+            _bucket_raw_rows(bucket_map, to_15m, BUCKET_15M_SECONDS)
+            _write_jsonl_rows(m15_path, [bucket_map[k] for k in sorted(bucket_map)])
+
+        if raw_path.exists():
+            _write_jsonl_rows(raw_path, keep_raw)
 
     # --- Stage 2: 15-min buckets -> 1-hour buckets -------------------------
+    # Outside the lock on purpose: snapshots_15m.jsonl / snapshots_1h.jsonl are
+    # compactor-private (the widget only ever appends to snapshots.jsonl).
     rows_15m, malformed = _read_jsonl_rows(m15_path)
     total_malformed += malformed
 

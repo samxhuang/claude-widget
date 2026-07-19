@@ -34,7 +34,7 @@ final class UsageFetcher {
           if (!orgsRes.ok) { return { error: 'orgs_http_' + orgsRes.status }; }
           const orgs = await orgsRes.json();
           if (!orgs || orgs.length === 0) { return { error: 'no_orgs' }; }
-          const orgId = orgs[0].uuid;
+        \(ClaudeWebSession.orgSelectionJS)
           const usageRes = await fetch('https://claude.ai/api/organizations/' + orgId + '/usage', { credentials: 'include' });
           if (usageRes.status === 401 || usageRes.status === 403) { return { loggedOut: true }; }
           if (!usageRes.ok) { return { error: 'usage_http_' + usageRes.status }; }

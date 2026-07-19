@@ -100,7 +100,7 @@ final class ChatsFetcher {
           if (!orgsRes.ok) { return { error: 'orgs_http_' + orgsRes.status }; }
           const orgs = await orgsRes.json();
           if (!orgs || orgs.length === 0) { return { error: 'no_orgs' }; }
-          const orgId = orgs[0].uuid;
+        \(ClaudeWebSession.orgSelectionJS)
           const url = 'https://claude.ai/api/organizations/' + orgId + '/chat_conversations?limit=30';
           const res = await fetch(url, { credentials: 'include' });
           if (res.status === 401 || res.status === 403) { return { loggedOut: true }; }
@@ -166,7 +166,7 @@ final class ChatsFetcher {
           if (!orgsRes.ok) { return { error: 'orgs_http_' + orgsRes.status }; }
           const orgs = await orgsRes.json();
           if (!orgs || orgs.length === 0) { return { error: 'no_orgs' }; }
-          const orgId = orgs[0].uuid;
+        \(ClaudeWebSession.orgSelectionJS)
 
           // Item 4: cloud-only sessions. /recents aggregates the
           // "chat"/"code"/"cowork" surfaces. Root-caused 2026-07-18 via a

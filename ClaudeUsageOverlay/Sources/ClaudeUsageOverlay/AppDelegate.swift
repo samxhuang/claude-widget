@@ -211,7 +211,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         chatsFetcher = ChatsFetcher(session: webSession, model: chatsModel, cloudSessions: cloudSessionsModel, localSessionIds: { [weak self] in
             Set(self?.sessionsModel.sessions.map { $0.id } ?? [])
         }, localSessionTitles: { [weak self] in
-            Set((self?.sessionsModel.sessions ?? []).map { $0.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+            // S5(b): only feed RECENTLY-ACTIVE local session titles into the
+            // cloud-vs-local title dedupe. That dedupe exists for the
+            // crash-continuation case (a just-crashed local session's
+            // conversation reappearing as a cloud row), which by definition
+            // involves a recently-live local row — so a stale local session
+            // must not suppress a genuinely live cloud one. A session with no
+            // lastActivityAt (old daemon build, can't confirm recency) is
+            // excluded, erring toward showing the cloud row.
+            let now = Date()
+            let recentWindow: TimeInterval = 180
+            return Set((self?.sessionsModel.sessions ?? [])
+                .filter { entry in
+                    guard let last = entry.lastActivityAt else { return false }
+                    return now.timeIntervalSince(last) < recentWindow
+                }
+                .map { $0.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
         }, onLoginNeeded: { [weak self] in
             self?.presentLoginWindow()
         })
@@ -304,19 +319,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// fallback and for age-label ticking; this just makes status changes
     /// (running -> needs input) land in the panel the moment the daemon
     /// publishes them. Debounced 200ms so a burst of writes coalesces.
+    ///
+    /// S10: the watched fd is the DIRECTORY's own inode, so if
+    /// ~/.claude-autoresume is deleted and recreated (e.g. a fresh
+    /// install.sh, or the user clearing it out) the source silently goes
+    /// stale — it keeps watching the now-orphaned old inode and never fires
+    /// again. `.delete`/`.rename` are added to the mask so we notice, and on
+    /// those events the source is cancelled and the watcher re-established
+    /// against the new inode (retried shortly if the directory doesn't exist
+    /// yet). Push behavior is restored; the 10s timer covers the brief gap.
     private func startStateFileWatcher() {
         let dirPath = (NSHomeDirectory() as NSString).appendingPathComponent(".claude-autoresume")
         let fd = open(dirPath, O_EVTONLY)
-        guard fd >= 0 else { return }
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd, eventMask: .write, queue: .main)
-        source.setEventHandler { [weak self] in
-            self?.stateWatchDebounce?.cancel()
-            let work = DispatchWorkItem {
-                self?.sessionsModel.tick()
-                self?.sessionsModel.refresh()
+        guard fd >= 0 else {
+            // Directory not present yet — retry shortly so a later
+            // install.sh / mkdir re-establishes push updates. The 10s poll
+            // timer keeps the panel current in the meantime.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.startStateFileWatcher()
             }
-            self?.stateWatchDebounce = work
+            return
+        }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .delete, .rename], queue: .main)
+        source.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let flags = source.data
+            // S10: the directory inode itself was removed/renamed out from
+            // under us — this watcher is now dead. Tear it down and rebuild
+            // against whatever inode currently occupies the path.
+            if flags.contains(.delete) || flags.contains(.rename) {
+                self.stateDirWatcher?.cancel()
+                self.stateDirWatcher = nil
+                self.startStateFileWatcher()
+                return
+            }
+            self.stateWatchDebounce?.cancel()
+            let work = DispatchWorkItem {
+                self.sessionsModel.tick()
+                self.sessionsModel.refresh()
+            }
+            self.stateWatchDebounce = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
         }
         source.setCancelHandler { close(fd) }
@@ -399,6 +442,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    /// The panel's own hide (×) button: identical to toggling "Show Overlay"
+    /// off — hides without quitting, keeps the menu item's checkmark in sync
+    /// so reopening from the menu-bar icon works exactly as before. The app
+    /// stays running (menu-bar accessory; there is no Dock icon).
+    private func hideOverlay() {
+        guard overlayPanel.isVisible else { return }
+        overlayPanel.orderOut(nil)
+        statusItem.menu?.item(withTitle: "Show Overlay")?.state = .off
+    }
+
     @objc private func presentLoginWindow() {
         if loginWindowController == nil {
             loginWindowController = LoginWindowController()
@@ -443,6 +496,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.moveWindow(cumulativeScreenDelta: cumulativeDelta)
         }, onMoveDragEnded: { [weak self] in
             self?.moveDragStartOrigin = nil
+        }, onHide: { [weak self] in
+            self?.hideOverlay()
         }))
         // Without this, NSHostingView installs Auto Layout min/max-size
         // constraints on itself (macOS 13+ default: .standardBounds) that
