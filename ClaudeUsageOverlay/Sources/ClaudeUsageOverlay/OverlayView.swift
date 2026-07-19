@@ -80,6 +80,11 @@ struct OverlayView: View {
     /// AppDelegate's drag-start bookkeeping.
     var onMoveDragChanged: (CGSize) -> Void = { _ in }
     var onMoveDragEnded: () -> Void = {}
+    /// Hide button on the title row: hides the panel (orderOut) without
+    /// quitting the app — for getting at whatever's underneath without
+    /// hunting for the panel later. Reopen via the menu-bar gauge icon →
+    /// "Show Overlay" (AppDelegate keeps that menu item's checkmark in sync).
+    var onHide: () -> Void = {}
 
     /// Sort-deadband state (see combinedSessionRows): an ordered list of row
     /// ids from the last computed arrangement, used as the tiebreak below.
@@ -123,9 +128,12 @@ struct OverlayView: View {
                 // representable, so it can never be bigger than the visible
                 // title text/spacer region it's meant to scope to.
                 HStack {
-                    Text("Claude Usage")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.9))
+                    // "Claude Usage" title removed (user request): the tab
+                    // pills were truncating ("Gra…"/"Plan…") in the space the
+                    // title ate, and what the panel is is self-evident. The
+                    // HStack + Spacer stay: this region is still the
+                    // MoveHandle drag-to-move target (see .background below),
+                    // and the sign-in/error status still renders here.
                     Spacer()
                     if model.isLoggedOut {
                         Text("Sign in needed")
@@ -138,8 +146,27 @@ struct OverlayView: View {
                             .lineLimit(1)
                     }
                 }
+                // minHeight: with the title text gone this HStack's only
+                // unconditional child is the Spacer, which has ZERO height on
+                // its own — and the MoveHandle behind it inherits that zero-
+                // height frame, making drag-to-move unhittable (reported live
+                // after the title's removal). Pin it to the pill row's height
+                // so the empty left region stays a real drag target.
+                .frame(minHeight: 19)
                 .background(MoveHandleRepresentable(onDragChanged: onMoveDragChanged, onDragEnded: onMoveDragEnded))
                 tabSwitch
+                // Hide (not quit): sits OUTSIDE the MoveHandle background's
+                // scope (a sibling of tabSwitch, same as the pills) so its
+                // click can't start a window drag.
+                Button(action: onHide) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(.white.opacity(0.45))
+                        .frame(width: 14, height: 14)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Hide the widget — reopen from the menu bar gauge icon → Show Overlay")
             }
 
             if graph.selectedTab == .main {
@@ -393,6 +420,16 @@ struct OverlayView: View {
             tabButton(title: "Graph", tab: .graph)
             tabButton(title: "Plan fit", tab: .planFit)
         }
+        // Truncation fix ("Gra…"/"Plan…" even with free space on the row):
+        // the title row's outer HStack splits its width between its flexible
+        // children — the Spacer-bearing status region and this stack — so the
+        // pills were being PROPOSED roughly half the row regardless of how
+        // little the other side actually needed, and the tail pills truncated
+        // into that artificial ceiling. fixedSize() makes the pills always
+        // take exactly their ideal width; the Spacer region absorbs whatever
+        // is left (and the status/error text there is lineLimit(1), so IT
+        // truncates first when genuinely tight — the right precedence).
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private func tabButton(title: String, tab: PanelTab) -> some View {
@@ -809,6 +846,10 @@ struct OverlayView: View {
                 .buttonStyle(.plain)
                 .font(.system(size: 8.5, weight: .medium))
                 .foregroundColor(.blue.opacity(0.9))
+                // S4: be explicit that this runs unattended — the daemon
+                // resumes the session in the background with a "continue"
+                // prompt, permission mode acceptEdits by default.
+                .help("Resume this session now, unattended: the daemon relaunches it with a \"continue\" prompt (permission mode acceptEdits by default)")
             }
 
             if entry.isCowork {
@@ -848,7 +889,12 @@ struct OverlayView: View {
                 CompactSwitch(isOn: entry.enabled, tint: Color(nsColor: .systemGreen)) {
                     sessions.setEnabled(entry.id, !entry.enabled)
                 }
-                .help(entry.isActive ? "Auto-resume if this session hits a rate limit" : "Auto-resume when the limit resets")
+                // S4: disclose that auto-resume runs the session unattended
+                // (background "continue" prompt, permission mode acceptEdits
+                // by default) — not just that it will fire on a rate limit.
+                .help(entry.isActive
+                      ? "Auto-resume if this session hits a rate limit — runs unattended with a \"continue\" prompt (permission mode acceptEdits by default)"
+                      : "Auto-resume when the limit resets — runs unattended with a \"continue\" prompt (permission mode acceptEdits by default)")
             }
         }
         .padding(.vertical, 4)
