@@ -235,13 +235,23 @@ final class GraphModel: ObservableObject {
             let firstKey = fmt.string(from: cal.startOfDay(for: start))
             measuredCost = dailyCost.filter { $0.key >= firstKey }.values.reduce(0, +)
         } else {
+            // Filter from the UTC hour-floor of `start`, not `start` itself:
+            // hourlyCostBuckets' first bar starts at that hour-floor, so the
+            // raw `key >= start` filter excluded the boundary hour the chart
+            // plots and the header total came up short of the visible bars.
+            // Counting the boundary hour whole is the deliberate parallel of
+            // the 3mo boundary-day-counted-whole semantics above.
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = TimeZone(identifier: "UTC") ?? .current
+            let comps = cal.dateComponents([.year, .month, .day, .hour], from: start)
+            let hourFloor = cal.date(from: comps) ?? start
             measuredCost = hourlyCost
-                .filter { $0.key >= start && $0.key < end }
+                .filter { $0.key >= hourFloor && $0.key < end }
                 .values.reduce(0, +)
         }
         costSummary = Self.costSummaryText(
             measured: measuredCost, start: start, end: end,
-            earliest: costDataEarliest(), duration: period.durationSeconds)
+            earliest: costDataEarliest(for: period), duration: period.durationSeconds)
 
         if let last = rawSnapshots.last {
             latestFiveHour = last.five
@@ -271,19 +281,38 @@ final class GraphModel: ObservableObject {
 
     /// Earliest instant the cost series has any data for — the boundary
     /// between "measured $0 because nothing ran" and "no measurement exists".
-    /// The hour-resolution series is authoritative when present: a daily key
-    /// ("YYYY-MM-DD") can only parse as UTC midnight, and taking min() across
-    /// both series let that midnight shave hours off the true start (first
-    /// data 04:00 → 4 phantom hours of "coverage"), quietly deflating the
-    /// estimate relative to plan_fit's hourly-anchored run rate. Daily is a
-    /// fallback for the (currently hypothetical) case of daily-only data.
-    private func costDataEarliest() -> Date? {
+    ///
+    /// The anchor MUST share a source with the period's measured sum.
+    /// plan_fit.py prunes `cost_series.hourly` to a rolling ~35-day window
+    /// while `daily` is forever-retained, so once history exceeds 35 days the
+    /// two series' minima diverge permanently. The 3mo view sums the FULL
+    /// daily history; anchoring its coverage on the hourly min would then
+    /// credit only ~35 of the 90 days as "covered", inflating the linear
+    /// estimate ~2.6x and showing an "est" even at 100% real coverage. So:
+    /// - .threeMonth: anchor on the daily series' min key, parsed as UTC
+    ///   midnight — consistent with the boundary-day-counted-whole daily sum.
+    /// - all other periods: the hour-resolution series is authoritative when
+    ///   present. A daily key ("YYYY-MM-DD") can only parse as UTC midnight,
+    ///   and taking min() across both series let that midnight shave hours
+    ///   off the true start (first data 04:00 → 4 phantom hours of
+    ///   "coverage"), quietly deflating the estimate relative to plan_fit's
+    ///   hourly-anchored run rate. Daily midnight remains the fallback for
+    ///   the (currently hypothetical) case of daily-only data.
+    private func costDataEarliest(for period: GraphPeriod) -> Date? {
+        if period == .threeMonth {
+            return Self.dailyKeyDate(dailyCost.keys.min())
+        }
         if let earliest = hourlyCost.keys.min() { return earliest }
-        guard let firstDaily = dailyCost.keys.min() else { return nil }
+        return Self.dailyKeyDate(dailyCost.keys.min())
+    }
+
+    /// "YYYY-MM-DD" daily-series key → UTC midnight of that day (nil in, nil out).
+    private static func dailyKeyDate(_ key: String?) -> Date? {
+        guard let key = key else { return nil }
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
         f.timeZone = TimeZone(identifier: "UTC")
-        return f.date(from: firstDaily)
+        return f.date(from: key)
     }
 
     /// "$18.42" when the cost data spans the whole period, "$18.42 · est $210"

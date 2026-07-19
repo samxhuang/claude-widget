@@ -78,14 +78,18 @@ final class ChatsFetcher {
     /// Titles are of the currently-DISPLAYED local sessions (i.e. after
     /// SessionsModel's own local-local dedupe), not the raw state.json set.
     private let localSessionTitles: () -> Set<String>
+    /// Known local CLI sessions' transcript creation dates (SessionsModel's
+    /// append-only cache) — the created_at dedupe signal for cloud echoes.
+    private let localStartDates: () -> [Date]
     private let onLoginNeeded: () -> Void
 
-    init(session: ClaudeWebSession, model: ChatsModel, cloudSessions: CloudSessionsModel, localSessionIds: @escaping () -> Set<String>, localSessionTitles: @escaping () -> Set<String>, onLoginNeeded: @escaping () -> Void) {
+    init(session: ClaudeWebSession, model: ChatsModel, cloudSessions: CloudSessionsModel, localSessionIds: @escaping () -> Set<String>, localSessionTitles: @escaping () -> Set<String>, localStartDates: @escaping () -> [Date], onLoginNeeded: @escaping () -> Void) {
         self.session = session
         self.model = model
         self.cloudSessions = cloudSessions
         self.localSessionIds = localSessionIds
         self.localSessionTitles = localSessionTitles
+        self.localStartDates = localStartDates
         self.onLoginNeeded = onLoginNeeded
     }
 
@@ -208,7 +212,15 @@ final class ChatsFetcher {
               // interpreted here) so CloudSessionsModel can map them — see
               // that model's header comment for what's verified vs. not.
               status: item.status || null,
-              worker_status: item.worker_status || item.workerStatus || null
+              worker_status: item.worker_status || item.workerStatus || null,
+              // Phantom-row dedupe: /recents ids are opaque cse_* tokens with
+              // every linking field null (verified via a live dump — no
+              // session uuid, no device binding, no preview; the detail
+              // endpoint 404s), so created_at is the ONLY joinable signal: a
+              // Desktop-attached session's cloud record is created within ~1s
+              // of its local transcript file. Passed through for
+              // CloudSessionsModel's creation-time dedupe.
+              created_at: item.created_at || item.createdAt || null
             }))
             .filter(c => c.id);
 
@@ -304,7 +316,8 @@ final class ChatsFetcher {
             }
             let localIds = localSessionIds()
             let localTitles = localSessionTitles()
-            cloudSessions.apply(raw: cloudRaw, localIds: localIds, localTitles: localTitles)
+            cloudSessions.apply(raw: cloudRaw, localIds: localIds, localTitles: localTitles,
+                                localStartDates: localStartDates())
             NSLog("[ChatsFetcher] cloud sessions: %d raw, %d after local-id/title filter+cap (%d local ids, %d local titles known)", cloudRaw.count, cloudSessions.sessions.count, localIds.count, localTitles.count)
         }
     }

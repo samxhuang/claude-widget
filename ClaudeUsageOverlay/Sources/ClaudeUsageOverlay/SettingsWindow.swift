@@ -2,14 +2,30 @@ import SwiftUI
 import AppKit
 import Foundation
 
+/// Broadcast to the SwiftUI tree when the Settings window closes. The window
+/// is kept alive (isReleasedWhenClosed = false), so its view tree — including
+/// AccountBudgetSection's buffered, not-yet-applied edits — would otherwise
+/// survive a close and reappear invisibly on the next open. Sections that
+/// buffer edits observe `closeCount` and discard pending edits when it moves,
+/// so reopening always starts from the live config. (Chosen mechanism: the
+/// controller is the window's NSWindowDelegate and bumps the counter in
+/// windowWillClose — simplest hook that fires on every close route: the
+/// close button, Cmd-W, or a programmatic close.)
+final class SettingsWindowSignals: ObservableObject {
+    /// Monotonic close counter — the value is meaningless, only its change is
+    /// observed (via .onChange).
+    @Published var closeCount = 0
+}
+
 /// Owns the real (titled/closable) Settings NSWindow, hosting `SettingsView`.
 /// Kept alive singleton-style by AppDelegate so the window and its ConfigStore
 /// survive being closed and reopened. A plain NSWindow rather than a popover
 /// per the plan — the Remote Hosts section (tables, deploy sheets) needs real
 /// window chrome and room.
-final class SettingsWindowController: NSObject {
+final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private let configStore: ConfigStore
+    private let windowSignals = SettingsWindowSignals()
 
     init(configStore: ConfigStore) {
         self.configStore = configStore
@@ -18,12 +34,13 @@ final class SettingsWindowController: NSObject {
 
     func show() {
         if window == nil {
-            let hosting = NSHostingController(rootView: SettingsView(configStore: configStore))
+            let hosting = NSHostingController(rootView: SettingsView(configStore: configStore, windowSignals: windowSignals))
             let w = NSWindow(contentViewController: hosting)
             w.title = "Claude Widget Settings"
             w.styleMask = [.titled, .closable, .miniaturizable]
             w.setContentSize(NSSize(width: 480, height: 600))
             w.isReleasedWhenClosed = false
+            w.delegate = self
             w.center()
             window = w
         }
@@ -32,17 +49,22 @@ final class SettingsWindowController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
     }
+
+    func windowWillClose(_ notification: Notification) {
+        windowSignals.closeCount += 1
+    }
 }
 
 // MARK: - Root settings view
 
 struct SettingsView: View {
     @ObservedObject var configStore: ConfigStore
+    let windowSignals: SettingsWindowSignals
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                AccountBudgetSection(configStore: configStore)
+                AccountBudgetSection(configStore: configStore, windowSignals: windowSignals)
                 Divider()
                 SessionsSection(configStore: configStore)
                 Divider()
@@ -154,6 +176,9 @@ struct SessionsSection: View {
 
 struct AccountBudgetSection: View {
     @ObservedObject var configStore: ConfigStore
+    /// Bumped by SettingsWindowController when the window closes — observed
+    /// below to discard pending (buffered, unapplied) edits on close.
+    @ObservedObject var windowSignals: SettingsWindowSignals
 
     @State private var accountChoice: AccountChoice = .max20x
     @State private var weeklyText: String = ""
@@ -190,18 +215,24 @@ struct AccountBudgetSection: View {
     private var weeklyValid: Bool { Self.isValidBudget(weeklyText) }
     private var monthlyValid: Bool { Self.isValidBudget(monthlyText) }
 
+    /// Whether a budget field means "no limit". Trimmed, so a field holding
+    /// only whitespace counts as empty rather than as invalid input.
+    private static func isBlank(_ s: String) -> Bool {
+        s.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
     /// The fields as currently edited (not yet applied), in snapshot form.
     private var editedSnapshot: SectionSnapshot {
         SectionSnapshot(
             choice: accountChoice,
-            weeklyUsd: weeklyText.isEmpty ? nil : Double(weeklyText),
-            monthlyUsd: monthlyText.isEmpty ? nil : Double(monthlyText),
+            weeklyUsd: Self.isBlank(weeklyText) ? nil : Self.parseBudget(weeklyText),
+            monthlyUsd: Self.isBlank(monthlyText) ? nil : Self.parseBudget(monthlyText),
             weekStart: weekStart
         )
     }
 
     private var hasInvalidInput: Bool {
-        (!weeklyText.isEmpty && !weeklyValid) || (!monthlyText.isEmpty && !monthlyValid)
+        (!Self.isBlank(weeklyText) && !weeklyValid) || (!Self.isBlank(monthlyText) && !monthlyValid)
     }
 
     /// Edits differ from the live config (or hold invalid text worth
@@ -233,8 +264,8 @@ struct AccountBudgetSection: View {
                         Text("$")
                         TextField("none", text: $weeklyText)
                             .frame(width: 100)
-                        if !weeklyText.isEmpty && !weeklyValid {
-                            Text("must be a positive number").foregroundColor(.red).font(.caption)
+                        if !Self.isBlank(weeklyText) && !weeklyValid {
+                            Text("enter a positive number like 200 or 12.50").foregroundColor(.red).font(.caption)
                         }
                     }
                 }
@@ -244,8 +275,8 @@ struct AccountBudgetSection: View {
                         Text("$")
                         TextField("none", text: $monthlyText)
                             .frame(width: 100)
-                        if !monthlyText.isEmpty && !monthlyValid {
-                            Text("must be a positive number").foregroundColor(.red).font(.caption)
+                        if !Self.isBlank(monthlyText) && !monthlyValid {
+                            Text("enter a positive number like 200 or 12.50").foregroundColor(.red).font(.caption)
                         }
                     }
                 }
@@ -291,6 +322,16 @@ struct AccountBudgetSection: View {
                 applyConfig(newConfig)
             }
         }
+        // Design fix: pending edits must NOT survive the window closing. The
+        // window is kept alive (isReleasedWhenClosed = false) and this section
+        // seeds once (onAppear + `seeded` guard), so buffered edits would
+        // otherwise reappear invisibly on reopen — looking applied when they
+        // never were. The window controller (this view's only host) bumps
+        // closeCount from windowWillClose; re-seeding from live config here is
+        // exactly the Cancel action.
+        .onChange(of: windowSignals.closeCount) { _ in
+            applyConfig(configStore.config)
+        }
     }
 
     private func seedFromConfig() {
@@ -312,21 +353,75 @@ struct AccountBudgetSection: View {
         lastSyncedSnapshot = snapshot(of: c)
     }
 
-    /// Apply: write all buffered edits to config in one go. Only reachable
-    /// with valid input (the button disables on hasInvalidInput). Records the
-    /// applied snapshot so the resulting config publish isn't mistaken for an
-    /// external edit.
+    /// Apply: write all buffered edits to config in one atomic mutation
+    /// (setAccountAndBudget — two sequential setters used to publish an
+    /// intermediate mixed state and write the file twice). Only reachable
+    /// with valid input (the button disables on hasInvalidInput).
+    ///
+    /// Per-field staleness guard: the buffers were seeded from
+    /// lastSyncedSnapshot, and an external config edit can land mid-edit
+    /// (onChange above deliberately leaves the user's typing alone). At Apply
+    /// time a field the user did NOT touch still holds the stale seeded
+    /// value — blindly committing it would silently revert the concurrent
+    /// external change. So each field commits the user's buffer only when it
+    /// differs from what was seeded; an untouched field commits the LIVE
+    /// config's current value instead.
     private func applyEdits() {
-        let (type, plan) = accountChoice.typeAndPlan(preservingPlan: configStore.config.accountPlan)
-        configStore.setAccount(type: type, plan: plan)
-        configStore.setBudget(weeklyUsd: weeklyText.isEmpty ? nil : Double(weeklyText),
-                              monthlyUsd: monthlyText.isEmpty ? nil : Double(monthlyText),
-                              weekStart: weekStart, timezone: configStore.config.timezone)
-        lastSyncedSnapshot = editedSnapshot
+        let live = configStore.config
+        let liveSnap = snapshot(of: live)
+        let edited = editedSnapshot
+        let seeded = lastSyncedSnapshot ?? liveSnap
+
+        func pick<T: Equatable>(_ editedVal: T, _ seededVal: T, _ liveVal: T) -> T {
+            editedVal == seededVal ? liveVal : editedVal
+        }
+        let resolved = SectionSnapshot(
+            choice: pick(edited.choice, seeded.choice, liveSnap.choice),
+            weeklyUsd: pick(edited.weeklyUsd, seeded.weeklyUsd, liveSnap.weeklyUsd),
+            monthlyUsd: pick(edited.monthlyUsd, seeded.monthlyUsd, liveSnap.monthlyUsd),
+            weekStart: pick(edited.weekStart, seeded.weekStart, liveSnap.weekStart)
+        )
+
+        let (type, plan) = resolved.choice.typeAndPlan(preservingPlan: live.accountPlan)
+        configStore.setAccountAndBudget(
+            type: type, plan: plan,
+            weeklyUsd: resolved.weeklyUsd, monthlyUsd: resolved.monthlyUsd,
+            weekStart: resolved.weekStart, timezone: live.timezone)
+
+        // Re-seed the fields to what was actually committed (an untouched
+        // field may have resolved to the live value, not its buffer) and
+        // record the snapshot so the resulting config publish isn't mistaken
+        // for an external edit.
+        accountChoice = resolved.choice
+        weeklyText = resolved.weeklyUsd.map { Self.formatBudget($0) } ?? ""
+        monthlyText = resolved.monthlyUsd.map { Self.formatBudget($0) } ?? ""
+        weekStart = resolved.weekStart
+        lastSyncedSnapshot = resolved
+    }
+
+    /// Budget-field text → Double, tolerant of whitespace and the user's
+    /// locale's decimal separator. Order matters:
+    /// 1. `Double(_:)` FIRST — it always accepts the dot-decimal form
+    ///    `formatBudget` emits ("12.50"), regardless of locale. Critically,
+    ///    in a comma-decimal locale a NumberFormatter would read "12.50"'s
+    ///    "." as a GROUPING separator (parsing it as 1250), so the formatter
+    ///    must never be the first to see dot-decimal input. This is what
+    ///    keeps formatBudget's output round-trippable in every locale.
+    /// 2. Locale-aware NumberFormatter as the fallback, so typed
+    ///    comma-decimal input ("12,50" in a comma locale) parses instead of
+    ///    surfacing an unexplained red error.
+    private static func parseBudget(_ s: String) -> Double? {
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let v = Double(trimmed) { return v }
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.locale = Locale.current
+        return f.number(from: trimmed)?.doubleValue
     }
 
     private static func isValidBudget(_ s: String) -> Bool {
-        guard let v = Double(s) else { return false }
+        guard let v = parseBudget(s) else { return false }
         return v.isFinite && v > 0
     }
 

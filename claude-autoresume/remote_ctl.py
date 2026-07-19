@@ -14,12 +14,30 @@ It reimplements the flock + atomic tmp+rename write on purpose rather than
 sharing code, so the deployed payload stays a flat set of files.
 
 Commands (stdout is machine-readable JSON, one object, on success):
-  dump            -> {"v":1,"now":<epoch float>,"state":{...}}   (state read under flock)
+  dump            -> {"v":1,"now":<epoch float>,"state":{...},
+                      "retention_minutes":N}                     (state read under flock)
   dump --usage    -> same, plus "tokens_hourly": {...}           (hourly lane only)
   apply-toggles   -> reads stdin JSON {"<sid>":{"enabled":bool,
                      "force_resume":bool,"resume_armed":bool}, ...}; applies
                      ONLY those whitelisted keys to EXISTING entries, under
                      flock, atomic save; prints {"ok":true,"applied":N}
+  apply-config    -> reads stdin JSON {"sessions":{"idle_retention_minutes":N}}
+                     and merges ONLY that one key into this host's
+                     config.json (every other key preserved; file created if
+                     absent), under a config.json.lock flock consistent with
+                     the Mac side's config locking, atomic tmp+rename;
+                     prints {"ok":true}. This is the ONE sanctioned non-widget
+                     config.json writer, and only on a remote host, solely as
+                     a relay of the widget's Settings — the daemon itself
+                     still never writes config.json anywhere. The remote
+                     daemon's poll loop re-reads config.json's sessions block
+                     on mtime change (see autoresume.main), so the pushed
+                     retention takes effect within one poll, no restart.
+
+"retention_minutes" in dump is the host's EFFECTIVE
+sessions.idle_retention_minutes (defaulted + clamped the same way
+autoresume_config.load_config does it — reimplemented inline below because
+this script must stay standalone).
 
 A missing state.json is not an error: dump emits an empty state, apply-toggles
 applies to nothing (0). Only keys present in each incoming entry are touched;
@@ -36,6 +54,13 @@ from pathlib import Path
 # Keys the Mac is allowed to push back into the remote state. Everything else
 # in state.json is remote-daemon-owned and must be left untouched.
 TOGGLE_KEYS = ("enabled", "force_resume", "resume_armed")
+
+# Effective-retention defaults/clamps. Mirror autoresume_config's
+# DEFAULT/MIN/MAX_IDLE_RETENTION_MINUTES — duplicated on purpose: this script
+# must stay standalone (no imports beyond stdlib) on the remote host.
+DEFAULT_IDLE_RETENTION_MINUTES = 30
+MIN_IDLE_RETENTION_MINUTES = 5
+MAX_IDLE_RETENTION_MINUTES = 24 * 60
 
 
 def state_dir() -> Path:
@@ -57,6 +82,14 @@ def lock_file() -> Path:
 
 def tokens_hourly_file() -> Path:
     return state_dir() / "usage" / "tokens_hourly.json"
+
+
+def config_file() -> Path:
+    return state_dir() / "config.json"
+
+
+def config_lock_file() -> Path:
+    return state_dir() / "config.json.lock"
 
 
 class StateLock:
@@ -97,6 +130,49 @@ def save_state(state: dict) -> None:
     tmp.replace(state_file())
 
 
+class ConfigLock:
+    """Exclusive flock on config.json.lock — the same lock discipline the
+    Mac's widget uses around its config.json writes, so an apply-config here
+    can never interleave with any other config writer on this host."""
+
+    def __enter__(self):
+        state_dir().mkdir(parents=True, exist_ok=True)
+        self._fh = open(config_lock_file(), "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
+        self._fh.close()
+
+
+def _load_raw_config() -> dict:
+    """config.json as-is (NO defaulting — apply-config must preserve every
+    key it doesn't own). Missing/unreadable/malformed -> empty dict."""
+    path = config_file()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def effective_retention_minutes() -> int:
+    """The host's effective sessions.idle_retention_minutes: an
+    autoresume_config.load_config-style defaulted+clamped read, inlined
+    (minimal, stdlib-only) because remote_ctl stays standalone."""
+    sessions = _load_raw_config().get("sessions")
+    if not isinstance(sessions, dict):
+        return DEFAULT_IDLE_RETENTION_MINUTES
+    retention = sessions.get("idle_retention_minutes")
+    if isinstance(retention, bool) or not isinstance(retention, (int, float)):
+        return DEFAULT_IDLE_RETENTION_MINUTES
+    return int(min(MAX_IDLE_RETENTION_MINUTES,
+                   max(MIN_IDLE_RETENTION_MINUTES, retention)))
+
+
 def load_tokens_hourly() -> dict:
     path = tokens_hourly_file()
     if not path.exists():
@@ -114,7 +190,10 @@ def cmd_dump(with_usage: bool) -> int:
     with StateLock():
         state = load_state()
         now = time.time()
-    out = {"v": 1, "now": now, "state": state}
+    out = {"v": 1, "now": now, "state": state,
+           # Effective sessions.idle_retention_minutes on this host, so the
+           # Mac's remote_sync can converge it with the widget's setting.
+           "retention_minutes": effective_retention_minutes()}
     if with_usage:
         # Usage tokens live in usage/tokens_hourly.json, written atomically by
         # the collector; a plain read outside the state lock is fine.
@@ -162,10 +241,56 @@ def cmd_apply_toggles() -> int:
     return 0
 
 
+def _fail(message: str) -> int:
+    json.dump({"ok": False, "error": message}, sys.stdout)
+    sys.stdout.write("\n")
+    return 1
+
+
+def cmd_apply_config() -> int:
+    """Merge the widget's sessions.idle_retention_minutes into THIS host's
+    config.json — the retention-relay write (see the module docstring for why
+    this is the one sanctioned non-widget config writer). Touches ONLY that
+    single key: every other top-level key, and every other key inside an
+    existing "sessions" block, is preserved byte-for-byte at the JSON level.
+    Runs under ConfigLock (config.json.lock flock), writes atomically
+    (tmp+rename), creates the file if absent."""
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, ValueError) as e:
+        return _fail(f"bad stdin json: {e}")
+    if not isinstance(payload, dict):
+        return _fail("stdin json must be an object")
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, dict):
+        return _fail('missing "sessions" object')
+    retention = sessions.get("idle_retention_minutes")
+    if isinstance(retention, bool) or not isinstance(retention, (int, float)):
+        return _fail('"sessions.idle_retention_minutes" must be a number')
+
+    with ConfigLock():
+        config = _load_raw_config()
+        existing_sessions = config.get("sessions")
+        if not isinstance(existing_sessions, dict):
+            existing_sessions = {}
+        existing_sessions["idle_retention_minutes"] = retention
+        config["sessions"] = existing_sessions
+        d = state_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = config_file().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(config, indent=2))
+        tmp.replace(config_file())
+
+    json.dump({"ok": True}, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
 def main(argv) -> int:
     args = argv[1:]
     if not args:
-        sys.stderr.write("usage: remote_ctl.py {dump [--usage] | apply-toggles}\n")
+        sys.stderr.write("usage: remote_ctl.py {dump [--usage] | apply-toggles | apply-config}\n")
         return 2
     cmd = args[0]
     rest = args[1:]
@@ -173,6 +298,8 @@ def main(argv) -> int:
         return cmd_dump(with_usage=("--usage" in rest))
     if cmd == "apply-toggles":
         return cmd_apply_toggles()
+    if cmd == "apply-config":
+        return cmd_apply_config()
     sys.stderr.write(f"unknown command: {cmd}\n")
     return 2
 

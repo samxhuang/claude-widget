@@ -382,9 +382,13 @@ final class PlanFitModel: ObservableObject {
     /// budget that is. nil when there's no projection or it's within budget,
     /// so callers can append it only in the overrun case. Whole dollars — a
     /// projection is an estimate, cents would be false precision.
+    /// The overrun must be at least $0.50 (i.e. round to a nonzero whole
+    /// dollar): a raw `projected > limit` guard let projected $1000.40 vs a
+    /// $1000 limit render as "proj $1000 (+$0)" — an overrun caption whose
+    /// displayed numbers say there's no overrun.
     func budgetOverrunText(_ w: BudgetWindow) -> String? {
         guard let projected = w.projectedUsd, let limit = w.limitUsd,
-              projected > limit else { return nil }
+              projected - limit >= 0.5 else { return nil }
         let proj = String(format: "$%.0f", projected)
         let over = String(format: "$%.0f", projected - limit)
         return "proj \(proj) (+\(over))"
@@ -403,8 +407,11 @@ final class PlanFitModel: ObservableObject {
         if let pct = w.pct {
             line += String(format: " (%.0f%%)", pct)
         }
+        // No trailing "over": budgetOverrunText's "(+$N)" parenthetical
+        // already says how far over — "proj $612 (+$112) over" read as if
+        // "(+$112) over" were one phrase.
         if let overrun = budgetOverrunText(w) {
-            line += " — \(overrun) over"
+            line += " — \(overrun)"
         }
         return line
     }

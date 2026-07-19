@@ -79,6 +79,23 @@ MONTHLY_RUN_RATE_DAYS = 30.0
 # Budget (API-account dollar limits) — see _budget_block / autoresume_config C1.
 BUDGET_PROJECTION_MIN_ELAPSED_SECONDS = 3600  # suppress linear projection in a period's first hour
 
+# Minimum elapsed time before a moving-average window reports a $/day value.
+# Semantics chosen: SUPPRESS (value null) rather than floor the denominator —
+# consistent with both the Swift Graph tab (period estimate suppressed under
+# 1h of data) and the budget projection above, so all three surfaces agree
+# that under an hour of elapsed data there is no rate to quote, instead of
+# quoting a clamped guess. Without this, $2 spent in the first 10 minutes of
+# history extrapolated to $288/day ($8,640/mo run rate), and the 1d window —
+# whose span restarts at 00:00 UTC — exploded the same way every day just
+# after midnight. `days_covered` is unaffected (maturity captions still work).
+MA_MIN_ELAPSED_SECONDS = 3600
+
+# Plan-change containment (see _update_plan_history): snapshot rows don't
+# record which plan they were measured against, so utilization observation is
+# restricted to rows at/after the most recent plan change recorded in this
+# sidecar. plan_fit MAY append to this file; it still NEVER writes config.json.
+PLAN_HISTORY_FILENAME = "plan_history.jsonl"
+
 # Remote usage merge (WS-6) — remote Claude Code bills the same API account, so
 # its token usage folds into the same cost/budget math. remote_sync.py writes
 # each collect_usage host's hourly store to usage/remote/<host>_tokens_hourly.json
@@ -660,6 +677,14 @@ def _moving_averages(daily_cost: dict, days_with_data: set, now: datetime,
     integer calendar-day count for the maturity captions ("2/7 days
     collected"). Falls back to day-counting if `earliest_data` is absent or
     inconsistent with `now` (clock skew).
+
+    Minimum-elapsed floor: with less than MA_MIN_ELAPSED_SECONDS (1h) elapsed
+    since the window's span start, the value is SUPPRESSED (None) rather than
+    extrapolated — the same "no estimate in the first hour" semantics as the
+    Swift Graph tab and the budget projection. This kills the fresh-store
+    explosion ($2 in 10 minutes reading as $288/day) and the 1d window's
+    daily just-after-00:00-UTC spike. days_covered still counts, so maturity
+    captions keep working while the value is suppressed.
     """
     today = now.date()
     result = {}
@@ -676,8 +701,13 @@ def _moving_averages(daily_cost: dict, days_with_data: set, now: datetime,
                                   window_start.day, tzinfo=timezone.utc)
             if earliest_data is not None and earliest_data > span_start:
                 span_start = earliest_data
-            elapsed_days = (now - span_start).total_seconds() / 86400.0
-            value = total / elapsed_days if elapsed_days > 0 else total / days_covered
+            elapsed_seconds = (now - span_start).total_seconds()
+            if elapsed_seconds <= 0:
+                value = total / days_covered  # clock-skew fallback (unchanged)
+            elif elapsed_seconds < MA_MIN_ELAPSED_SECONDS:
+                value = None  # <1h elapsed: suppress, don't extrapolate
+            else:
+                value = total / (elapsed_seconds / 86400.0)
         result[f"{window_days}d"] = {
             "value_usd_per_day": round(value, 2) if value is not None else None,
             "days_covered": days_covered,
@@ -824,6 +854,87 @@ def _utilization_observed(points: list[dict]) -> dict:
             "avg_pct": round(avg_val, 1) if avg_val is not None else None,
         }
     return result
+
+
+# ---------------------------------------------------------------------------
+# Plan-change containment (usage/plan_history.jsonl sidecar)
+# ---------------------------------------------------------------------------
+#
+# Snapshot rows carry server-reported utilization percentages measured against
+# whatever plan was active WHEN THE ROW WAS WRITTEN, but the rows themselves
+# don't record that plan (per-row stamping would need the Swift snapshot
+# writer). Without containment, changing config.json's account.plan silently
+# rebases ALL history: an 80%-of-Max20x historical peak reread under a Pro
+# setting projects as 80%-of-Pro, letting _verdict declare Pro viable when the
+# true Pro-relative peak was 1600%. The containment fix: plan_fit appends a
+# {"ts", "plan"} line to usage/plan_history.jsonl whenever the configured plan
+# differs from the last recorded one, and the utilization peak/avg scan only
+# uses snapshot rows at/after the most recent recorded plan change.
+#
+# First run (no history file): the file is seeded with the CURRENT plan
+# stamped at the epoch of the earliest snapshot data — i.e. pre-existing
+# history is presumed to have been measured under the currently-configured
+# plan. Documented assumption: that matches reality here (the owner has been
+# on max_20x throughout); anyone who changed plans BEFORE first running this
+# version has no record of it, and the old rebasing behavior applies to that
+# pre-history once.
+#
+# plan_fit MAY write this one sidecar; it must still NEVER write config.json.
+
+def _point_ts(point: dict) -> datetime:
+    """Timestamp of a merged utilization point (raw or bucket)."""
+    return point["ts"] if point["kind"] == "raw" else point["ts_start"]
+
+
+def _load_plan_history(usage_dir: Path) -> list[tuple[datetime, str]]:
+    """Valid (ts, plan) rows of plan_history.jsonl in file (append) order.
+    Missing/malformed file or rows -> skipped, never raises."""
+    entries: list[tuple[datetime, str]] = []
+    for row in load_jsonl(usage_dir / PLAN_HISTORY_FILENAME):
+        ts = _parse_iso(row.get("ts"))
+        plan = row.get("plan")
+        if ts is not None and isinstance(plan, str) and plan:
+            entries.append((ts, plan))
+    return entries
+
+
+def _append_plan_history(usage_dir: Path, ts: datetime, plan: str) -> None:
+    """Append one {"ts","plan"} line. Write failures are swallowed — the
+    caller already holds the correct cutoff in memory for this run, and the
+    next run simply retries the append."""
+    try:
+        usage_dir.mkdir(parents=True, exist_ok=True)
+        with open(usage_dir / PLAN_HISTORY_FILENAME, "a") as f:
+            f.write(json.dumps({"ts": ts.isoformat(), "plan": plan}) + "\n")
+    except OSError:
+        pass
+
+
+def _update_plan_history(usage_dir: Path, current_plan: str, now: datetime,
+                         earliest_data: datetime | None) -> datetime:
+    """Maintain the plan-history sidecar and return the cutoff: the UTC
+    instant since which snapshot rows are known to have been measured against
+    `current_plan` (the most recent recorded plan change).
+
+    - No usable history yet: seed with the current plan stamped at the epoch
+      of the earliest snapshot data (or `now` if there is none) — see the
+      first-run assumption in the block comment above. Cutoff = that seed,
+      so nothing is truncated.
+    - Last recorded plan != current plan: the plan just changed; record it at
+      `now`. Cutoff = now (no existing snapshot row was measured under the
+      new plan).
+    - Otherwise: cutoff = the last recorded entry's ts, unchanged file.
+    """
+    entries = _load_plan_history(usage_dir)
+    if not entries:
+        seed_ts = earliest_data if earliest_data is not None else now
+        _append_plan_history(usage_dir, seed_ts, current_plan)
+        return seed_ts
+    last_ts, last_plan = entries[-1]
+    if last_plan != current_plan:
+        _append_plan_history(usage_dir, now, current_plan)
+        return now
+    return last_ts
 
 
 # ---------------------------------------------------------------------------
@@ -1145,7 +1256,23 @@ def compute(state_dir: Path, now: datetime) -> dict:
         warnings.append("No utilization snapshots found — peak utilization and tier projections are unavailable.")
 
     merged_points = _merge_utilization_points(raw_rows, bucket15_rows, bucket1h_rows)
-    utilization_observed = _utilization_observed(merged_points)
+
+    # Plan-change containment: restrict the peak/avg scan to rows measured
+    # under the currently-configured plan (at/after the most recent recorded
+    # plan change). A bucket point straddling the change is excluded whole
+    # (its ts_start predates the change), which is the conservative side.
+    earliest_point = min((_point_ts(p) for p in merged_points), default=None)
+    plan_since = _update_plan_history(usage_dir, current_plan, now, earliest_point)
+    observed_points = [p for p in merged_points if _point_ts(p) >= plan_since]
+    truncated = len(merged_points) - len(observed_points)
+    if truncated > 0:
+        warnings.append(
+            f"Plan changed to {current_plan!r}: peak/avg utilization only uses snapshots "
+            f"since {plan_since.isoformat()} ({truncated} earlier snapshot row(s) were "
+            "measured against a different plan and are excluded)."
+        )
+
+    utilization_observed = _utilization_observed(observed_points)
 
     tier_projection = _tier_projection(utilization_observed, current_plan)
 

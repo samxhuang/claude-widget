@@ -1,9 +1,13 @@
 """Shared config for the daemon, plan_fit, and (via direct JSON writes) the widget.
 
 `~/.claude-autoresume/config.json` is the single source of truth for account
-type, budget limits, and remote SSH hosts. The widget's Settings window is the
-only writer (read-modify-write under `config.json.lock`, tmp+rename, unknown
-keys preserved); the Python side only ever reads. A missing or malformed file
+type, budget limits, and remote SSH hosts. On the Mac, the widget's Settings
+window is the only writer (read-modify-write under `config.json.lock`,
+tmp+rename, unknown keys preserved); the Python side only ever reads. On a
+REMOTE host, `remote_ctl.py apply-config` may additionally write the file —
+solely as a relay of the widget's settings (sessions.idle_retention_minutes),
+same lock + tmp+rename discipline; the daemon itself never writes config.json
+on any host. A missing or malformed file
 yields the full default config below, which reproduces pre-config behavior
 exactly (Max account, no budget, no remote hosts) — the file is optional.
 
@@ -47,6 +51,13 @@ CONFIG_FILENAME = "config.json"
 VALID_ACCOUNT_TYPES = {"max", "api"}
 VALID_WEEK_STARTS = {"monday", "sunday"}
 VALID_TIMEZONES = {"local", "utc"}
+
+# Canonical plan keys. Mirrors plan_fit.TIER_MULTIPLIERS' key set — kept as a
+# duplicate on purpose: this module must not import plan_fit (it is imported
+# by the daemon and deployed standalone to remote hosts). If a tier is ever
+# added there, add it here too. Anything else in config.json falls back to
+# DEFAULT_PLAN instead of flowing downstream as an unknown plan string.
+VALID_PLANS = {"pro", "max_5x", "max_20x"}
 
 DEFAULT_PLAN = "max_20x"
 DEFAULT_HOST_POLL_SECONDS = 30
@@ -151,8 +162,9 @@ def load_config(state_dir: Path) -> dict:
         if isinstance(acct_type, str) and acct_type in VALID_ACCOUNT_TYPES:
             cfg["account"]["type"] = acct_type
         plan = account.get("plan")
-        if isinstance(plan, str) and plan.strip():
+        if isinstance(plan, str) and plan.strip() in VALID_PLANS:
             cfg["account"]["plan"] = plan.strip()
+        # invalid/unknown plan string -> keep DEFAULT_PLAN (canonical keys only)
 
     budget = raw.get("budget")
     if isinstance(budget, dict):

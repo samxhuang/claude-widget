@@ -107,6 +107,49 @@ class MovingAverageTests(TempStateDirTestCase):
         self.assertEqual(ma["7d"]["days_covered"], 7)
         self.assertAlmostEqual(ma["7d"]["value_usd_per_day"], 70.0 / 6.5, places=2)
 
+    def test_fresh_store_first_hour_suppresses_all_windows(self):
+        # Audit MAJOR #1: $2 spent in the first 10 minutes of history must NOT
+        # extrapolate ($2 / (10min/1440min) = $288/day, $8,640/mo run rate).
+        # Chosen semantics: SUPPRESS (null) under 1h elapsed, matching the
+        # Swift Graph tab and the budget projection. days_covered still counts.
+        # input_tok * 5 / 1e6 == 2.0 -> 400,000 input tokens of opus.
+        hours = {"2026-07-18T12": {"code_cli": {"claude-opus-4-5-x": {"input": 400_000, "output": 0}}}}
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly(hours))
+
+        now = datetime(2026, 7, 18, 12, 10, tzinfo=timezone.utc)  # 10 min of data
+        result = plan_fit.compute(self.state_dir, now)
+        for window in ("1d", "7d", "30d", "90d"):
+            ma = result["moving_averages"][window]
+            self.assertEqual(ma["days_covered"], 1)
+            self.assertIsNone(ma["value_usd_per_day"],
+                              f"{window}: <1h of data must suppress the $/day value")
+        self.assertIsNone(result["monthly_run_rate"]["value_usd_per_month"])
+
+    def test_1d_window_suppressed_just_after_midnight(self):
+        # The 1d window's span restarts at 00:00 UTC, so just after midnight
+        # its elapsed time is minutes even with days of history — it used to
+        # explode daily. Now: 1d suppressed, wider windows (whose span start
+        # is days back) unaffected.
+        hours = {}
+        for day in (15, 16, 17):
+            hours[f"2026-07-{day:02d}T03"] = {
+                "code_cli": {"claude-opus-4-5-x": {"input": 2_000_000, "output": 0}}}
+        hours["2026-07-18T00"] = {
+            "code_cli": {"claude-opus-4-5-x": {"input": 400_000, "output": 0}}}
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly(hours))
+
+        now = datetime(2026, 7, 18, 0, 10, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+        ma = result["moving_averages"]
+        self.assertIsNone(ma["1d"]["value_usd_per_day"],
+                          "10 min into the UTC day: 1d value must be suppressed")
+        self.assertEqual(ma["1d"]["days_covered"], 1)
+        # 7d spans back to Jul 15 03:00 (earliest data) — nearly 3 days
+        # elapsed, $32 total -> well-defined, no explosion.
+        self.assertIsNotNone(ma["7d"]["value_usd_per_day"])
+        elapsed_days = (now - datetime(2026, 7, 15, 3, 0, tzinfo=timezone.utc)).total_seconds() / 86400.0
+        self.assertAlmostEqual(ma["7d"]["value_usd_per_day"], round(32.0 / elapsed_days, 2), places=2)
+
     def test_zero_days_covered_gives_null_value(self):
         _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
         now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
@@ -274,6 +317,106 @@ class TierRescalingTests(TempStateDirTestCase):
         self.assertIsNone(observed["five_hour"]["peak_pct"])
         self.assertIsNone(observed["seven_day"]["peak_pct"])
         self.assertTrue(any("utilization snapshots" in w for w in result["warnings"]))
+
+
+# ---------------------------------------------------------------------------
+# Plan-change containment (usage/plan_history.jsonl) — audit MAJOR #2
+# ---------------------------------------------------------------------------
+
+class PlanHistoryTests(TempStateDirTestCase):
+    """Snapshot rows don't record which plan they were measured against, so a
+    Settings plan change must truncate the utilization observation window to
+    rows at/after the change — not silently rebase history (80%-of-Max20x
+    reread as 80%-of-Pro)."""
+
+    # Two bucket rows: an OLD high peak and a NEWER low one, so truncation is
+    # observable in the peak.
+    def _write_snapshots(self):
+        rows = [
+            {"ts_start": "2026-07-01T00:00:00+00:00", "n": 10,
+             "five_hour": {"min": 10, "max": 90, "avg": 50, "last": 60},
+             "seven_day": {"min": 5, "max": 70, "avg": 40, "last": 50}},
+            {"ts_start": "2026-07-10T00:00:00+00:00", "n": 10,
+             "five_hour": {"min": 5, "max": 40, "avg": 20, "last": 30},
+             "seven_day": {"min": 2, "max": 30, "avg": 15, "last": 20}},
+        ]
+        _write_jsonl(self.usage_dir / "snapshots_1h.jsonl", rows)
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+
+    def _history_lines(self):
+        path = self.usage_dir / "plan_history.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+    def test_first_run_seeds_history_at_earliest_data_and_uses_full_history(self):
+        # Documented assumption: pre-existing history is presumed measured
+        # under the currently-configured plan at first run (matches reality
+        # here — the owner has been on max_20x throughout).
+        self._write_snapshots()
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+
+        self.assertAlmostEqual(result["utilization_observed"]["five_hour"]["peak_pct"],
+                               90.0, places=1, msg="no plan change: full history used")
+        self.assertFalse(any("Plan changed" in w for w in result["warnings"]))
+        lines = self._history_lines()
+        self.assertEqual(len(lines), 1, "seeded with exactly one entry")
+        self.assertEqual(lines[0]["plan"], "max_20x")
+        self.assertEqual(plan_fit._parse_iso(lines[0]["ts"]),
+                         datetime(2026, 7, 1, 0, 0, tzinfo=timezone.utc),
+                         "seed stamped at the epoch of the earliest snapshot data")
+
+    def test_recorded_plan_change_truncates_observation_and_warns(self):
+        self._write_snapshots()
+        _write_jsonl(self.usage_dir / "plan_history.jsonl", [
+            {"ts": "2026-07-01T00:00:00+00:00", "plan": "max_20x"},
+            {"ts": "2026-07-05T00:00:00+00:00", "plan": "pro"},
+        ])
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+
+        # Only the post-change (2026-07-10) row counts: peak 40, not 90.
+        self.assertAlmostEqual(result["utilization_observed"]["five_hour"]["peak_pct"],
+                               40.0, places=1)
+        self.assertTrue(any("Plan changed" in w and "2026-07-05" in w
+                            for w in result["warnings"]),
+                        "warning must say since when data is used")
+        # No new plan entry: last recorded plan already matches the config.
+        self.assertEqual(len(self._history_lines()), 2)
+
+    def test_live_plan_change_appends_entry_and_resets_observation(self):
+        # The downgrade scenario itself: history says max_20x, Settings now
+        # says pro -> compute records the change at `now`; NO existing row was
+        # measured under pro, so observation resets instead of rebasing the
+        # old 90%-of-Max20x peak as 90%-of-Pro.
+        self._write_snapshots()
+        _write_jsonl(self.usage_dir / "plan_history.jsonl", [
+            {"ts": "2026-07-01T00:00:00+00:00", "plan": "max_20x"},
+        ])
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+
+        self.assertIsNone(result["utilization_observed"]["five_hour"]["peak_pct"],
+                          "no snapshot row measured under the new plan yet")
+        self.assertFalse(result["verdict"]["plans"]["pro"]["has_peak_data"])
+        self.assertTrue(any("Plan changed" in w for w in result["warnings"]))
+        lines = self._history_lines()
+        self.assertEqual([l["plan"] for l in lines], ["max_20x", "pro"])
+        self.assertEqual(plan_fit._parse_iso(lines[1]["ts"]), now)
+
+    def test_no_change_keeps_history_file_stable_across_computes(self):
+        self._write_snapshots()
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        plan_fit.compute(self.state_dir, now)
+        first = self._history_lines()
+        plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 13, 0, tzinfo=timezone.utc))
+        self.assertEqual(self._history_lines(), first,
+                         "no plan change: no new lines appended")
 
 
 # ---------------------------------------------------------------------------

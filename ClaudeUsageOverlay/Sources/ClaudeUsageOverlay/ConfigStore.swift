@@ -143,23 +143,28 @@ final class ConfigStore: ObservableObject {
 
     // MARK: - Mutations (typed setters, each a locked read-modify-write)
 
-    /// Account type + plan. For "api" the plan is still stored (plan_fit.py
-    /// uses it for the tier-comparison ratio even on API accounts).
-    func setAccount(type: String, plan: String) {
+    /// Account type + plan AND budget block, written in ONE locked
+    /// read-modify-write. The Settings Apply button sets both; doing it as
+    /// two sequential mutations published an intermediate config (account
+    /// updated, budget still old) — a one-frame re-seed of observing views to
+    /// a mixed state — and hit the disk twice per Apply. Replaces the former
+    /// separate setAccount/setBudget, whose only caller was that Apply.
+    ///
+    /// Account: for "api" the plan is still stored (plan_fit.py uses it for
+    /// the tier-comparison ratio even on API accounts).
+    /// Budget: `nil` clears a period's limit (stored as JSON null so the
+    /// daemon distinguishes "unconfigured" from "0"). Non-positive values are
+    /// treated as nil (validator: budgets numeric > 0 else null, matching
+    /// WS-0's config module).
+    func setAccountAndBudget(type: String, plan: String,
+                             weeklyUsd: Double?, monthlyUsd: Double?,
+                             weekStart: String, timezone: String) {
         mutate { root in
             var account = (root["account"] as? [String: Any]) ?? [:]
             account["type"] = type
             account["plan"] = plan
             root["account"] = account
-        }
-    }
 
-    /// Budget dollar limits + period definition. `nil` clears a period's
-    /// limit (stored as JSON null so the daemon distinguishes "unconfigured"
-    /// from "0"). Non-positive values are treated as nil (validator: budgets
-    /// numeric > 0 else null, matching WS-0's config module).
-    func setBudget(weeklyUsd: Double?, monthlyUsd: Double?, weekStart: String, timezone: String) {
-        mutate { root in
             var budget = (root["budget"] as? [String: Any]) ?? [:]
             budget["weekly_usd"] = Self.sanitizedBudget(weeklyUsd) ?? NSNull()
             budget["monthly_usd"] = Self.sanitizedBudget(monthlyUsd) ?? NSNull()
@@ -336,7 +341,11 @@ final class ConfigStore: ObservableObject {
         }
         if let sessions = root["sessions"] as? [String: Any],
            let retention = (sessions["idle_retention_minutes"] as? NSNumber)?.intValue {
-            c.idleRetentionMinutes = retention
+            // Clamp to the daemon's accepted range (Python validator clamps
+            // 5–1440) so a hand-edited out-of-range value displays as what
+            // actually takes effect — e.g. a raw 3 used to snap the Sessions
+            // picker to "15 minutes" while the daemon ran with 5.
+            c.idleRetentionMinutes = min(1440, max(5, retention))
         }
         if let hosts = root["remote_hosts"] as? [[String: Any]] {
             c.remoteHosts = hosts.compactMap { h in

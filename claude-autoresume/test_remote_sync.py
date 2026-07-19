@@ -40,17 +40,23 @@ class FakeTransport:
     remote_ctl subcommand. Distinguishes `dump`, `dump --usage`, and
     `apply-toggles` by inspecting remote_argv."""
 
-    def __init__(self, dump=None, usage=None, apply_ok=True, raise_on=None):
+    def __init__(self, dump=None, usage=None, apply_ok=True, raise_on=None,
+                 apply_config_ok=True):
         self._dump = dump                # dict for `dump` → serialized to stdout
         self._usage = usage              # dict for `dump --usage`
         self._apply_ok = apply_ok        # bool | (rc, body) for apply-toggles
         self._raise_on = raise_on or set()  # subcommands that raise (unreachable)
+        # bool | (rc, stdout, stderr) for apply-config. "old_remote" simulates
+        # a deployed remote_ctl predating the command (rc 2, unknown command).
+        self._apply_config_ok = apply_config_ok
         self.calls = []                  # list of (kind, ssh_target, stdin_data)
 
     def _kind(self, remote_argv):
         # remote_argv is now a one-element list holding the composed remote
         # shell command line — substring-match rather than membership.
         joined = " ".join(remote_argv)
+        if "apply-config" in joined:
+            return "apply_config"
         if "apply-toggles" in joined:
             return "apply"
         if "--usage" in joined:
@@ -62,6 +68,12 @@ class FakeTransport:
         self.calls.append((kind, ssh_target, stdin_data))
         if kind in self._raise_on:
             raise TimeoutError(f"fake ssh timeout on {kind}")
+        if kind == "apply_config":
+            if self._apply_config_ok is True:
+                return 0, json.dumps({"ok": True}), ""
+            if self._apply_config_ok == "old_remote":
+                return 2, "", "unknown command: apply-config"
+            return self._apply_config_ok  # explicit (rc, stdout, stderr) tuple
         if kind == "apply":
             if self._apply_ok is True:
                 return 0, json.dumps({"ok": True, "applied": 1}), ""
@@ -78,8 +90,13 @@ class FakeTransport:
         return 0, json.dumps(self._dump), ""
 
 
-def dump_payload(now, state):
-    return {"v": 1, "now": now, "state": state}
+def dump_payload(now, state, retention=None):
+    """A remote_ctl dump body. `retention=None` reproduces an OLD remote_ctl
+    (no retention_minutes field); pass a number for a current one."""
+    out = {"v": 1, "now": now, "state": state}
+    if retention is not None:
+        out["retention_minutes"] = retention
+    return out
 
 
 def remote_entry(**kw):
@@ -136,6 +153,9 @@ class TempEnvMixin:
         ar.STATE_FILE = self.state_dir / "state.json"
         ar.LOCK_FILE = self.state_dir / "state.json.lock"
         ar.DAEMON_LOG = self.state_dir / "daemon.log"
+        # Retention-relay failure memo is module-level (once-per-config-change
+        # semantics) — reset so tests can't leak state into each other.
+        rs._RETENTION_PUSH_FAILED.clear()
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -672,6 +692,196 @@ class TestDeployPayloadImports(unittest.TestCase):
         self.assertNotEqual(rc, 0, "import unexpectedly succeeded without remote_sync.py")
         self.assertIn("remote_sync", err,
                       f"expected a ModuleNotFoundError for remote_sync, got:\n{err}")
+
+
+# ---------------------------------------------------------------------------
+# Retention relay: Mac's sessions.idle_retention_minutes pushed to remotes
+# ---------------------------------------------------------------------------
+
+class TestRetentionRelay(TempEnvMixin, unittest.TestCase):
+    """Feature: after a successful dump+merge, if the dump's reported
+    retention_minutes differs from the Mac's configured
+    sessions.idle_retention_minutes, remote_sync pushes apply-config —
+    idempotent convergence like the toggle relay."""
+
+    def _write_mac_config(self, retention):
+        (self.state_dir / "config.json").write_text(json.dumps(
+            {"version": 1, "sessions": {"idle_retention_minutes": retention}}))
+
+    def _daemon_log(self):
+        try:
+            return (self.state_dir / "daemon.log").read_text()
+        except OSError:
+            return ""
+
+    def test_differing_retention_pushes_apply_config(self):
+        self._write_mac_config(10)
+        dump = dump_payload(1000.0, {"s1": remote_entry()}, retention=30)
+        ft = FakeTransport(dump=dump)
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1000.0)
+
+        pushes = [c for c in ft.calls if c[0] == "apply_config"]
+        self.assertEqual(len(pushes), 1, "differing retention must be pushed")
+        self.assertEqual(json.loads(pushes[0][2]),
+                         {"sessions": {"idle_retention_minutes": 10}},
+                         "payload carries ONLY the retention key")
+
+    def test_equal_retention_no_push(self):
+        self._write_mac_config(10)
+        dump = dump_payload(1000.0, {"s1": remote_entry()}, retention=10)
+        ft = FakeTransport(dump=dump)
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1000.0)
+        self.assertEqual([c for c in ft.calls if c[0] == "apply_config"], [])
+
+    def test_default_config_matches_default_remote_no_push(self):
+        # No Mac config at all (default 30) vs remote reporting 30.
+        dump = dump_payload(1000.0, {"s1": remote_entry()}, retention=30)
+        ft = FakeTransport(dump=dump)
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1000.0)
+        self.assertEqual([c for c in ft.calls if c[0] == "apply_config"], [])
+
+    def test_convergence_next_cycle_no_repush(self):
+        # Cycle 1 pushes; cycle 2's dump reflects the applied value -> silent.
+        self._write_mac_config(10)
+        ft = FakeTransport(dump=dump_payload(1000.0, {"s1": remote_entry()}, retention=30))
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1000.0)
+        ft2 = FakeTransport(dump=dump_payload(1100.0, {"s1": remote_entry()}, retention=10))
+        rs.sync_host(HOST, self.state_dir, ft2, now_fn=lambda: 1100.0)
+        self.assertEqual(len([c for c in ft.calls if c[0] == "apply_config"]), 1)
+        self.assertEqual([c for c in ft2.calls if c[0] == "apply_config"], [])
+
+    def test_old_remote_dump_without_retention_no_push_one_hint(self):
+        # An old remote_ctl reports no retention_minutes at all: nothing to
+        # compare, no push attempt, ONE redeploy hint per host per config
+        # value — not one per cycle.
+        self._write_mac_config(10)
+        dump = dump_payload(1000.0, {"s1": remote_entry()})  # no retention field
+        for t in (1000.0, 1030.0, 1060.0):
+            ft = FakeTransport(dump=dump)
+            rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda t=t: t)
+            self.assertEqual([c for c in ft.calls if c[0] == "apply_config"], [])
+        self.assertEqual(self._daemon_log().count("old remote_ctl"), 1,
+                         "redeploy hint logged exactly once, not per cycle")
+
+    def test_old_remote_apply_config_failure_no_retry_spam(self):
+        # Remote reports a retention (differing) but its remote_ctl predates
+        # apply-config: the push fails rc=2 once; subsequent cycles must not
+        # retry while the Mac's value is unchanged.
+        self._write_mac_config(10)
+        dump = dump_payload(1000.0, {"s1": remote_entry()}, retention=30)
+        ft = FakeTransport(dump=dump, apply_config_ok="old_remote")
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1000.0)
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1030.0)
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1060.0)
+        self.assertEqual(len([c for c in ft.calls if c[0] == "apply_config"]), 1,
+                         "failed push must not be retried for the same value")
+        self.assertEqual(self._daemon_log().count("redeploy to update"), 1)
+        # ...and the merge itself still worked (sync degraded gracefully).
+        self.assertIn("devbox::s1", self.read_state())
+
+    def test_retention_change_after_failure_retries_once(self):
+        self._write_mac_config(10)
+        dump = dump_payload(1000.0, {"s1": remote_entry()}, retention=30)
+        ft = FakeTransport(dump=dump, apply_config_ok="old_remote")
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1000.0)
+        self.assertEqual(len([c for c in ft.calls if c[0] == "apply_config"]), 1)
+        # The user changes the Mac's retention: one fresh attempt is allowed.
+        self._write_mac_config(20)
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1030.0)
+        self.assertEqual(len([c for c in ft.calls if c[0] == "apply_config"]), 2)
+
+    def test_push_happens_even_with_no_toggle_delta(self):
+        # The relay must not be starved by the `if not payload: return True`
+        # toggle early-out: no toggle divergence, retention differs -> push.
+        self.write_state({
+            "devbox::s1": {"host": "devbox", "remote_id": "s1",
+                           "enabled": False, "resume_armed": False, "force_resume": False}
+        })
+        self._write_mac_config(10)
+        dump = dump_payload(1000.0, {"s1": remote_entry()}, retention=30)
+        ft = FakeTransport(dump=dump)
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1000.0)
+        self.assertEqual(len([c for c in ft.calls if c[0] == "apply_config"]), 1)
+        self.assertEqual([c for c in ft.calls if c[0] == "apply"], [],
+                         "no toggle delta expected")
+
+
+# ---------------------------------------------------------------------------
+# remote_ctl apply-config / dump retention_minutes — direct, against a tmp dir
+# ---------------------------------------------------------------------------
+
+class TestRemoteCtlApplyConfig(unittest.TestCase):
+    """Drives the real remote_ctl.py as a subprocess (the same way ssh does)
+    against a temp AUTORESUME_STATE_DIR."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+        self.env = {**os.environ, "AUTORESUME_STATE_DIR": str(self.state_dir)}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, args, stdin=""):
+        return subprocess.run(
+            [sys.executable, str(REPO_DIR / "remote_ctl.py"), *args],
+            input=stdin, env=self.env, capture_output=True, text=True, timeout=30)
+
+    def _apply(self, retention):
+        return self._run(["apply-config"],
+                         json.dumps({"sessions": {"idle_retention_minutes": retention}}))
+
+    def test_creates_config_when_absent(self):
+        proc = self._apply(15)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), {"ok": True})
+        cfg = json.loads((self.state_dir / "config.json").read_text())
+        self.assertEqual(cfg, {"sessions": {"idle_retention_minutes": 15}})
+
+    def test_merge_preserves_unknown_keys(self):
+        (self.state_dir / "config.json").write_text(json.dumps({
+            "version": 1,
+            "account": {"type": "max", "plan": "max_20x"},
+            "custom_top_level": {"x": [1, 2]},
+            "sessions": {"idle_retention_minutes": 30, "future_knob": "keep-me"},
+        }))
+        proc = self._apply(45)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        cfg = json.loads((self.state_dir / "config.json").read_text())
+        self.assertEqual(cfg["sessions"]["idle_retention_minutes"], 45)
+        self.assertEqual(cfg["sessions"]["future_knob"], "keep-me",
+                         "sibling keys inside sessions preserved")
+        self.assertEqual(cfg["account"], {"type": "max", "plan": "max_20x"})
+        self.assertEqual(cfg["custom_top_level"], {"x": [1, 2]})
+        self.assertEqual(cfg["version"], 1)
+
+    def test_bad_payload_rejected(self):
+        for bad in ("not json", json.dumps({"sessions": {}}),
+                    json.dumps({"sessions": {"idle_retention_minutes": "soon"}}),
+                    json.dumps({"sessions": {"idle_retention_minutes": True}}),
+                    json.dumps([1, 2])):
+            proc = self._run(["apply-config"], bad)
+            self.assertEqual(proc.returncode, 1, f"payload {bad!r} must be rejected")
+            self.assertFalse(json.loads(proc.stdout)["ok"])
+        self.assertFalse((self.state_dir / "config.json").exists(),
+                         "rejected payloads must not create/write config.json")
+
+    def test_dump_reports_effective_retention(self):
+        # No config -> autoresume_config-style default (30).
+        proc = self._run(["dump"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["retention_minutes"], 30)
+        # After an apply-config, dump reflects the pushed value.
+        self._apply(45)
+        proc = self._run(["dump"])
+        self.assertEqual(json.loads(proc.stdout)["retention_minutes"], 45)
+
+    def test_dump_clamps_out_of_range_retention(self):
+        (self.state_dir / "config.json").write_text(
+            json.dumps({"sessions": {"idle_retention_minutes": 1}}))
+        proc = self._run(["dump"])
+        self.assertEqual(json.loads(proc.stdout)["retention_minutes"], 5,
+                         "effective value is clamped like autoresume_config")
 
 
 if __name__ == "__main__":

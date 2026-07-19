@@ -45,12 +45,17 @@ then.
 - **`state.json` writes go through the flock-based lock** (`StateLock` in
   `autoresume.py`; Swift side does the equivalent before writing back
   `enabled`/`force_resume`/etc.). Respect that when adding fields.
-- **`~/.claude-autoresume/config.json` has exactly one writer: the widget's
-  Settings window** (via ConfigStore, flock on `config.json.lock`, tmp+rename,
-  unknown keys preserved). The Python side (`autoresume_config.load_config`)
-  only reads, is fully defensive, and treats a missing/malformed file as the
-  defaults (Max account, no budget, no remote hosts). Hand-editing works but
-  is never required; the daemon must never write this file.
+- **`config.json` writers.** The MAC's `~/.claude-autoresume/config.json`
+  has exactly one writer: the widget's Settings window (via ConfigStore,
+  flock on `config.json.lock`, tmp+rename, unknown keys preserved). The
+  Python side (`autoresume_config.load_config`) only reads, is fully
+  defensive, and treats a missing/malformed file as the defaults; hand-
+  editing works but is never required. A REMOTE host's config.json may
+  additionally be written by `remote_ctl.py apply-config` — solely as a
+  relay of the widget's settings (currently
+  `sessions.idle_retention_minutes`, pushed by `remote_sync`'s retention
+  relay), same lock + atomic-write discipline, never touching any other
+  key. The daemon itself never writes config.json on any host.
 
 ## Build / deploy
 

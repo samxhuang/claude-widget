@@ -249,6 +249,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     return now.timeIntervalSince(last) < recentWindow
                 }
                 .map { $0.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        }, localStartDates: { [weak self] in
+            // created_at dedupe for cloud echoes of local CLI sessions — see
+            // CloudSessionsModel.apply and SessionsModel.cliStartDates.
+            self?.sessionsModel.cliStartDates ?? []
         }, onLoginNeeded: { [weak self] in
             self?.presentLoginWindow()
         })

@@ -41,6 +41,12 @@ Design
 * Hourly usage lane: for `collect_usage` hosts, `dump --usage` once per hour and
   an atomic write to `usage/remote/<host>_tokens_hourly.json` (a stale copy is
   kept on failure).
+* Retention relay: each successful dump reports the host's effective
+  `sessions.idle_retention_minutes`; when it differs from the Mac's configured
+  value, `remote_ctl.py apply-config` pushes the Mac's value (outside the
+  StateLock; idempotent convergence like the toggle relay). An old remote_ctl
+  without apply-config logs one redeploy hint per host per config change — see
+  `_maybe_push_retention`.
 
 Testability: the ssh transport is injected (a callable with the signature
 `(ssh_target, remote_argv, stdin_data, timeout) -> (returncode, stdout, stderr)`)
@@ -191,6 +197,87 @@ def fetch_dump(host, transport, usage=False):
         autoresume.log(f"remote-sync: {host['name']} dump malformed (missing v/state)")
         return None
     return data
+
+
+# Retention relay (config push): once-per-(host, config-change) failure memo.
+# Maps host name -> the Mac-side retention value whose push last failed (or
+# couldn't be attempted because the remote's remote_ctl predates apply-config).
+# While the Mac's configured value is unchanged, that host is not retried —
+# no per-cycle spam; a new value (config change) clears the way for one fresh
+# attempt + one fresh log line. Single sync thread, so no locking needed.
+_RETENTION_PUSH_FAILED: dict = {}
+
+
+def push_config(host, retention_minutes, transport):
+    """Push the Mac's sessions.idle_retention_minutes to `host` via
+    `remote_ctl.py apply-config` (JSON on stdin). Returns True only when the
+    remote confirms `{"ok": true}`. An old deployed remote_ctl without the
+    apply-config command exits non-zero ("unknown command", rc 2) — that
+    lands in the rc != 0 branch and reads as failure, which the caller turns
+    into a single redeploy-hint log."""
+    argv = _remote_ctl_command(host, "apply-config")
+    body = json.dumps({"sessions": {"idle_retention_minutes": retention_minutes}})
+    try:
+        rc, out, err = transport(host["ssh"], argv, body, REMOTE_SSH_TIMEOUT_SECONDS)
+    except Exception as e:
+        autoresume.log(f"remote-sync: {host['name']} apply-config transport error: {e!r}")
+        return False
+    if rc != 0:
+        autoresume.log(f"remote-sync: {host['name']} apply-config failed "
+                       f"(rc={rc}): {(err or '').strip()[:200]}")
+        return False
+    try:
+        resp = json.loads(out)
+    except (ValueError, TypeError):
+        autoresume.log(f"remote-sync: {host['name']} apply-config returned unparseable output")
+        return False
+    return bool(isinstance(resp, dict) and resp.get("ok"))
+
+
+def _maybe_push_retention(host, state_dir, dump, transport):
+    """Retention relay (WS config push): after a successful dump, converge the
+    remote's effective sessions.idle_retention_minutes onto the Mac's
+    configured value. Idempotent convergence, exactly like the toggle relay:
+    push only when the dump's reported value differs; next cycle's dump
+    reflects the applied value and the delta disappears. Runs OUTSIDE the
+    StateLock (pure ssh + config read, no state.json access).
+
+    Old-remote handling: a remote_ctl predating this feature neither reports
+    "retention_minutes" in its dump nor understands apply-config. Either way
+    we log ONE "redeploy to update" hint per host per Mac-side config change
+    (via _RETENTION_PUSH_FAILED) instead of retry-spamming every cycle."""
+    name = host["name"]
+    local = int(autoresume_config.load_config(Path(state_dir))
+                ["sessions"]["idle_retention_minutes"])
+
+    remote = dump.get("retention_minutes")
+    if isinstance(remote, bool) or not isinstance(remote, (int, float)):
+        # Old remote_ctl: no retention_minutes field in the dump.
+        if _RETENTION_PUSH_FAILED.get(name) != local:
+            _RETENTION_PUSH_FAILED[name] = local
+            autoresume.log(
+                f"remote-sync: {name} dump has no retention_minutes (old remote_ctl) — "
+                f"can't relay idle retention ({local}m); redeploy to update "
+                "(deploy_remote.sh). Will retry after the next retention change.")
+        return
+
+    if int(remote) == local:
+        _RETENTION_PUSH_FAILED.pop(name, None)  # converged — allow future pushes
+        return
+
+    if _RETENTION_PUSH_FAILED.get(name) == local:
+        return  # this exact value already failed once for this host — no spam
+
+    if push_config(host, local, transport):
+        _RETENTION_PUSH_FAILED.pop(name, None)
+        autoresume.log(f"remote-sync: {name} idle retention pushed "
+                       f"({int(remote)}m -> {local}m)")
+    else:
+        _RETENTION_PUSH_FAILED[name] = local
+        autoresume.log(
+            f"remote-sync: {name} apply-config push of idle retention ({local}m) failed — "
+            "if the host runs an older remote_ctl, redeploy to update (deploy_remote.sh). "
+            "Will retry after the next retention change.")
 
 
 def push_toggles(host, payload, transport):
@@ -378,6 +465,10 @@ def sync_host(host, state_dir, transport, now_fn=time.time):
         dump_by_sid = _merge_host(state, name, dump, offset, t1)
         payload = _compute_toggle_deltas(state, name, dump_by_sid)
         autoresume.save_state(state)
+
+    # Retention relay: outside the StateLock (it never touches state.json),
+    # after a successful dump+merge, before/independent of the toggle push.
+    _maybe_push_retention(host, state_dir, dump, transport)
 
     if not payload:
         return True

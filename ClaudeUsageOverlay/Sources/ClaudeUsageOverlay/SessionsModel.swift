@@ -286,6 +286,25 @@ final class SessionsModel: ObservableObject {
                 case (_, nil): return true
                 }
             }
+            // Phantom-cloud-row dedupe support: record each local CLI
+            // session's transcript creation time. /recents rows for
+            // Desktop-attached sessions carry an opaque cse_* id and no
+            // linking fields, but their created_at lands within ~1s of the
+            // local transcript's birth — so CloudSessionsModel hides cloud
+            // rows created at the same moment as a known local session. The
+            // cache is append-only for the app's lifetime ON PURPOSE: a local
+            // session dropped for idleness still has a live-looking /recents
+            // echo for a while, and forgetting its start time would let the
+            // echo pop back in as a phantom.
+            let newStarts = entries
+                .filter { $0.kind != "cowork" && $0.host == nil }
+                .compactMap { entry -> (String, Date)? in
+                    if let cached = self.cliStartCache[entry.id] { return (entry.id, cached) }
+                    guard let date = Self.transcriptCreationDate(projectDir: entry.projectDir, id: entry.id) else { return nil }
+                    return (entry.id, date)
+                }
+            for (id, date) in newStarts { self.cliStartCache[id] = date }
+            let startDates = Array(self.cliStartCache.values)
             DispatchQueue.main.async {
                 // Only reassign (and thus only trigger a SwiftUI/hosting-view
                 // invalidation) if something actually changed. The 5s poll
@@ -294,8 +313,42 @@ final class SessionsModel: ObservableObject {
                 if self.sessions != entries {
                     self.sessions = entries
                 }
+                if self.cliStartDates != startDates {
+                    self.cliStartDates = startDates
+                }
             }
         }
+    }
+
+    /// See the dedupe comment in refresh(): known local CLI sessions' transcript
+    /// creation times, published for CloudSessionsModel's created_at matching.
+    @Published var cliStartDates: [Date] = []
+    /// id -> transcript creation date; append-only for the app's lifetime,
+    /// touched only on the refresh queue.
+    private var cliStartCache: [String: Date] = [:]
+
+    /// The transcript file's creation date for a CLI session. Tries the
+    /// project-dir encoding Claude Code uses for folder names ("/" and "." →
+    /// "-"), then falls back to a shallow scan of ~/.claude/projects for
+    /// <id>.jsonl (encoding rules could drift; the scan is one-time per
+    /// session thanks to the cache above).
+    private static func transcriptCreationDate(projectDir: String, id: String) -> Date? {
+        let base = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude").appendingPathComponent("projects")
+        let encoded = projectDir
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ".", with: "-")
+        var candidates = [base.appendingPathComponent(encoded).appendingPathComponent("\(id).jsonl")]
+        if let subdirs = try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil) {
+            candidates += subdirs.map { $0.appendingPathComponent("\(id).jsonl") }
+        }
+        for url in candidates {
+            if let values = try? url.resourceValues(forKeys: [.creationDateKey]),
+               let created = values.creationDate {
+                return created
+            }
+        }
+        return nil
     }
 
     func setEnabled(_ sessionId: String, _ enabled: Bool) {

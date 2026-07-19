@@ -405,35 +405,76 @@ class TestPlanFitOnConfigChange(TempEnvMixin, unittest.TestCase):
         ar.plan_fit = self._real_plan_fit
         super().tearDown()
 
-    def _write_cfg(self, mtime):
-        self.cfg.write_text(json.dumps({"version": 1}))
+    def _write_cfg(self, mtime, content=None):
+        self.cfg.write_text(json.dumps(content if content is not None else {"version": 1}))
         os.utime(self.cfg, (mtime, mtime))
+
+    def _inputs(self):
+        import autoresume_config as acfg
+        return ar._plan_fit_config_inputs(acfg.load_config(self.state_dir))
 
     def test_no_change_no_write(self):
         self._write_cfg(1000.0)
         import autoresume_config as acfg
         last = acfg.config_mtime(self.state_dir)
-        new = ar._maybe_write_plan_fit_on_config_change(self.state_dir, last, False)
-        self.assertEqual(new, last)
+        new_mtime, inputs = ar._maybe_write_plan_fit_on_config_change(
+            self.state_dir, last, False, self._inputs())
+        self.assertEqual(new_mtime, last)
         self.assertEqual(self.fake.calls, 0)
 
     def test_change_triggers_single_write_and_advances_mtime(self):
         self._write_cfg(1000.0)
         last = 1000.0
-        self._write_cfg(2000.0)  # user edited Settings → new mtime
-        new = ar._maybe_write_plan_fit_on_config_change(self.state_dir, last, False)
-        self.assertEqual(self.fake.calls, 1, "one plan_fit write on config change")
-        self.assertEqual(new, 2000.0, "returns the new mtime so it won't re-fire")
-        # A follow-up with the returned mtime must not write again.
-        again = ar._maybe_write_plan_fit_on_config_change(self.state_dir, new, False)
+        last_inputs = self._inputs()
+        # user edited Settings → new mtime AND a plan-fit-relevant change
+        self._write_cfg(2000.0, {"version": 1, "account": {"type": "api", "plan": "pro"}})
+        new_mtime, new_inputs = ar._maybe_write_plan_fit_on_config_change(
+            self.state_dir, last, False, last_inputs)
+        self.assertEqual(self.fake.calls, 1, "one plan_fit write on account change")
+        self.assertEqual(new_mtime, 2000.0, "returns the new mtime so it won't re-fire")
+        # A follow-up with the returned values must not write again.
+        again_mtime, again_inputs = ar._maybe_write_plan_fit_on_config_change(
+            self.state_dir, new_mtime, False, new_inputs)
         self.assertEqual(self.fake.calls, 1)
-        self.assertEqual(again, new)
+        self.assertEqual(again_mtime, new_mtime)
+        self.assertEqual(again_inputs, new_inputs)
+
+    def test_retention_only_change_skips_write(self):
+        # Audit MINOR #6: an edit that only touches retention (or hosts) bumps
+        # the mtime but doesn't affect plan-fit's inputs — no rewrite, but the
+        # mtime is remembered so the detector doesn't re-load every poll.
+        self._write_cfg(1000.0)
+        last_inputs = self._inputs()
+        self._write_cfg(2000.0, {"version": 1,
+                                 "sessions": {"idle_retention_minutes": 120}})
+        new_mtime, new_inputs = ar._maybe_write_plan_fit_on_config_change(
+            self.state_dir, 1000.0, False, last_inputs)
+        self.assertEqual(self.fake.calls, 0, "retention-only edit: no plan_fit rewrite")
+        self.assertEqual(new_mtime, 2000.0, "mtime still advanced")
+        self.assertEqual(new_inputs, last_inputs)
+
+    def test_budget_change_triggers_write(self):
+        self._write_cfg(1000.0)
+        last_inputs = self._inputs()
+        self._write_cfg(2000.0, {"version": 1, "budget": {"monthly_usd": 300}})
+        ar._maybe_write_plan_fit_on_config_change(
+            self.state_dir, 1000.0, False, last_inputs)
+        self.assertEqual(self.fake.calls, 1, "budget edit must rewrite plan_fit")
+
+    def test_unknown_last_inputs_counts_as_differing(self):
+        # last_plan_inputs=None (unknown) must fail safe: rewrite once.
+        self._write_cfg(1000.0)
+        self._write_cfg(2000.0)
+        ar._maybe_write_plan_fit_on_config_change(self.state_dir, 1000.0, False, None)
+        self.assertEqual(self.fake.calls, 1)
 
     def test_remote_mode_never_writes(self):
         self._write_cfg(1000.0)
-        new = ar._maybe_write_plan_fit_on_config_change(self.state_dir, 500.0, True)
+        new_mtime, inputs = ar._maybe_write_plan_fit_on_config_change(
+            self.state_dir, 500.0, True, ("sentinel",))
         self.assertEqual(self.fake.calls, 0, "remote host: Mac owns plan_fit")
-        self.assertEqual(new, 500.0, "last_mtime unchanged in remote mode")
+        self.assertEqual(new_mtime, 500.0, "last_mtime unchanged in remote mode")
+        self.assertEqual(inputs, ("sentinel",), "cached inputs unchanged in remote mode")
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +528,131 @@ class TestIdleRetentionDrop(TempEnvMixin, unittest.TestCase):
                              "last_seen": now - 60 * 60}}
         ar.prune_old_entries(state, 30)
         self.assertNotIn("legacy", state)
+
+
+# ---------------------------------------------------------------------------
+# Quiet-drop must not delete sessions with a pending tool call (audit MAJOR #3)
+# ---------------------------------------------------------------------------
+
+def assistant_tool_use(name="Bash", tool_id="toolu_01", ts="2026-07-18T14:01:00.000Z") -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": tool_id, "name": name,
+                         "input": {"command": "sleep 600"}}],
+            "stop_reason": "tool_use",
+        },
+        "timestamp": ts,
+    }
+
+
+def tool_result_user(tool_id="toolu_01", ts="2026-07-18T14:03:00.000Z") -> dict:
+    return {
+        "type": "user",
+        "message": {"role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tool_id,
+                                 "content": "ok"}]},
+        "timestamp": ts,
+    }
+
+
+class TestQuietDropPendingTool(TempEnvMixin, unittest.TestCase):
+    """The audit scenario: retention=5 (the MIN floor), a session whose tail
+    is a pending Bash tool_use goes >5min without a transcript write during a
+    long tool run. The old quiet branch emitted a None record, which deleted
+    the entry — including widget-owned enabled=True — and the session came
+    back later as enabled=False."""
+
+    def test_pending_tool_use_survives_quiet_window(self):
+        now = ar.time.time()
+        mtime = now - 6 * 60  # 6 min idle, retention 5
+        self.write_cli_transcript("sess_pending", [
+            human_user(cwd=str(self.tmp)),
+            assistant_tool_use(),  # flushed tool_use, no tool_result yet
+        ], mtime=mtime)
+        records = ar.compute_cli_records(now, {}, {}, 5)
+        self.assertIn("sess_pending", records)
+        self.assertEqual(records["sess_pending"]["status"], "active",
+                         "pending tool call: must stay active, not quiet-drop")
+
+    def test_pending_tool_keeps_enabled_toggle_across_merge(self):
+        # End-to-end shape of the audit bug: the enabled=True entry must
+        # survive the merge instead of being deleted and later re-added off.
+        now = ar.time.time()
+        self.write_cli_transcript("sess_toggled", [
+            human_user(cwd=str(self.tmp)),
+            assistant_tool_use(),
+        ], mtime=now - 6 * 60)
+        records = ar.compute_cli_records(now, {}, {}, 5)
+        state = {"sess_toggled": {"kind": "cli", "status": "active",
+                                  "handled": False, "enabled": True}}
+        ar.merge_cli_records(state, records, now)
+        self.assertIn("sess_toggled", state)
+        self.assertTrue(state["sess_toggled"]["enabled"],
+                        "widget-owned enabled=True must survive")
+
+    def test_completed_tail_still_quiet_drops(self):
+        # Same shape but the tool call completed and the turn ended cleanly:
+        # past the retention edge this is genuinely idle -> None record.
+        now = ar.time.time()
+        self.write_cli_transcript("sess_done", [
+            human_user(cwd=str(self.tmp)),
+            assistant_tool_use(),
+            tool_result_user(),
+            assistant_text("all done"),
+        ], mtime=now - 6 * 60)
+        records = ar.compute_cli_records(now, {}, {}, 5)
+        self.assertIn("sess_done", records)
+        self.assertIsNone(records["sess_done"]["status"],
+                          "completed tail past retention: quiet-drop as before")
+
+    def test_pending_tool_inside_retention_unchanged(self):
+        now = ar.time.time()
+        self.write_cli_transcript("sess_fresh", [
+            human_user(cwd=str(self.tmp)),
+            assistant_tool_use(),
+        ], mtime=now - 2 * 60)
+        records = ar.compute_cli_records(now, {}, {}, 5)
+        self.assertEqual(records["sess_fresh"]["status"], "active")
+
+
+# ---------------------------------------------------------------------------
+# autoresume_config: account.plan canonicalization (audit MINOR #5)
+# ---------------------------------------------------------------------------
+
+class TestConfigPlanCanonicalization(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _plan_for(self, plan_value):
+        import autoresume_config as acfg
+        (self.state_dir / "config.json").write_text(
+            json.dumps({"version": 1, "account": {"type": "max", "plan": plan_value}}))
+        return acfg.load_config(self.state_dir)["account"]["plan"]
+
+    def test_valid_plans_accepted(self):
+        for plan in ("pro", "max_5x", "max_20x"):
+            self.assertEqual(self._plan_for(plan), plan)
+
+    def test_whitespace_stripped(self):
+        self.assertEqual(self._plan_for("  pro  "), "pro")
+
+    def test_unknown_plan_falls_back_to_default(self):
+        import autoresume_config as acfg
+        # Any non-canonical string (the old code accepted ALL non-empty
+        # strings) must fall back to the default plan.
+        for bad in ("enterprise_9000", "Max 20x", "max20x", "PRO"):
+            self.assertEqual(self._plan_for(bad), acfg.DEFAULT_PLAN)
+
+    def test_non_string_plan_falls_back_to_default(self):
+        import autoresume_config as acfg
+        for bad in (None, 20, True, ["max_20x"]):
+            self.assertEqual(self._plan_for(bad), acfg.DEFAULT_PLAN)
 
 
 if __name__ == "__main__":

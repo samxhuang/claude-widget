@@ -290,6 +290,49 @@ def _parse_event_time(obj: dict) -> float | None:
     return None
 
 
+def _scan_current_turn(objs: list[dict]) -> tuple[list, dict | None]:
+    """Walk the current turn backwards: returns (pending, last_conv), where
+    `pending` is [(tool_name, event_time or None), ...] for every tool_use
+    call not yet answered by a tool_result, and `last_conv` is the newest
+    conversational (user/assistant) event. tool_results always land after
+    their tool_use, so scanning backwards we meet results before uses. The
+    turn is bounded by a non-tool_result user event (a human/injected prompt)
+    or a previous turn's end_turn. Shared by classify_work_status and the
+    quiet-drop guard in compute_cli_records."""
+    result_ids = set()
+    pending = []  # (tool_name, event_time or None)
+    last_conv = None
+    for obj in reversed(objs[-400:]):
+        obj_type = obj.get("type")
+        if obj_type not in ("assistant", "user"):
+            continue  # queue-operation / attachment / system / ai-title ...
+        message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        content = message.get("content")
+        if last_conv is None:
+            last_conv = obj
+        if obj_type == "user":
+            saw_result = False
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        result_ids.add(block.get("tool_use_id"))
+                        saw_result = True
+            if not saw_result:
+                break  # human prompt: start of the current turn
+        else:
+            if isinstance(content, list):
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and block.get("id") not in result_ids
+                    ):
+                        pending.append((block.get("name") or "", _parse_event_time(obj)))
+            if obj is not last_conv and message.get("stop_reason") == "end_turn":
+                break  # previous turn's clean ending
+    return pending, last_conv
+
+
 def classify_work_status(
     objs: list[dict],
     mtime: float,
@@ -341,42 +384,9 @@ def classify_work_status(
     pid = session_pids.get(session_id) if session_id else None
     executing = pid is not None and pid in busy_pids
 
-    # --- walk the current turn backwards: newest conversational event and
-    # any tool_use calls not yet answered by a tool_result. tool_results
-    # always land after their tool_use, so scanning backwards we meet
-    # results before uses. The turn is bounded by a non-tool_result user
-    # event (a human/injected prompt) or a previous turn's end_turn.
-    result_ids = set()
-    pending = []  # (tool_name, event_time or None)
-    last_conv = None
-    for obj in reversed(objs[-400:]):
-        obj_type = obj.get("type")
-        if obj_type not in ("assistant", "user"):
-            continue  # queue-operation / attachment / system / ai-title ...
-        message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-        content = message.get("content")
-        if last_conv is None:
-            last_conv = obj
-        if obj_type == "user":
-            saw_result = False
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        result_ids.add(block.get("tool_use_id"))
-                        saw_result = True
-            if not saw_result:
-                break  # human prompt: start of the current turn
-        else:
-            if isinstance(content, list):
-                for block in content:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "tool_use"
-                        and block.get("id") not in result_ids
-                    ):
-                        pending.append((block.get("name") or "", _parse_event_time(obj)))
-            if obj is not last_conv and message.get("stop_reason") == "end_turn":
-                break  # previous turn's clean ending
+    # Current-turn walk (factored into _scan_current_turn — see its docstring
+    # for the backwards-scan invariants).
+    pending, last_conv = _scan_current_turn(objs)
 
     # Rule 1: tools that exist to block on the human.
     if any(name in USER_INPUT_TOOLS for name, _ in pending):
@@ -842,10 +852,28 @@ def compute_cli_records(now: float, runtime: dict, cache: dict,
 
             # Per-cycle status: cheap, depends on now/activity_mtime, not on
             # file content, so it's recomputed here rather than cached.
+            #
+            # Quiet-drop guard (audit MAJOR #3): a session whose transcript
+            # tail shows a PENDING tool_use — the tool_use event flushed but
+            # no tool_result yet, the same evidence classify_work_status rule
+            # 4 keys off — is NOT idle, no matter how long since the last
+            # transcript write: a long-running Bash/subagent/permission-prompt
+            # wait writes nothing for many minutes. Under a short retention
+            # (MIN floor 5m) the old unconditional quiet-drop emitted a None
+            # record for exactly such a session, which deleted its state.json
+            # entry INCLUDING widget-owned enabled=True, and the session came
+            # back later as enabled=False. Consult the already-cached parse
+            # (derived["objs_tail"] — no extra I/O) and keep the session
+            # "active" while a tool call is pending. Truly-abandoned
+            # pending-tool sessions are still bounded: once they leave the
+            # scan window entirely, prune_old_entries' last_activity_at
+            # retention+grace backstop drops them (acceptable, unchanged).
             if derived["waiting_resets_at"] is not None:
                 status = "waiting"
                 resets_at = derived["waiting_resets_at"]
-            elif derived["has_human_message"] and (now - activity_mtime) <= active_window_seconds:
+            elif derived["has_human_message"] and (
+                    (now - activity_mtime) <= active_window_seconds
+                    or _scan_current_turn(derived["objs_tail"])[0]):
                 status = "active"
                 resets_at = None
             else:
@@ -1001,12 +1029,12 @@ def compute_cowork_records(now: float,
     if not COWORK_SESSIONS_DIR.is_dir():
         return records
 
-    # Same configurable retention as the CLI scan: the scan window stretches
-    # with it (floor 30m) plus the same strictly-wider SCAN_BUFFER (see
-    # compute_cli_records — the quiet->drop band must be non-empty), and
-    # "gone quiet" is judged at the retention edge.
-    scan_cutoff_ms = (now - (max(SCAN_WINDOW_MINUTES, retention_minutes)
-                             + SCAN_BUFFER_MINUTES) * 60) * 1000
+    # Unlike the CLI scan there is no mtime-based scan-window skip here:
+    # every non-archived session with an audit.jsonl yields a record each
+    # cycle. Ones quiet past the retention edge (quiet_cutoff_ms, judged on
+    # the metadata's own lastActivityAt) yield a cheap None record so merge
+    # drops any tracked entry; the rest get the audit-tail read (itself cheap
+    # — read_last_jsonl_object seeks from the end).
     quiet_cutoff_ms = (now - retention_minutes * 60) * 1000
 
     for meta_path in COWORK_SESSIONS_DIR.rglob("local_*.json"):
@@ -1295,25 +1323,48 @@ def prune_old_entries(state: dict,
         del state[sid]
 
 
+def _plan_fit_config_inputs(config: dict) -> tuple:
+    """The config blocks plan-fit actually consumes (account + budget), as a
+    small comparable tuple. Used to gate the on-config-change plan_fit rewrite
+    to edits that can affect its output — retention/hosts edits don't."""
+    account = config.get("account", {}) or {}
+    budget = config.get("budget", {}) or {}
+    return (
+        account.get("type"), account.get("plan"),
+        budget.get("weekly_usd"), budget.get("monthly_usd"),
+        budget.get("week_start"), budget.get("timezone"),
+    )
+
+
 def _maybe_write_plan_fit_on_config_change(state_dir, last_config_mtime,
-                                           remote_mode) -> object:
+                                           remote_mode,
+                                           last_plan_inputs=None) -> tuple:
     """Finding 2: reflect a Settings edit (account type / budget) into
     plan_fit.json within one poll instead of waiting for the hourly analytics
-    cadence. Polls config.json's mtime; on a change it rewrites ONLY
-    plan_fit.json — not the usage collector, not the pricing refresh — since
-    account/budget are the only config inputs plan-fit consumes.
+    cadence. Polls config.json's mtime; on a change it loads the config and
+    rewrites plan_fit.json ONLY when the account or budget blocks actually
+    differ from the previously-seen ones (`last_plan_inputs`) — an edit to
+    retention or remote hosts bumps the mtime but is irrelevant to plan-fit,
+    so it no longer triggers a rewrite. A None `last_plan_inputs` means
+    "unknown" and counts as differing (safe: rewrite once, then cache).
 
     Skipped on a remote host (AUTORESUME_REMOTE=1) exactly like the hourly
-    plan_fit write: the Mac owns plan_fit.json for the whole fleet. Returns the
-    mtime to remember for the next comparison (unchanged in remote mode)."""
+    plan_fit write: the Mac owns plan_fit.json for the whole fleet. Returns
+    (mtime, plan_inputs) to remember for the next comparison (both unchanged
+    in remote mode)."""
     if remote_mode:
-        return last_config_mtime
+        return last_config_mtime, last_plan_inputs
     cfg_mtime = autoresume_config.config_mtime(state_dir)
-    if cfg_mtime != last_config_mtime:
-        plan_fit.write_plan_fit(state_dir, datetime.now().astimezone())
-        log("usage analytics: config.json changed — plan_fit.json refreshed")
-        return cfg_mtime
-    return last_config_mtime
+    if cfg_mtime == last_config_mtime:
+        return last_config_mtime, last_plan_inputs
+    inputs = _plan_fit_config_inputs(autoresume_config.load_config(state_dir))
+    if inputs == last_plan_inputs:
+        # mtime moved but account/budget are byte-identical (retention/hosts
+        # edit) — remember the mtime, skip the rewrite.
+        return cfg_mtime, last_plan_inputs
+    plan_fit.write_plan_fit(state_dir, datetime.now().astimezone())
+    log("usage analytics: config.json account/budget changed — plan_fit.json refreshed")
+    return cfg_mtime, inputs
 
 
 def _usage_analytics_worker() -> None:
@@ -1338,7 +1389,10 @@ def _usage_analytics_worker() -> None:
     remote_mode = os.environ.get("AUTORESUME_REMOTE") == "1"
     # Finding 2: seed with the current mtime so we don't spuriously rewrite on
     # the first iteration (the hourly path below already writes plan_fit then).
+    # The account/budget tuple is seeded alongside so the change-detector can
+    # tell a plan-fit-relevant edit from a retention/hosts-only one.
     last_config_mtime = autoresume_config.config_mtime(STATE_DIR)
+    last_plan_inputs = _plan_fit_config_inputs(autoresume_config.load_config(STATE_DIR))
     while True:
         try:
             now_mono = time.time()
@@ -1361,13 +1415,16 @@ def _usage_analytics_worker() -> None:
                     # the newer mtime and never rewrite. Snapshotting first
                     # leaves that edit visible to the detector below.
                     cfg_mtime_before_write = autoresume_config.config_mtime(STATE_DIR)
+                    cfg_inputs_before_write = _plan_fit_config_inputs(
+                        autoresume_config.load_config(STATE_DIR))
                     plan_fit.write_plan_fit(STATE_DIR, datetime.now().astimezone())
                     log("usage analytics: collected, compacted, plan_fit.json refreshed")
                     last_config_mtime = cfg_mtime_before_write
+                    last_plan_inputs = cfg_inputs_before_write
             # Finding 2: between hourly passes, still reflect a config.json edit
             # into plan_fit.json on the very next poll (~10s), not an hour later.
-            last_config_mtime = _maybe_write_plan_fit_on_config_change(
-                STATE_DIR, last_config_mtime, remote_mode)
+            last_config_mtime, last_plan_inputs = _maybe_write_plan_fit_on_config_change(
+                STATE_DIR, last_config_mtime, remote_mode, last_plan_inputs)
         except Exception as e:
             log(f"ERROR in usage analytics cycle: {e!r}")
         time.sleep(POLL_INTERVAL_SECONDS)

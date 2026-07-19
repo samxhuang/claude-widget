@@ -116,21 +116,30 @@ final class CloudSessionsModel: ObservableObject {
     /// would still collapse — accepted as rare (a specific shared title on two
     /// concurrently-live sessions is unlikely) and strictly narrower than the
     /// previous any-title-match behavior.
-    func apply(raw: [[String: Any]], localIds: Set<String>, localTitles: Set<String>) {
+    func apply(raw: [[String: Any]], localIds: Set<String>, localTitles: Set<String>,
+               localStartDates: [Date] = []) {
         let cutoff = Date().addingTimeInterval(-Self.lookbackWindow)
         let parsed: [CloudSessionEntry] = raw.compactMap { dict in
             guard let id = dict["id"] as? String, !id.isEmpty, !localIds.contains(id) else { return nil }
-            // Cloud echo of a locally-tracked CLI session: claude.ai's
-            // server-side record for a Desktop-attached CLI session carries a
-            // "local_" prefix on the transcript uuid (same convention as the
-            // deep-link imports — see openLocalSession's history), while the
-            // daemon keys the local entry by the bare uuid. Without stripping
-            // the prefix here the echo dodges the id dedupe, and the title
-            // dedupe can't catch it either (claude.ai titles the synced copy
-            // itself, so the two titles differ). Cowork rows are unaffected:
-            // they're tracked locally under the local_-prefixed id already,
-            // so they match on the plain contains() above.
-            if id.hasPrefix("local_"), localIds.contains(String(id.dropFirst("local_".count))) {
+            // Cloud echo of a locally-tracked CLI session. Verified against a
+            // live /recents dump: these rows id as opaque cse_* tokens with
+            // EVERY linking field null (no session uuid, no bound device, no
+            // preview; the per-session detail endpoint 404s), and claude.ai
+            // titles the echo itself, so neither the id nor the title dedupe
+            // can catch them. The one joinable signal is created_at — the
+            // cloud record is created within ~1s of the local transcript file
+            // (verified: 09:44:39.0Z vs 09:44:39.9Z) — so any row created
+            // within a ±3min window of a known local CLI session's transcript
+            // birth is treated as that session's echo. SessionsModel keeps
+            // its start-date cache append-only, so echoes of sessions the
+            // daemon has since dropped for idleness stay hidden too. Residual
+            // risk: a genuine cloud session started within 3 minutes of a
+            // local one is hidden until the local session's echo ages out of
+            // the lookback — accepted; the alternative was a phantom copy of
+            // every live local session at the top of the list.
+            if let createdStr = dict["created_at"] as? String,
+               let created = Self.parseDate(createdStr),
+               localStartDates.contains(where: { abs($0.timeIntervalSince(created)) < 180 }) {
                 return nil
             }
             let title = dict["title"] as? String ?? ""
