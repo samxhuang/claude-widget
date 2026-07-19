@@ -383,5 +383,58 @@ class TestParseCache(TempEnvMixin, unittest.TestCase):
         self.assertNotIn(str(path), cache)
 
 
+class TestPlanFitOnConfigChange(TempEnvMixin, unittest.TestCase):
+    """Finding 2: a config.json edit refreshes plan_fit.json on the next poll,
+    not an hour later."""
+
+    class _FakePlanFit:
+        def __init__(self):
+            self.calls = 0
+
+        def write_plan_fit(self, state_dir, when):
+            self.calls += 1
+
+    def setUp(self):
+        super().setUp()
+        self._real_plan_fit = ar.plan_fit
+        self.fake = self._FakePlanFit()
+        ar.plan_fit = self.fake
+        self.cfg = self.state_dir / "config.json"
+
+    def tearDown(self):
+        ar.plan_fit = self._real_plan_fit
+        super().tearDown()
+
+    def _write_cfg(self, mtime):
+        self.cfg.write_text(json.dumps({"version": 1}))
+        os.utime(self.cfg, (mtime, mtime))
+
+    def test_no_change_no_write(self):
+        self._write_cfg(1000.0)
+        import autoresume_config as acfg
+        last = acfg.config_mtime(self.state_dir)
+        new = ar._maybe_write_plan_fit_on_config_change(self.state_dir, last, False)
+        self.assertEqual(new, last)
+        self.assertEqual(self.fake.calls, 0)
+
+    def test_change_triggers_single_write_and_advances_mtime(self):
+        self._write_cfg(1000.0)
+        last = 1000.0
+        self._write_cfg(2000.0)  # user edited Settings → new mtime
+        new = ar._maybe_write_plan_fit_on_config_change(self.state_dir, last, False)
+        self.assertEqual(self.fake.calls, 1, "one plan_fit write on config change")
+        self.assertEqual(new, 2000.0, "returns the new mtime so it won't re-fire")
+        # A follow-up with the returned mtime must not write again.
+        again = ar._maybe_write_plan_fit_on_config_change(self.state_dir, new, False)
+        self.assertEqual(self.fake.calls, 1)
+        self.assertEqual(again, new)
+
+    def test_remote_mode_never_writes(self):
+        self._write_cfg(1000.0)
+        new = ar._maybe_write_plan_fit_on_config_change(self.state_dir, 500.0, True)
+        self.assertEqual(self.fake.calls, 0, "remote host: Mac owns plan_fit")
+        self.assertEqual(new, 500.0, "last_mtime unchanged in remote mode")
+
+
 if __name__ == "__main__":
     unittest.main()

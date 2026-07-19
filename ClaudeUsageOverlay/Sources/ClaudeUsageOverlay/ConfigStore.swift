@@ -75,6 +75,12 @@ final class ConfigStore: ObservableObject {
     /// dependent read runs first.
     private let ioQueue = DispatchQueue(label: "com.claude-widget.config-io")
 
+    /// Finding 1: config.json's modification date at the last load/write we
+    /// observed — only touched on `ioQueue` (serial), so no locking beyond
+    /// that. `reloadIfChanged()` uses it to skip re-reading an unchanged file
+    /// on the widget's periodic refresh. Nil until the first load.
+    private var lastLoadedMtime: Date?
+
     init() {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-autoresume")
@@ -92,8 +98,42 @@ final class ConfigStore: ObservableObject {
     func load() {
         withLock { [weak self] in
             guard let self = self else { return }
+            self.lastLoadedMtime = self.currentMtime()
             let decoded = Self.decode(self.readRaw())
-            DispatchQueue.main.async { self.config = decoded }
+            self.publish(decoded)
+        }
+    }
+
+    /// Finding 1: a lightweight, mtime-guarded reload for the widget's
+    /// periodic refresh and window-focus hooks — picks up an external edit
+    /// (a hand-edit of config.json, contract C1 allows it) without the cost of
+    /// re-reading + re-decoding on every tick when nothing changed. Own writes
+    /// update `lastLoadedMtime` too, so this no-ops right after a Settings
+    /// change (which already published via `mutate`). Skips reload entirely
+    /// when the mtime is unchanged since the last load/write.
+    func reloadIfChanged() {
+        withLock { [weak self] in
+            guard let self = self else { return }
+            let mtime = self.currentMtime()
+            if let mtime = mtime, mtime == self.lastLoadedMtime { return }
+            self.lastLoadedMtime = mtime
+            let decoded = Self.decode(self.readRaw())
+            self.publish(decoded)
+        }
+    }
+
+    /// config.json's on-disk modification date, or nil if the file doesn't
+    /// exist yet. Called only while holding the lock (on `ioQueue`).
+    private func currentMtime() -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: configURL.path)[.modificationDate]) as? Date
+    }
+
+    /// Republish on main, but only when the value actually changed — an
+    /// mtime-guarded reload or a redundant write shouldn't churn every
+    /// observing view. `AppConfig` is `Equatable` for exactly this.
+    private func publish(_ decoded: AppConfig) {
+        DispatchQueue.main.async {
+            if self.config != decoded { self.config = decoded }
         }
     }
 
@@ -182,8 +222,11 @@ final class ConfigStore: ObservableObject {
             if root["version"] == nil { root["version"] = 1 }
             change(&root)
             self.writeRaw(root)
+            // Record our own write's mtime so a later reloadIfChanged() (focus
+            // / periodic) doesn't treat it as an external edit and re-read.
+            self.lastLoadedMtime = self.currentMtime()
             let decoded = Self.decode(root)
-            DispatchQueue.main.async { self.config = decoded }
+            self.publish(decoded)
         }
     }
 

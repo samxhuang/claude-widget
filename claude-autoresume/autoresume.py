@@ -1263,6 +1263,27 @@ def prune_old_entries(state: dict) -> None:
         del state[sid]
 
 
+def _maybe_write_plan_fit_on_config_change(state_dir, last_config_mtime,
+                                           remote_mode) -> object:
+    """Finding 2: reflect a Settings edit (account type / budget) into
+    plan_fit.json within one poll instead of waiting for the hourly analytics
+    cadence. Polls config.json's mtime; on a change it rewrites ONLY
+    plan_fit.json — not the usage collector, not the pricing refresh — since
+    account/budget are the only config inputs plan-fit consumes.
+
+    Skipped on a remote host (AUTORESUME_REMOTE=1) exactly like the hourly
+    plan_fit write: the Mac owns plan_fit.json for the whole fleet. Returns the
+    mtime to remember for the next comparison (unchanged in remote mode)."""
+    if remote_mode:
+        return last_config_mtime
+    cfg_mtime = autoresume_config.config_mtime(state_dir)
+    if cfg_mtime != last_config_mtime:
+        plan_fit.write_plan_fit(state_dir, datetime.now().astimezone())
+        log("usage analytics: config.json changed — plan_fit.json refreshed")
+        return cfg_mtime
+    return last_config_mtime
+
+
 def _usage_analytics_worker() -> None:
     """Usage analytics (hourly collect/compact/plan_fit + daily pricing
     refresh) on its OWN daemon thread, off the poll thread. These passes can
@@ -1283,6 +1304,9 @@ def _usage_analytics_worker() -> None:
     # write here, but keep collect()/compact() so the remote's tokens are still
     # gathered for the budget bar.
     remote_mode = os.environ.get("AUTORESUME_REMOTE") == "1"
+    # Finding 2: seed with the current mtime so we don't spuriously rewrite on
+    # the first iteration (the hourly path below already writes plan_fit then).
+    last_config_mtime = autoresume_config.config_mtime(STATE_DIR)
     while True:
         try:
             now_mono = time.time()
@@ -1300,6 +1324,11 @@ def _usage_analytics_worker() -> None:
                 else:
                     plan_fit.write_plan_fit(STATE_DIR, datetime.now().astimezone())
                     log("usage analytics: collected, compacted, plan_fit.json refreshed")
+                    last_config_mtime = autoresume_config.config_mtime(STATE_DIR)
+            # Finding 2: between hourly passes, still reflect a config.json edit
+            # into plan_fit.json on the very next poll (~10s), not an hour later.
+            last_config_mtime = _maybe_write_plan_fit_on_config_change(
+                STATE_DIR, last_config_mtime, remote_mode)
         except Exception as e:
             log(f"ERROR in usage analytics cycle: {e!r}")
         time.sleep(POLL_INTERVAL_SECONDS)
@@ -1315,19 +1344,21 @@ def main() -> None:
     # process; it holds no state.json lock, so nothing to clean up on exit.
     threading.Thread(target=_usage_analytics_worker, name="usage-analytics", daemon=True).start()
 
-    # Feature 2 "Shape C": if config.json declares any enabled remote host, run
-    # the remote-sync thread (same daemon-thread pattern — dies with the
-    # process, takes the StateLock only for its own merges/write-backs). Not
-    # started at all when there are no enabled hosts, so a default-config Mac is
-    # byte-for-byte unchanged. Hosts added/removed later while the thread is
-    # running are picked up via config mtime; going from zero to some hosts is
-    # the one case that needs a daemon restart (which the widget's deploy flow
-    # triggers anyway).
+    # Feature 2 "Shape C": ALWAYS start the remote-sync thread (same daemon
+    # pattern — dies with the process, takes the StateLock only for its own
+    # merges/write-backs). It must be running before any host exists, because
+    # adding a host from the widget only writes config.json — nothing restarts
+    # the daemon — so a thread gated on "has enabled hosts at boot" would never
+    # notice the first host. When no host is configured the thread's tick takes
+    # a lock-free idle early-out, so a default-config Mac pays effectively
+    # nothing. Hosts added/removed later are picked up via config mtime.
     if remote_sync.has_enabled_hosts(STATE_DIR):
-        threading.Thread(target=remote_sync._remote_sync_worker,
-                         name="remote-sync", daemon=True).start()
+        log("remote-sync: enabled remote host(s) in config — starting sync thread")
     else:
-        log("remote-sync: no enabled remote hosts in config — thread not started")
+        log("remote-sync: no enabled remote hosts — sync thread started idle "
+            "(will pick up hosts added later via config.json)")
+    threading.Thread(target=remote_sync._remote_sync_worker,
+                     name="remote-sync", daemon=True).start()
 
     while True:
         try:

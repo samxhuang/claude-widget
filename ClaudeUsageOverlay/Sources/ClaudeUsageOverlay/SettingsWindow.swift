@@ -94,7 +94,11 @@ private enum AccountChoice: String, CaseIterable, Identifiable {
     }
 }
 
-private let weekdayOptions = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+// Finding 2: the Python config validator (contract C1) only accepts "monday"
+// or "sunday" for week_start — any other value silently computes Monday weeks
+// while the UI would have shown the chosen day. Restrict the picker to the two
+// the daemon actually honors rather than offering all seven.
+private let weekdayOptions = ["monday", "sunday"]
 
 struct AccountBudgetSection: View {
     @ObservedObject var configStore: ConfigStore
@@ -179,7 +183,10 @@ struct AccountBudgetSection: View {
         accountChoice = AccountChoice.from(config: c)
         weeklyText = c.weeklyUsd.map { Self.formatBudget($0) } ?? ""
         monthlyText = c.monthlyUsd.map { Self.formatBudget($0) } ?? ""
-        weekStart = c.weekStart
+        // Finding 2: only monday/sunday are valid options now — fall back to
+        // monday for any other stored value (old/hand-edited config) so the
+        // Picker has a matching tag rather than rendering blank.
+        weekStart = weekdayOptions.contains(c.weekStart) ? c.weekStart : "monday"
     }
 
     private func persistAccount() {
@@ -364,9 +371,18 @@ private struct HostRow: View {
                 Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
                     GridRow {
                         Text("Poll interval (s)").font(.caption)
-                        TextField("30", text: $pollText)
-                            .frame(width: 60)
-                            .onSubmit { persist() }
+                        VStack(alignment: .leading, spacing: 1) {
+                            TextField("30", text: $pollText)
+                                .frame(width: 60)
+                                .onSubmit { persist() }
+                            // Finding 4: the daemon floors poll interval at 10s
+                            // (Python silently resets anything < 10 to 30), so
+                            // flag sub-10 input rather than persisting a value
+                            // the daemon will quietly override.
+                            if let poll = Int(pollText), poll < 10 {
+                                Text("minimum 10s").font(.caption2).foregroundColor(.red)
+                            }
+                        }
                     }
                     GridRow {
                         Text("Collect usage").font(.caption)
@@ -388,15 +404,28 @@ private struct HostRow: View {
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
-        .onAppear {
-            pollText = String(host.pollSeconds)
-            collectUsage = host.collectUsage
-        }
+        .onAppear { seedFromHost() }
+        // Finding 4: pollText/collectUsage were seeded only in onAppear, so if
+        // the host entry changed underneath the row while it stayed on screen
+        // (e.g. a deploy stamped deployed_version, or an external config edit)
+        // the fields kept showing the stale seed. Re-seed whenever the host
+        // value changes. RemoteHostConfig is Equatable, so this only fires on
+        // an actual change.
+        .onChange(of: host) { _ in seedFromHost() }
+    }
+
+    private func seedFromHost() {
+        pollText = String(host.pollSeconds)
+        collectUsage = host.collectUsage
     }
 
     private func persist() {
         var updated = host
-        if let poll = Int(pollText), poll > 0 { updated.pollSeconds = poll }
+        // Finding 4: enforce the daemon's 10s floor here so config.json never
+        // carries a sub-10 interval (which the daemon would silently reset to
+        // 30). Only persist a valid, in-range value; a below-floor entry is
+        // flagged inline and left unsaved until corrected.
+        if let poll = Int(pollText), poll >= 10 { updated.pollSeconds = poll }
         updated.collectUsage = collectUsage
         onChange(updated)
     }
@@ -420,13 +449,21 @@ struct AddHostSheet: View {
     @State private var testing = false
     @State private var started = false
 
+    // Finding 3: validate (and later save) the TRIMMED name/ssh. Python
+    // stores state under the cleaned name and resolveHostSSH matches it
+    // exactly, so an untrimmed " devbox " here would (a) slip past the
+    // duplicate-name check against the already-cleaned existingNames and
+    // (b) diverge from the daemon's key, breaking host resolution.
+    private var trimmedName: String { name.trimmingCharacters(in: .whitespaces) }
+    private var trimmedSSH: String { ssh.trimmingCharacters(in: .whitespaces) }
+
     private var nameValid: Bool {
-        !name.trimmingCharacters(in: .whitespaces).isEmpty
-            && !name.contains(":")
-            && !existingNames.contains(name)
+        !trimmedName.isEmpty
+            && !trimmedName.contains(":")
+            && !existingNames.contains(trimmedName)
     }
     private var canSave: Bool {
-        nameValid && !ssh.trimmingCharacters(in: .whitespaces).isEmpty && !deployer.isRunning
+        nameValid && !trimmedSSH.isEmpty && !deployer.isRunning
     }
 
     var body: some View {
@@ -439,8 +476,8 @@ struct AddHostSheet: View {
                     VStack(alignment: .leading, spacing: 2) {
                         TextField("devbox", text: $name)
                         if !name.isEmpty && !nameValid {
-                            Text(name.contains(":") ? "no “:” allowed in a host name"
-                                 : (existingNames.contains(name) ? "a host with this name already exists" : "required"))
+                            Text(trimmedName.contains(":") ? "no “:” allowed in a host name"
+                                 : (existingNames.contains(trimmedName) ? "a host with this name already exists" : "required"))
                                 .font(.caption).foregroundColor(.red)
                         }
                     }
@@ -499,17 +536,22 @@ struct AddHostSheet: View {
     }
 
     private func save() {
-        let host = RemoteHostConfig.defaults(name: name, ssh: ssh)
+        // Finding 3: persist and deploy against the trimmed values so the
+        // config key, the deploy target, and the daemon's cleaned state key
+        // all agree.
+        let cleanName = trimmedName
+        let cleanSSH = trimmedSSH
+        let host = RemoteHostConfig.defaults(name: cleanName, ssh: cleanSSH)
         // Save disabled first so a failed deploy still leaves a record the
         // user can retry from; a successful deploy re-records it enabled.
         configStore.upsertHost(host)
         started = true
-        deployer.deploy(target: ssh) { succeeded, version in
+        deployer.deploy(target: cleanSSH) { succeeded, version in
             if succeeded {
                 let stamp = ISO8601DateFormatter().string(from: Date())
-                configStore.recordDeployment(named: name, deployedAt: stamp, version: version, enable: true)
+                configStore.recordDeployment(named: cleanName, deployedAt: stamp, version: version, enable: true)
             }
-            onFinished(name, succeeded)
+            onFinished(cleanName, succeeded)
         }
     }
 }
@@ -644,7 +686,7 @@ struct DeployProgressView: View {
                         Text(symbol(for: step.status))
                             .foregroundColor(color(for: step.status))
                             .frame(width: 14)
-                        Text(step.kind.label)
+                        Text(step.label)
                             .font(.caption)
                             .foregroundColor(step.status == .pending ? .secondary : .primary)
                     }

@@ -155,12 +155,28 @@ echo "copied: ${PAYLOAD_FILES[*]}"
 
 # --- service ---------------------------------------------------------------
 step service
+# Detect a usable `systemctl --user`. A non-login ssh session often lacks
+# XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, so the plain probe fails even though
+# the user bus is running — retry with them set explicitly before falling back
+# to nohup. SYSTEMD_PREFIX (a literal string; the remote shell expands $(id -u))
+# is prepended to every subsequent `systemctl --user` call so they hit the same
+# bus the probe succeeded on.
 USE_SYSTEMD=0
-if rssh 'command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1'; then
-  USE_SYSTEMD=1
+SYSTEMD_PREFIX=""
+SYSTEMD_PATH=""
+if rssh 'command -v systemctl >/dev/null 2>&1'; then
+  if rssh 'systemctl --user show-environment >/dev/null 2>&1'; then
+    USE_SYSTEMD=1
+    SYSTEMD_PATH="systemd --user (default session bus)"
+  elif rssh 'XDG_RUNTIME_DIR="/run/user/$(id -u)" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" systemctl --user show-environment >/dev/null 2>&1'; then
+    USE_SYSTEMD=1
+    SYSTEMD_PREFIX='XDG_RUNTIME_DIR="/run/user/$(id -u)" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" '
+    SYSTEMD_PATH="systemd --user (explicit XDG_RUNTIME_DIR=/run/user/\$(id -u))"
+  fi
 fi
 
 if [ "$USE_SYSTEMD" -eq 1 ]; then
+  echo "service path: $SYSTEMD_PATH"
   echo "Installing systemd --user unit ..."
   RENDERED="$(mktemp 2>/dev/null || echo /tmp/claude-autoresume.service.$$)"
   trap 'rm -f "$RENDERED"' EXIT
@@ -172,7 +188,7 @@ if [ "$USE_SYSTEMD" -eq 1 ]; then
     "$SERVICE_TEMPLATE" > "$RENDERED" || fail "service: rendering unit template failed"
   rssh 'mkdir -p ~/.config/systemd/user' || fail "service: mkdir ~/.config/systemd/user failed"
   rscp "$RENDERED" "$HOST:.config/systemd/user/$REMOTE_SERVICE" >/dev/null 2>&1 || fail "service: scp of unit file failed"
-  rssh 'systemctl --user daemon-reload' || fail "service: systemctl --user daemon-reload failed"
+  rssh "${SYSTEMD_PREFIX}systemctl --user daemon-reload" || fail "service: systemctl --user daemon-reload failed"
   echo "unit installed at ~/.config/systemd/user/$REMOTE_SERVICE"
   # Linger keeps the user manager (and thus the daemon) alive after logout.
   if rssh 'loginctl enable-linger "$USER"' >/dev/null 2>&1; then
@@ -181,14 +197,14 @@ if [ "$USE_SYSTEMD" -eq 1 ]; then
     echo "warning: could not enable loginctl linger — the remote daemon may stop when you log out. Run 'loginctl enable-linger <user>' as an admin if you want it to persist."
   fi
 else
-  echo "No usable 'systemctl --user' on remote; will use nohup + pidfile fallback."
+  echo "service path: nohup + pidfile (no usable 'systemctl --user' on remote)"
 fi
 
 # --- start -----------------------------------------------------------------
 step start
 if [ "$USE_SYSTEMD" -eq 1 ]; then
   echo "Enabling and starting the service ..."
-  rssh 'systemctl --user enable --now claude-autoresume.service' || fail "start: systemctl --user enable --now failed"
+  rssh "${SYSTEMD_PREFIX}systemctl --user enable --now claude-autoresume.service" || fail "start: systemctl --user enable --now failed"
   echo "service enabled and started."
 else
   echo "Starting daemon with nohup ..."

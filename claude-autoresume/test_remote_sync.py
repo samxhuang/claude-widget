@@ -41,9 +41,12 @@ class FakeTransport:
         self.calls = []                  # list of (kind, ssh_target, stdin_data)
 
     def _kind(self, remote_argv):
-        if "apply-toggles" in remote_argv:
+        # remote_argv is now a one-element list holding the composed remote
+        # shell command line — substring-match rather than membership.
+        joined = " ".join(remote_argv)
+        if "apply-toggles" in joined:
             return "apply"
-        if "--usage" in remote_argv:
+        if "--usage" in joined:
             return "usage"
         return "dump"
 
@@ -446,6 +449,161 @@ class TestHasEnabledHosts(TempEnvMixin, unittest.TestCase):
             {"name": "devbox", "ssh": "sam@devbox", "enabled": False}
         ]})
         self.assertFalse(rs.has_enabled_hosts(self.state_dir))
+
+
+# ---------------------------------------------------------------------------
+# Remote command composition (M3): single quoted shell line, tilde + spaces +
+# custom state_dir all handled
+# ---------------------------------------------------------------------------
+
+class TestRemoteCommandComposition(unittest.TestCase):
+    def test_default_state_dir_tilde_resolved_to_home(self):
+        cmd_list = rs._remote_ctl_command(HOST, "dump")
+        self.assertEqual(len(cmd_list), 1, "must be ONE ssh argument")
+        cmd = cmd_list[0]
+        self.assertIn('AUTORESUME_STATE_DIR="$HOME/.claude-autoresume"', cmd)
+        self.assertIn('"$HOME/.claude-autoresume/bin/remote_ctl.py"', cmd)
+        self.assertTrue(cmd.endswith(" dump"))
+        self.assertNotIn("~", cmd, "leading ~/ must be rewritten to $HOME/")
+
+    def test_usage_flag_appended(self):
+        cmd = rs._remote_ctl_command(HOST, "dump", "--usage")[0]
+        self.assertTrue(cmd.endswith(" dump --usage"))
+
+    def test_custom_state_dir_with_spaces_is_quoted(self):
+        host = dict(HOST, state_dir="/opt/my daemon/state", python="/usr/bin/python3")
+        cmd = rs._remote_ctl_command(host, "apply-toggles")[0]
+        # Double-quoted so the space survives the remote shell's word-splitting.
+        self.assertIn('AUTORESUME_STATE_DIR="/opt/my daemon/state"', cmd)
+        self.assertIn('"/opt/my daemon/state/bin/remote_ctl.py"', cmd)
+        self.assertIn('"/usr/bin/python3"', cmd)
+        self.assertIn("apply-toggles", cmd)
+
+    def test_python_with_spaces_is_quoted(self):
+        host = dict(HOST, python="/home/user/py venv/bin/python")
+        cmd = rs._remote_ctl_command(host, "dump")[0]
+        self.assertIn('"/home/user/py venv/bin/python"', cmd)
+
+    def test_resolve_state_dir_forms(self):
+        self.assertEqual(rs._resolve_state_dir("~"), "$HOME")
+        self.assertEqual(rs._resolve_state_dir("~/x"), "$HOME/x")
+        self.assertEqual(rs._resolve_state_dir("/abs/path"), "/abs/path")
+        self.assertEqual(rs._resolve_state_dir("$HOME/y"), "$HOME/y")
+
+    def test_custom_state_dir_reaches_transport_as_single_arg(self):
+        host = dict(HOST, state_dir="~/alt-state")
+        captured = {}
+
+        def transport(ssh_target, remote_argv, stdin_data=None, timeout=15):
+            captured["argv"] = remote_argv
+            return 1, "", "unreachable"  # short-circuit; we only inspect argv
+
+        rs.fetch_dump(host, transport)
+        self.assertEqual(len(captured["argv"]), 1)
+        self.assertIn('AUTORESUME_STATE_DIR="$HOME/alt-state"', captured["argv"][0])
+
+
+# ---------------------------------------------------------------------------
+# _prune_removed_hosts return value (drives the worker's idle early-out)
+# ---------------------------------------------------------------------------
+
+class TestPruneReturnsRemaining(TempEnvMixin, unittest.TestCase):
+    def test_returns_true_when_host_entries_remain(self):
+        self.write_state({"keep::s1": {"host": "keep", "remote_id": "s1"}})
+        self.assertTrue(rs._prune_removed_hosts(self.state_dir, {"keep"}))
+
+    def test_returns_false_when_none_remain(self):
+        self.write_state({
+            "gone::s1": {"host": "gone", "remote_id": "s1"},
+            "local-uuid": {"kind": "cli", "status": "active"},  # not a host entry
+        })
+        # host "gone" not in the (empty) configured set → pruned; only the
+        # non-host local entry remains ⇒ no host entries left.
+        self.assertFalse(rs._prune_removed_hosts(self.state_dir, set()))
+
+
+# ---------------------------------------------------------------------------
+# Worker tick: idle early-out never takes the lock; scheduler eviction
+# ---------------------------------------------------------------------------
+
+class _CountingLock:
+    """Drop-in for ar.StateLock that counts acquisitions."""
+    count = 0
+
+    def __enter__(self):
+        type(self).count += 1
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestWorkerTick(TempEnvMixin, unittest.TestCase):
+    def _write_config(self, cfg):
+        (self.state_dir / "config.json").write_text(json.dumps(cfg))
+
+    def setUp(self):
+        super().setUp()
+        self._real_lock = ar.StateLock
+        _CountingLock.count = 0
+        ar.StateLock = _CountingLock
+
+    def tearDown(self):
+        ar.StateLock = self._real_lock
+        super().tearDown()
+
+    def test_idle_early_out_takes_no_lock(self):
+        # No config (no hosts) and we tell the loop nothing is believed present.
+        loop = rs._RemoteSyncLoop(self.state_dir, FakeTransport())
+        loop.believe_host_entries = False
+        did_work = loop.tick(now_fn=lambda: 1000.0)
+        self.assertFalse(did_work, "no hosts + nothing believed ⇒ early-out")
+        self.assertEqual(_CountingLock.count, 0,
+                         "idle early-out must never acquire StateLock")
+
+    def test_first_tick_cleans_leftovers_then_goes_idle(self):
+        # A leftover host:: entry from a removed-hosts config, no config file.
+        with self._real_lock():
+            ar.save_state({"gone::s1": {"host": "gone", "remote_id": "s1"}})
+        loop = rs._RemoteSyncLoop(self.state_dir, FakeTransport())
+        self.assertTrue(loop.believe_host_entries, "starts believing → forces a check")
+        did_work = loop.tick(now_fn=lambda: 1000.0)
+        self.assertTrue(did_work, "first tick must run to clean leftovers")
+        self.assertGreaterEqual(_CountingLock.count, 1)
+        with self._real_lock():
+            self.assertNotIn("gone::s1", ar.load_state())
+        # Now nothing is believed present; next tick early-outs without a lock.
+        self.assertFalse(loop.believe_host_entries)
+        before = _CountingLock.count
+        self.assertFalse(loop.tick(now_fn=lambda: 1000.0))
+        self.assertEqual(_CountingLock.count, before,
+                         "second tick early-outs, no further lock")
+
+    def test_configured_host_is_serviced_and_tracked(self):
+        self._write_config({"remote_hosts": [
+            {"name": "devbox", "ssh": "sam@devbox", "enabled": True,
+             "poll_seconds": 30, "collect_usage": False}
+        ]})
+        dump = dump_payload(1000.0, {"s1": remote_entry()})
+        loop = rs._RemoteSyncLoop(self.state_dir, FakeTransport(dump=dump))
+        self.assertTrue(loop.tick(now_fn=lambda: 1000.0))
+        with self._real_lock():
+            self.assertIn("devbox::s1", ar.load_state())
+        self.assertTrue(loop.believe_host_entries)
+
+    def test_scheduler_dicts_evict_removed_hosts(self):
+        loop = rs._RemoteSyncLoop(self.state_dir, FakeTransport())
+        # Simulate stale schedule entries for a host no longer configured.
+        loop.next_poll = {"devbox": 5.0, "gone": 5.0}
+        loop.next_usage = {"gone": 5.0}
+        # Config lists only devbox.
+        self._write_config({"remote_hosts": [
+            {"name": "devbox", "ssh": "sam@devbox", "enabled": False}
+        ]})
+        loop.tick(now_fn=lambda: 1000.0)
+        self.assertIn("devbox", loop.next_poll, "still-configured host kept")
+        self.assertNotIn("gone", loop.next_poll, "removed host evicted from next_poll")
+        self.assertNotIn("gone", loop.next_usage, "removed host evicted from next_usage")
 
 
 if __name__ == "__main__":

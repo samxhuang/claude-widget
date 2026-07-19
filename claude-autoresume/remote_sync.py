@@ -11,10 +11,13 @@ remote host — the Mac NEVER runs `claude --resume` for a remote entry (see the
 Design
 ------
 * One daemon thread (`_remote_sync_worker`, started from autoresume.main() with
-  the same daemon=True pattern as the usage-analytics worker), only when the
-  config has at least one enabled remote host. It re-reads config.json on mtime
-  change (via autoresume_config.config_mtime) so hosts the widget adds/removes
-  take effect without a daemon restart.
+  the same daemon=True pattern as the usage-analytics worker). It is ALWAYS
+  started — a host the widget adds at runtime only writes config.json, nothing
+  restarts the daemon, so the thread must already be alive to notice it. When
+  no host is configured (and no leftover `host::` entries remain) the tick takes
+  a cheap idle early-out that never touches StateLock. It re-reads config.json
+  on mtime change (via autoresume_config.config_mtime) so hosts the widget
+  adds/removes take effect without a daemon restart.
 * Per host, on that host's own `poll_seconds` cadence, one sync cycle:
     1. `dump` fetch over ssh (15s hard timeout, stdin=DEVNULL). Failure ⇒ mark
        that host's entries `remote_stale=true` (under StateLock) and skip; after
@@ -119,11 +122,37 @@ def _default_transport(ssh_target, remote_argv, stdin_data=None,
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _remote_ctl_argv(host, subcommand, *extra):
-    """Build the remote command vector for remote_ctl.py (contract C4). The
-    remote login shell expands the leading `~` in state_dir."""
-    script = f"{host['state_dir']}/bin/remote_ctl.py"
-    return [host["python"], script, subcommand, *extra]
+def _resolve_state_dir(state_dir):
+    """Rewrite a leading `~`/`~/` to `$HOME`/`$HOME/` so the remote shell (not
+    the local one) expands it inside the double-quoted command below. Absolute
+    paths, `$VAR` forms, and anything else pass through untouched."""
+    if state_dir == "~":
+        return "$HOME"
+    if state_dir.startswith("~/"):
+        return "$HOME/" + state_dir[2:]
+    return state_dir
+
+
+def _remote_ctl_command(host, subcommand, *extra):
+    """Compose the SINGLE remote shell command line for remote_ctl.py (contract
+    C4), returned as a one-element list to hand ssh as one argument.
+
+    It exports `AUTORESUME_STATE_DIR` (remote_ctl.py honors it) before invoking
+    the script, so a non-default `state_dir` points remote_ctl at the right
+    place. Every path is double-quoted so spaces in `state_dir`/`python` survive
+    the remote shell's word-splitting (audit M3), and a leading `~/` is rewritten
+    to `$HOME/` for remote-shell expansion.
+
+    Note: deploy_remote.sh only ever installs to `~/.claude-autoresume`, so a
+    host configured with a custom `state_dir` needs a matching manual deploy
+    there — this composition just makes the runtime calls address it correctly."""
+    state_dir = _resolve_state_dir(host["state_dir"])
+    script = f"{state_dir}/bin/remote_ctl.py"
+    python = host["python"]
+    extra_str = "".join(f" {tok}" for tok in extra)
+    command = (f'AUTORESUME_STATE_DIR="{state_dir}" '
+               f'"{python}" "{script}" {subcommand}{extra_str}')
+    return [command]
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +164,7 @@ def fetch_dump(host, transport, usage=False):
     dict on success, or None if the host is unreachable / the output is
     malformed (either counts as "unreachable this cycle" per C4)."""
     extra = ("--usage",) if usage else ()
-    argv = _remote_ctl_argv(host, "dump", *extra)
+    argv = _remote_ctl_command(host, "dump", *extra)
     try:
         rc, out, err = transport(host["ssh"], argv, None, REMOTE_SSH_TIMEOUT_SECONDS)
     except Exception as e:  # TimeoutExpired, OSError, anything the transport raises
@@ -160,7 +189,7 @@ def fetch_dump(host, transport, usage=False):
 def push_toggles(host, payload, transport):
     """Push a toggle delta via `remote_ctl.py apply-toggles` (JSON on stdin).
     Returns True only when the remote confirms `{"ok": true, …}`."""
-    argv = _remote_ctl_argv(host, "apply-toggles")
+    argv = _remote_ctl_command(host, "apply-toggles")
     body = json.dumps(payload)
     try:
         rc, out, err = transport(host["ssh"], argv, body, REMOTE_SSH_TIMEOUT_SECONDS)
@@ -291,7 +320,11 @@ def _drop_long_unreachable(state, host_name, mac_now):
 def _prune_removed_hosts(state_dir, host_names):
     """Delete state entries whose host is no longer present in config at all
     (the widget removed it). Configured-but-disabled hosts keep their entries
-    (frozen) so re-enabling doesn't lose them. Takes its own StateLock."""
+    (frozen) so re-enabling doesn't lose them. Takes its own StateLock.
+
+    Returns True if ANY `host::` entry still remains after the prune. The worker
+    uses this to decide whether it can take the idle early-out next tick (no
+    configured hosts AND nothing believed present ⇒ skip without the lock)."""
     with autoresume.StateLock():
         state = autoresume.load_state()
         removed = [k for k, e in state.items()
@@ -302,6 +335,8 @@ def _prune_removed_hosts(state_dir, host_names):
             del state[key]
         if removed:
             autoresume.save_state(state)
+        return any(isinstance(e, dict) and e.get("host") is not None
+                   for e in state.values())
 
 
 # ---------------------------------------------------------------------------
@@ -392,55 +427,89 @@ def has_enabled_hosts(state_dir) -> bool:
     return any(h.get("enabled") for h in cfg.get("remote_hosts", []))
 
 
+class _RemoteSyncLoop:
+    """Loop-carried state for the sync worker, factored out so a single tick is
+    unit-testable without driving the `while True`. `tick()` runs one scheduler
+    iteration (no sleep); `_remote_sync_worker` just constructs one of these and
+    calls `tick()` forever."""
+
+    def __init__(self, state_dir=None, transport=None):
+        if state_dir is None:
+            state_dir = autoresume.STATE_DIR
+        self.state_dir = Path(state_dir)
+        self.transport = transport or _default_transport
+        self.next_poll: dict = {}   # host name -> next epoch to run a state sync
+        self.next_usage: dict = {}  # host name -> next epoch to run a usage fetch
+        self.cfg = autoresume_config.load_config(self.state_dir)
+        self.last_mtime = autoresume_config.config_mtime(self.state_dir)
+        # Start believing entries MAY exist so the very first tick always runs
+        # the prune once — cleans up any `host::` leftovers from a config whose
+        # hosts were removed while the daemon was down, then latches to False.
+        self.believe_host_entries = True
+
+    def tick(self, now_fn=time.time):
+        """One scheduler iteration. Returns True if it did real work (serviced
+        hosts / pruned under StateLock), or False if it took the idle early-out
+        (no configured hosts AND no `host::` entry believed present) — in which
+        case StateLock was never acquired."""
+        mtime = autoresume_config.config_mtime(self.state_dir)
+        if mtime != self.last_mtime:
+            self.cfg = autoresume_config.load_config(self.state_dir)
+            self.last_mtime = mtime
+
+        hosts = self.cfg.get("remote_hosts", [])
+        host_names = {h["name"] for h in hosts}
+
+        # Finding 5: evict scheduler entries for hosts no longer in the config
+        # set (runs every tick, so it covers every config reload).
+        for sched in (self.next_poll, self.next_usage):
+            for name in [n for n in sched if n not in host_names]:
+                del sched[name]
+
+        # Finding 1: idle early-out. Nothing configured and nothing believed
+        # present ⇒ skip the whole tick without ever taking StateLock.
+        if not hosts and not self.believe_host_entries:
+            return False
+
+        now = now_fn()
+        for host in hosts:
+            if not host.get("enabled"):
+                continue
+            name = host["name"]
+            if now >= self.next_poll.get(name, 0.0):
+                self.next_poll[name] = now + host.get("poll_seconds", 30)
+                try:
+                    sync_host(host, self.state_dir, self.transport)
+                except Exception as e:
+                    autoresume.log(f"remote-sync: {name} sync cycle error: {e!r}")
+            if host.get("collect_usage") and now >= self.next_usage.get(name, 0.0):
+                self.next_usage[name] = now + USAGE_LANE_INTERVAL_SECONDS
+                try:
+                    fetch_host_usage(host, self.state_dir, self.transport)
+                except Exception as e:
+                    autoresume.log(f"remote-sync: {name} usage cycle error: {e!r}")
+
+        self.believe_host_entries = _prune_removed_hosts(self.state_dir, host_names)
+        return True
+
+
 def _remote_sync_worker(state_dir=None, transport=None):
-    """Daemon-thread entry point. Sequentially services each enabled remote host
-    on its own poll_seconds cadence (and each collect_usage host hourly),
-    re-reading config.json on mtime change so add/remove takes effect live."""
-    if state_dir is None:
-        state_dir = autoresume.STATE_DIR
-    state_dir = Path(state_dir)
-    transport = transport or _default_transport
-
-    next_poll: dict = {}   # host name -> next epoch to run a state sync
-    next_usage: dict = {}  # host name -> next epoch to run a usage fetch
-
-    cfg = autoresume_config.load_config(state_dir)
-    last_mtime = autoresume_config.config_mtime(state_dir)
-    autoresume.log(
-        f"remote-sync thread started ("
-        f"{sum(1 for h in cfg.get('remote_hosts', []) if h.get('enabled'))} enabled host(s))"
-    )
+    """Daemon-thread entry point. Always started by autoresume.main() (a host
+    the widget adds at runtime doesn't restart the daemon), and idle-cheap when
+    no host is configured. Sequentially services each enabled remote host on its
+    own poll_seconds cadence (and each collect_usage host hourly), re-reading
+    config.json on mtime change so add/remove takes effect live."""
+    loop = _RemoteSyncLoop(state_dir, transport)
+    enabled = sum(1 for h in loop.cfg.get("remote_hosts", []) if h.get("enabled"))
+    if enabled:
+        autoresume.log(f"remote-sync thread started ({enabled} enabled host(s))")
+    else:
+        autoresume.log("remote-sync thread started (no enabled remote hosts — "
+                       "idle until one is configured)")
 
     while True:
         try:
-            mtime = autoresume_config.config_mtime(state_dir)
-            if mtime != last_mtime:
-                cfg = autoresume_config.load_config(state_dir)
-                last_mtime = mtime
-
-            hosts = cfg.get("remote_hosts", [])
-            host_names = {h["name"] for h in hosts}
-            now = time.time()
-
-            for host in hosts:
-                if not host.get("enabled"):
-                    continue
-                name = host["name"]
-                if now >= next_poll.get(name, 0.0):
-                    next_poll[name] = now + host.get("poll_seconds", 30)
-                    try:
-                        sync_host(host, state_dir, transport)
-                    except Exception as e:
-                        autoresume.log(f"remote-sync: {name} sync cycle error: {e!r}")
-                if host.get("collect_usage") and now >= next_usage.get(name, 0.0):
-                    next_usage[name] = now + USAGE_LANE_INTERVAL_SECONDS
-                    try:
-                        fetch_host_usage(host, state_dir, transport)
-                    except Exception as e:
-                        autoresume.log(f"remote-sync: {name} usage cycle error: {e!r}")
-
-            _prune_removed_hosts(state_dir, host_names)
+            loop.tick()
         except Exception as e:  # a bad cycle must never kill the thread
             autoresume.log(f"remote-sync: worker cycle error: {e!r}")
-
         time.sleep(REMOTE_SYNC_TICK_SECONDS)

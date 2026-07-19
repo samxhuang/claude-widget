@@ -118,6 +118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // (not probe-measured like the other constants — a shorter panel here
     // just leaves a little slack, never clips), erring slightly tall.
     private let mainUsageRowHeight: CGFloat = 34
+    // Finding 5: the API "No budget set — open Settings" prompt is a single
+    // ~10pt-font line (~14pt tall), NOT a full mainUsageRowHeight row. When
+    // it replaces both percentage rows, only this much height is actually
+    // used, so apiRowCountDelta subtracts `2*mainUsageRowHeight - this`
+    // rather than a single whole row (which left ~20px of dead space).
+    private let apiNoBudgetPromptHeight: CGFloat = 14
     // Both sections are wrapped in a ScrollView, so these only need to cover
     // a handful of visible rows — the ScrollView absorbs any overflow rather
     // than the panel growing to fit every entry. Halved from their original
@@ -267,6 +273,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.chatsFetcher.refresh()
             self?.planFitModel.refresh()
             self?.graphModel.refresh()
+            // Finding 1: cheap mtime-guarded pick-up of an external config.json
+            // edit (Settings writes already publish live via ConfigStore).
+            self?.configStore.reloadIfChanged()
         }
         uiTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.model.tick()
@@ -336,6 +345,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.updatePanelSize()
             }
             .store(in: &cancellables)
+
+        // Finding 1: the Main tab's height (apiRowCountDelta) and mode
+        // (API budget bars vs. Max percentages) now key off the LIVE config,
+        // so a Settings change to the account type / budget must re-size the
+        // panel immediately — not wait for the next plan_fit.json refresh.
+        // AppConfig is Equatable, so ConfigStore only emits on a real change;
+        // updatePanelSize is idempotent regardless.
+        configStore.$config
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updatePanelSize()
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Finding 1: window-focus hook for picking up an external config.json
+    /// edit. For this accessory app this fires when the app is activated
+    /// (e.g. the Settings window is brought to front). mtime-guarded, so it's
+    /// a no-op when nothing changed.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        configStore.reloadIfChanged()
     }
 
     // MARK: - Status bar menu
@@ -532,7 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func setupOverlayPanel() {
         let initialHeight = currentPanelHeight()
 
-        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, cloudSessions: cloudSessionsModel, planFit: planFitModel, graph: graphModel, panelSize: panelSizeState, onExpandGraph: { [weak self] in
+        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, cloudSessions: cloudSessionsModel, planFit: planFitModel, graph: graphModel, configStore: configStore, panelSize: panelSizeState, onExpandGraph: { [weak self] in
             self?.presentGraphWindow()
         }, onResizeDrag: { [weak self] extra in
             self?.setUserExtraHeight(extra)
@@ -688,15 +718,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Max accounts (still two rows). For API accounts the top block is 1-2
     /// budget bars (or a single "No budget set" prompt), so this returns the
     /// height of the row(s) no longer present.
+    ///
+    /// Finding 1: gated on — and counted from — the LIVE config, not
+    /// `planFitModel.data` (regenerated at most hourly), so the panel resizes
+    /// the instant the account type / budget changes rather than up to an
+    /// hour later. Bar count is the number of configured periods; that matches
+    /// what mainTabContent renders (a real bar or a "calculating…" scaffold
+    /// bar per configured period).
     private func apiRowCountDelta() -> CGFloat {
-        guard let data = planFitModel.data, data.isApiAccount else { return 0 }
-        let barCount: Int
-        if data.hasBudget {
-            barCount = [data.budgetWeekly?.limitUsd, data.budgetMonthly?.limitUsd]
-                .compactMap { $0 }.count
-        } else {
-            // The single "No budget set — open Settings" line.
-            barCount = 1
+        guard configStore.config.isApiAccount else { return 0 }
+        let barCount = [configStore.config.weeklyUsd, configStore.config.monthlyUsd]
+            .compactMap { $0 }.count
+        if barCount == 0 {
+            // Finding 5: the no-budget case is a single ~14pt prompt line, not
+            // a full ~34pt row — subtracting one whole row (the old barCount=1
+            // path) left ~20px of dead space below it. Account for both
+            // percentage rows being gone and replaced by just that short line.
+            return 2 * mainUsageRowHeight - apiNoBudgetPromptHeight
         }
         return CGFloat(max(0, 2 - barCount)) * mainUsageRowHeight
     }

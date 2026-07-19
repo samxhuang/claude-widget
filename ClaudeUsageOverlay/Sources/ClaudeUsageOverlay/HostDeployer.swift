@@ -35,6 +35,10 @@ enum DeployStepStatus {
 struct DeployStep: Identifiable {
     let kind: DeployStepKind
     var status: DeployStepStatus
+    /// Finding 7: the displayed label is carried on the step rather than read
+    /// from `kind.label`, so the uninstall flow (which reuses `.service`) can
+    /// show "Remove service" instead of the deploy label "Install service".
+    var label: String
     var id: String { kind.rawValue }
 }
 
@@ -60,7 +64,7 @@ enum DeployPhase {
 /// leave disabled on failure).
 final class HostDeployer: ObservableObject {
     @Published var phase: DeployPhase = .idle
-    @Published var steps: [DeployStep] = DeployStepKind.allCases.map { DeployStep(kind: $0, status: .pending) }
+    @Published var steps: [DeployStep] = HostDeployer.initialSteps(uninstall: false)
     @Published var logText: String = ""
     /// The `@@FAIL:<reason>` short reason, or a synthesized one when the
     /// script couldn't be found / launched.
@@ -77,6 +81,24 @@ final class HostDeployer: ObservableObject {
     private var lineRemainder = ""
 
     var isRunning: Bool { phase == .running }
+
+    /// Finding 7: the checklist for the current run. Deploy runs all six
+    /// stages; `deploy_remote.sh --uninstall` only ever emits `@@STEP:connect`
+    /// then `@@STEP:service` then `@@OK`, so its checklist is just those two
+    /// (with `.service` relabeled "Remove service"). Showing the full six and
+    /// then ✓-ing python/copy/start/verify — which uninstall never runs — was
+    /// the reported bug.
+    private static func initialSteps(uninstall: Bool) -> [DeployStep] {
+        if uninstall {
+            return [
+                DeployStep(kind: .connect, status: .pending, label: DeployStepKind.connect.label),
+                DeployStep(kind: .service, status: .pending, label: "Remove service"),
+            ]
+        }
+        return DeployStepKind.allCases.map {
+            DeployStep(kind: $0, status: .pending, label: $0.label)
+        }
+    }
 
     // MARK: - Public entry points
 
@@ -98,7 +120,7 @@ final class HostDeployer: ObservableObject {
     private func run(target: String, uninstall: Bool, onComplete: @escaping (Bool, String?) -> Void) {
         // Reset per-run state.
         phase = .running
-        steps = DeployStepKind.allCases.map { DeployStep(kind: $0, status: .pending) }
+        steps = Self.initialSteps(uninstall: uninstall)
         logText = ""
         failReason = nil
         hints = []

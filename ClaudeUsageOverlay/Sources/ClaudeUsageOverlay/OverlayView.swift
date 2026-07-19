@@ -51,6 +51,17 @@ struct OverlayView: View {
     @ObservedObject var cloudSessions: CloudSessionsModel
     @ObservedObject var planFit: PlanFitModel
     @ObservedObject var graph: GraphModel
+    /// WS-2 finding 1: the live config.json store. The API-vs-Max mode switch
+    /// (dollar budget bars vs. Max session/weekly percentages) is gated on
+    /// THIS — the user's just-saved account type — not on `planFit.data`,
+    /// which is regenerated at most hourly and so lagged the UI by up to an
+    /// hour after a Settings change. The dollar NUMBERS still come from
+    /// `planFit.data`; config only decides which mode to render and, in the
+    /// transitional window (config flipped to API but plan_fit.json not yet
+    /// rewritten), drives a "calculating…" scaffold instead of falling back to
+    /// the Max bars. A missing/`"max"` config (no config.json) reads as Max ⇒
+    /// exactly the pre-WS-2 UI.
+    @ObservedObject var configStore: ConfigStore
     /// Item 2 (resizable panel): the panel's user-dragged "extra" height
     /// beyond its content-computed base — see AppDelegate.PanelSizeState's
     /// doc comment.
@@ -478,10 +489,16 @@ struct OverlayView: View {
         // are meaningless — swap in 1-2 dollar budget bars (reusing row(...)
         // so the projection dot / red-pinning / 70/90 thresholds all carry
         // over), or a "No budget set" prompt when none is configured. A
-        // missing/`"max"` account block (old daemon or Max plan) falls
+        // missing/`"max"` account block (no config.json or a Max plan) falls
         // through to exactly today's two percentage rows.
-        if let data = planFit.data, data.isApiAccount {
-            apiBudgetSection(data)
+        //
+        // Finding 1: gate on the LIVE config account type (republished the
+        // instant Settings writes it), not on `planFit.data.isApiAccount` —
+        // the latter is regenerated at most hourly, so the mode switch used
+        // to lag a Settings change by up to an hour. The dollar numbers still
+        // come from `planFit.data`; config only picks the mode.
+        if configStore.config.isApiAccount {
+            apiBudgetSection(planFit.data)
         } else {
             row(label: "Session (5h)", percent: model.sessionPercent, estimatedPercent: model.sessionEstimatedPercent, resetText: model.resetText(for: model.sessionResetsAt))
             // Item 2: the standalone "updated Xm" line is gone — folded onto the
@@ -508,14 +525,25 @@ struct OverlayView: View {
     /// when neither period is configured. `UsageFetcher` keeps running behind
     /// this regardless (it still feeds SnapshotLogger/the Graph tab) — only
     /// the display of its percentages is suppressed here.
+    ///
+    /// Finding 1: which periods to show comes from the LIVE config
+    /// (`weeklyUsd`/`monthlyUsd`), so it flips the instant the user sets a
+    /// budget — the dollar numbers come from `data` (plan_fit.json) once the
+    /// daemon has recomputed them. Transitional window (config has a budget
+    /// but plan_fit.json hasn't been regenerated with matching numbers yet):
+    /// show the bar scaffold with a muted "calculating…" rather than snapping
+    /// back to the Max percentage rows. `data` is nil when plan_fit.json
+    /// doesn't exist yet at all — same scaffold path.
     @ViewBuilder
-    private func apiBudgetSection(_ data: PlanFitData) -> some View {
-        if data.hasBudget {
-            if let w = data.budgetWeekly, w.limitUsd != nil {
-                budgetRow(label: "Weekly budget", window: w)
+    private func apiBudgetSection(_ data: PlanFitData?) -> some View {
+        let weeklyConfigured = configStore.config.weeklyUsd != nil
+        let monthlyConfigured = configStore.config.monthlyUsd != nil
+        if weeklyConfigured || monthlyConfigured {
+            if weeklyConfigured {
+                budgetRowOrScaffold(label: "Weekly budget", window: data?.budgetWeekly)
             }
-            if let m = data.budgetMonthly, m.limitUsd != nil {
-                budgetRow(label: "Monthly budget", window: m)
+            if monthlyConfigured {
+                budgetRowOrScaffold(label: "Monthly budget", window: data?.budgetMonthly)
             }
         } else {
             Button(action: onOpenSettings) {
@@ -530,6 +558,19 @@ struct OverlayView: View {
             }
             .buttonStyle(.plain)
             .help("Set a weekly or monthly dollar budget in Settings to show budget bars here")
+        }
+    }
+
+    /// Finding 1: a real budget bar once plan_fit.json carries this period's
+    /// numbers, otherwise the "calculating…" scaffold — an empty bar with the
+    /// period label, so the panel doesn't visibly flip modes while the daemon
+    /// catches up to a just-saved budget.
+    @ViewBuilder
+    private func budgetRowOrScaffold(label: String, window: BudgetWindow?) -> some View {
+        if let w = window, w.limitUsd != nil {
+            budgetRow(label: label, window: w)
+        } else {
+            row(label: label, percent: nil, resetText: "calculating…")
         }
     }
 
@@ -1189,7 +1230,12 @@ struct OverlayView: View {
         if entry.isRemote, let host = entry.host {
             let target = resolveHostSSH(host) ?? host
             let remoteId = entry.remoteId ?? entry.id
-            let command = "ssh -t \(target) 'cd \(entry.projectDir) && claude --resume \(remoteId)'"
+            // Finding 6: projectDir is interpolated inside a single-quoted
+            // shell word — a literal `'` in the path would otherwise close the
+            // quote early and produce a broken command. Escape via the
+            // standard '\'' technique (close quote, escaped quote, reopen).
+            let safeDir = entry.projectDir.replacingOccurrences(of: "'", with: "'\\''")
+            let command = "ssh -t \(target) 'cd \(safeDir) && claude --resume \(remoteId)'"
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(command, forType: .string)
