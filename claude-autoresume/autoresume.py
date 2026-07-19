@@ -124,6 +124,11 @@ ACTIVE_STALE_MINUTES = ACTIVE_WINDOW_MINUTES * 2
 # reliable signal is structural: an assistant turn's last content block is a
 # tool_use with no subsequent tool_result event.
 WORK_STATUS_RUNNING_WINDOW_SECONDS = 90
+# Tools whose entire purpose is to block on the human. A pending call to one
+# of these means "needs input" the moment it's issued — no quiet-window wait
+# (unlike ordinary tools, where a pending call usually just means the tool is
+# still executing).
+USER_INPUT_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
 
 def classify_work_status(objs: list[dict], mtime: float, now: float) -> str:
@@ -154,16 +159,19 @@ def classify_work_status(objs: list[dict], mtime: float, now: float) -> str:
     quiet for a while (WORK_STATUS_RUNNING_WINDOW_SECONDS) — a fresh pending
     tool_use just means a tool is still running (e.g. a slow Bash command or
     a subagent mid-flight), not that a human needs to approve anything.
-    """
-    if (now - mtime) <= WORK_STATUS_RUNNING_WINDOW_SECONDS:
-        return "running"
 
+    Exception: some tools exist purely to wait on the human (AskUserQuestion,
+    ExitPlanMode's plan-approval prompt). A pending call to one of those IS
+    the session asking for input — classify needs_input immediately, no
+    quiet-window wait.
+    """
     last_conv = None
     for obj in reversed(objs):
         if obj.get("type") in ("assistant", "user"):
             last_conv = obj
             break
 
+    pending_tool = None
     if last_conv is not None and last_conv.get("type") == "assistant":
         message = last_conv.get("message")
         content = message.get("content") if isinstance(message, dict) else None
@@ -173,8 +181,14 @@ def classify_work_status(objs: list[dict], mtime: float, now: float) -> str:
             and isinstance(content[-1], dict)
             and content[-1].get("type") == "tool_use"
         ):
-            return "needs_input"
+            pending_tool = content[-1].get("name") or ""
 
+    if pending_tool in USER_INPUT_TOOLS:
+        return "needs_input"
+    if (now - mtime) <= WORK_STATUS_RUNNING_WINDOW_SECONDS:
+        return "running"
+    if pending_tool is not None:
+        return "needs_input"
     return "idle"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
