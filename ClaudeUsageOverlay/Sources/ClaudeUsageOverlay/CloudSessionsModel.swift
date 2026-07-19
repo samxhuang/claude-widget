@@ -120,6 +120,19 @@ final class CloudSessionsModel: ObservableObject {
         let cutoff = Date().addingTimeInterval(-Self.lookbackWindow)
         let parsed: [CloudSessionEntry] = raw.compactMap { dict in
             guard let id = dict["id"] as? String, !id.isEmpty, !localIds.contains(id) else { return nil }
+            // Cloud echo of a locally-tracked CLI session: claude.ai's
+            // server-side record for a Desktop-attached CLI session carries a
+            // "local_" prefix on the transcript uuid (same convention as the
+            // deep-link imports — see openLocalSession's history), while the
+            // daemon keys the local entry by the bare uuid. Without stripping
+            // the prefix here the echo dodges the id dedupe, and the title
+            // dedupe can't catch it either (claude.ai titles the synced copy
+            // itself, so the two titles differ). Cowork rows are unaffected:
+            // they're tracked locally under the local_-prefixed id already,
+            // so they match on the plain contains() above.
+            if id.hasPrefix("local_"), localIds.contains(String(id.dropFirst("local_".count))) {
+                return nil
+            }
             let title = dict["title"] as? String ?? ""
             let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             // S5(b): only treat a title match as a dedupe signal when the title
