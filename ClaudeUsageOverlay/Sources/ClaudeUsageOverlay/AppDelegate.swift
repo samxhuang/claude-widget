@@ -36,6 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Item 3 amendment: cloud sessions' own 30s cadence — see
     /// cloudSessionsModel's doc comment above.
     private var cloudSessionsTimer: Timer?
+    // See startStateFileWatcher() — push-style refresh on state.json writes.
+    private var stateDirWatcher: DispatchSourceFileSystemObject?
+    private var stateWatchDebounce: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
 
     // Panel sizing: fixed width, height computed from which of the three
@@ -195,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.sessionsModel.tick()
             self?.sessionsModel.refresh()
         }
+        startStateFileWatcher()
 
         // Item 3 amendment: cloud sessions' own 30s lane — a dedicated
         // /recents-only JS round-trip (ChatsFetcher.refreshRecentsOnly(),
@@ -239,6 +243,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Status bar menu
+
+    /// Latency fix: state.json is replaced atomically (tmp + rename) by the
+    /// daemon, so instead of waiting for the next 10s poll tick, watch the
+    /// state DIRECTORY for writes (a rename into a directory is a directory
+    /// write; watching the file's own descriptor would go stale after the
+    /// first replace) and refresh immediately. The 10s timer stays as the
+    /// fallback and for age-label ticking; this just makes status changes
+    /// (running -> needs input) land in the panel the moment the daemon
+    /// publishes them. Debounced 200ms so a burst of writes coalesces.
+    private func startStateFileWatcher() {
+        let dirPath = (NSHomeDirectory() as NSString).appendingPathComponent(".claude-autoresume")
+        let fd = open(dirPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: .write, queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.stateWatchDebounce?.cancel()
+            let work = DispatchWorkItem {
+                self?.sessionsModel.tick()
+                self?.sessionsModel.refresh()
+            }
+            self?.stateWatchDebounce = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+        }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        stateDirWatcher = source
+    }
 
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
