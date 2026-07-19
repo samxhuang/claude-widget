@@ -174,6 +174,48 @@ class TierRescalingTests(TempStateDirTestCase):
         self.assertFalse(verdict["plans"]["max_5x"]["viable"])
         self.assertTrue(verdict["plans"]["max_20x"]["viable"])
 
+    def test_projection_baseline_follows_configured_plan(self):
+        # Observed percentages are relative to the CONFIGURED plan's caps, not
+        # a hardcoded Max-20x baseline: 80% observed on Pro is 80% of Pro's
+        # cap, which projects to 16%/4% on Max 5x/20x (factor = 1/mult), and
+        # the identity projection is the pro row itself.
+        rows = [{
+            "ts_start": "2026-07-01T00:00:00+00:00",
+            "n": 10,
+            "five_hour": {"min": 10, "max": 80, "avg": 40, "last": 50},
+            "seven_day": {"min": 5, "max": 60, "avg": 30, "last": 40},
+        }]
+        _write_jsonl(self.usage_dir / "snapshots_1h.jsonl", rows)
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+
+        proj = result["tier_projection"]
+        # pro: identity (factor 1/1)
+        self.assertAlmostEqual(proj["pro"]["peak_five_hour_pct"], 80.0, places=1)
+        self.assertFalse(proj["pro"]["would_hit_cap"])
+        # max_5x: factor 1/5
+        self.assertAlmostEqual(proj["max_5x"]["peak_five_hour_pct"], 16.0, places=1)
+        # max_20x: factor 1/20
+        self.assertAlmostEqual(proj["max_20x"]["peak_five_hour_pct"], 4.0, places=1)
+        # Pro fits, so the verdict should call the current plan sufficient.
+        self.assertTrue(result["verdict"]["plans"]["pro"]["viable"])
+        self.assertIn("current plan", result["verdict"]["recommendation"])
+
+    def test_projection_unknown_plan_falls_back_to_default_baseline(self):
+        # An unrecognized plan string (hand-edited config) must not crash the
+        # analytics path — it degrades to the Max-20x default baseline.
+        observed = {
+            "five_hour": {"peak_pct": 40.0, "avg_pct": 25.0},
+            "seven_day": {"peak_pct": 20.0, "avg_pct": 15.0},
+        }
+        proj = plan_fit._tier_projection(observed, current_plan="enterprise_9000")
+        self.assertAlmostEqual(proj["pro"]["peak_five_hour_pct"], 800.0, places=1)
+        self.assertAlmostEqual(proj["max_20x"]["peak_five_hour_pct"], 40.0, places=1)
+
     def test_merge_prefers_raw_over_overlapping_bucket(self):
         # Same timestamp appears in both the raw store and an hourly bucket;
         # the bucket's (much higher) max/avg must NOT be double-counted

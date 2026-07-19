@@ -16,11 +16,12 @@ file: ~/.claude-autoresume/usage/plan_fit.json. That file is consumed by
 the Swift menu-bar widget, so its shape is meant to stay flat and stable.
 
 Utilization numbers in the snapshots stores are official, server-reported
-percentages measured against whatever plan is *currently* active — right
-now that's Max 20x (CURRENT_PLAN below). "Tier rescaling" projects what
-those same percentages would have been on a smaller plan, since the caps
-scale linearly with the plan's multiplier (Pro=1x, Max 5x=5x, Max
-20x=20x): observed_utilization × (20 / tier_multiplier).
+percentages measured against whatever plan is *currently* active — i.e.
+the configured account plan (config["account"]["plan"], default
+CURRENT_PLAN below). "Tier rescaling" projects what those same
+percentages would have been on another plan, since the caps scale
+linearly with the plan's multiplier (Pro=1x, Max 5x=5x, Max 20x=20x):
+observed_utilization × (current_multiplier / tier_multiplier).
 
 Pricing layer
 -------------
@@ -807,10 +808,21 @@ def _utilization_observed(points: list[dict]) -> dict:
 # Tier rescaling + verdict
 # ---------------------------------------------------------------------------
 
-def _tier_projection(observed: dict) -> dict:
+def _tier_projection(observed: dict, current_plan: str = CURRENT_PLAN) -> dict:
+    """Rescale observed utilization onto every tier.
+
+    The observed percentages are measured against the *current* plan's caps
+    (the usage endpoint reports utilization of whatever plan the account
+    actually has), so the baseline multiplier must be the configured plan's —
+    a hardcoded 20.0 here silently assumed Max 20x and produced projections
+    off by current/20x for anyone on Pro or Max 5x once the plan became
+    user-configurable. Unknown plan strings fall back to the Max-20x baseline
+    rather than crashing the analytics thread.
+    """
+    current_mult = float(TIER_MULTIPLIERS.get(current_plan, TIER_MULTIPLIERS[CURRENT_PLAN]))
     projection = {}
     for tier, mult in TIER_MULTIPLIERS.items():
-        factor = 20.0 / mult
+        factor = current_mult / mult
         peak_5h = observed["five_hour"]["peak_pct"]
         peak_7d = observed["seven_day"]["peak_pct"]
         avg_5h = observed["five_hour"]["avg_pct"]
@@ -1112,7 +1124,7 @@ def compute(state_dir: Path, now: datetime) -> dict:
     merged_points = _merge_utilization_points(raw_rows, bucket15_rows, bucket1h_rows)
     utilization_observed = _utilization_observed(merged_points)
 
-    tier_projection = _tier_projection(utilization_observed)
+    tier_projection = _tier_projection(utilization_observed, current_plan)
 
     widest_window = MA_WINDOWS_DAYS[-1]
     days_covered_widest = moving_averages[f"{widest_window}d"]["days_covered"]
