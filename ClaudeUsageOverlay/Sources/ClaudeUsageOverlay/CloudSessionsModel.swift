@@ -103,10 +103,28 @@ final class CloudSessionsModel: ObservableObject {
             // age out of the list rather than lingering for days. Unparseable
             // dates are treated as stale, not shown forever.
             guard let updated = updatedAt, updated >= cutoff else { return nil }
+            let rawStatus = (dict["status"] as? String)?.trimmingCharacters(in: .whitespaces).lowercased()
             let workStatus = Self.mapWorkStatus(
                 status: dict["status"] as? String,
                 workerStatus: dict["worker_status"] as? String
             )
+            // Deleted-session fix (2026-07-19): deleting a session in Claude
+            // Desktop's GUI archives its cloud copy rather than removing it
+            // from /recents right away, so a deleted session would linger
+            // here as a phantom "cloud session" row (reported against a
+            // deleted Code session that popped back up under its old cloud
+            // title). Live per-item dump of all 13 /recents items at the
+            // time: every dead/deleted item was status=archived with an
+            // idle worker, while every genuinely-live session was either
+            // status=active (visible in Desktop's sidebar) or had a
+            // running worker (archived+running — Desktop auto-archive with
+            // the worker still going, which must stay visible). So:
+            // archived + no live/needs-input worker = not a real session
+            // anymore, drop it. (This also filters the cloud echoes of the
+            // duplicate "General coding session" imports the old deep-link
+            // click behavior created — see OverlayView.openLocalSession —
+            // after those dups are deleted.)
+            if rawStatus == "archived" && workStatus == .idle { return nil }
             return CloudSessionEntry(id: id, title: title, updatedAt: updated, workStatus: workStatus)
         }
         // Newest-first: /recents already comes back sorted this way, but

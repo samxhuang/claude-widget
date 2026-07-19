@@ -51,6 +51,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var stateDirWatcher: DispatchSourceFileSystemObject?
     private var stateWatchDebounce: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
+    /// Bug fix (move+resize firing together): the panel's frame origin at
+    /// the moment the current title-bar drag began — nil when no drag is in
+    /// progress. Mirrors resizeHandle's `dragStartExtra` pattern: OverlayView's
+    /// MoveHandleView reports a CUMULATIVE screen-space delta since its own
+    /// mouseDown (see its doc comment for why that's measured in raw
+    /// `NSEvent.mouseLocation` rather than a SwiftUI DragGesture), so this is
+    /// what turns that cumulative delta into an absolute target origin
+    /// instead of drifting from repeated small additions.
+    private var moveDragStartOrigin: NSPoint?
 
     // Panel sizing: fixed width, height computed from which tab is showing
     // and, on the Main tab, whether Sessions (now inclusive of chat rows —
@@ -143,10 +152,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// always has a live object to observe from the very first frame,
     /// seeded from whatever extra height the user last dragged in (0 if
     /// never resized, or on first launch).
+    ///
+    /// Item 2 bug fix: no `max(0, ...)` clamp anymore — a negative extra
+    /// (shrunk below default) is now valid, and this closure runs before
+    /// `self` exists, so it has no access to `minimumContentHeight()` to
+    /// clamp against anyway. The raw persisted value loads as-is;
+    /// `currentPanelHeight()` (called moments later from
+    /// setupOverlayPanel, with full instance context available) is what
+    /// actually clamps it against the real floor/ceiling before the panel
+    /// is ever sized.
     private let panelSizeState: PanelSizeState = {
         let state = PanelSizeState()
         let saved = UserDefaults.standard.double(forKey: AppDelegate.userExtraHeightDefaultsKey)
-        state.userExtraHeight = max(0, CGFloat(saved))
+        state.userExtraHeight = CGFloat(saved)
         return state
     }()
 
@@ -419,6 +437,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, cloudSessions: cloudSessionsModel, planFit: planFitModel, graph: graphModel, panelSize: panelSizeState, onExpandGraph: { [weak self] in
             self?.presentGraphWindow()
+        }, onResizeDrag: { [weak self] extra in
+            self?.setUserExtraHeight(extra)
+        }, onMoveDragChanged: { [weak self] cumulativeDelta in
+            self?.moveWindow(cumulativeScreenDelta: cumulativeDelta)
+        }, onMoveDragEnded: { [weak self] in
+            self?.moveDragStartOrigin = nil
         }))
         // Without this, NSHostingView installs Auto Layout min/max-size
         // constraints on itself (macOS 13+ default: .standardBounds) that
@@ -432,12 +456,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hosting.sizingOptions = []
         hosting.frame = NSRect(x: 0, y: 0, width: panelWidth, height: initialHeight)
 
-        // Item 2: `.resizable` lets the user drag the panel's bottom edge
-        // (or a corner — width is pinned via minSize/maxSize below, so any
-        // drag only ever changes height) to show more Sessions rows at
-        // once. See applyResizeConstraints/windowDidResize for the
-        // min/max-height plumbing and currentPanelHeight()'s doc comment
-        // for how the resulting extra height flows into the SwiftUI view.
+        // Item 2 bug fix: `.resizable` alone does nothing here — a
+        // *borderless* NSWindow/NSPanel has no NSThemeFrame border to
+        // hit-test against, so AppKit never starts an edge/corner drag no
+        // matter what's in styleMask (this is a longstanding AppKit
+        // limitation, not something ever configured wrong here). Verified by
+        // the user reporting drag-to-resize simply did nothing. `.resizable`
+        // is left in the mask (harmless) but the actual resizing is now
+        // driven entirely by OverlayView's own resizeHandle view (a visible
+        // grab strip at the panel's bottom edge) via the onResizeDrag
+        // closure below -> setUserExtraHeight. minSize/maxSize below still
+        // exist to bound that manual resize's screen-visible-height ceiling.
+        // See applyResizeConstraints/setUserExtraHeight for the min/max
+        // plumbing and currentPanelHeight()'s doc comment for how the
+        // resulting extra height flows into the SwiftUI view.
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: initialHeight),
             styleMask: [.borderless, .nonactivatingPanel, .resizable],
@@ -449,7 +481,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.hasShadow = true
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        panel.isMovableByWindowBackground = true
+        // Bug fix (move+resize firing together): this was `true`, making the
+        // ENTIRE panel background drag-to-move — including the resize
+        // handle's own region, which raced AppKit's window-background-move
+        // against OverlayView's ResizeHandleView mouse tracking on the same
+        // gesture. Moving is now handled exclusively by OverlayView's own
+        // title-bar drag region (MoveHandleView, mirroring the resize
+        // handle's native mouse-tracking approach) via
+        // onMoveDragChanged/onMoveDragEnded above, so this stays false and
+        // dragging anywhere else on the panel does nothing at all — matching
+        // the ask: move only from the title bar, resize only from the
+        // bottom edge.
+        panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.contentView = hosting
         // NSWindowDelegate: windowDidResize below is what turns a live user
@@ -469,31 +512,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// Item 2: width is fixed (min == max == panelWidth, so a drag can only
-    /// ever change height); height's floor is whatever the CURRENT tab's
-    /// content actually needs (`computedContentHeight()`, i.e. without any
-    /// user extra) so a resize can never clip content, and its ceiling is
-    /// the screen's visible height. Re-applied from updatePanelSize()
-    /// whenever the floor might have changed (tab switch, section
-    /// expand/collapse) — not just once at launch — since minSize is a
-    /// hard AppKit constraint that would otherwise still reflect the old
-    /// tab/section's requirements.
+    /// ever change height); height's floor is `minimumContentHeight()` (see
+    /// its doc comment — NOT the same as the tab's default size) and its
+    /// ceiling is the screen's visible height. Re-applied from
+    /// updatePanelSize() whenever the floor might have changed (tab switch,
+    /// section expand/collapse) — not just once at launch — since minSize
+    /// is a hard AppKit constraint that would otherwise still reflect the
+    /// old tab/section's requirements. (These no longer gate the actual
+    /// manual-drag resize path — see setUserExtraHeight — but are kept
+    /// correct in case AppKit ever exercises them itself, e.g. window
+    /// zoom/fullscreen.)
     private func applyResizeConstraints(to panel: NSPanel) {
-        let minHeight = computedContentHeight()
+        let minHeight = minimumContentHeight()
         let screenHeight = (panel.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame.height ?? 2000
         panel.minSize = NSSize(width: panelWidth, height: minHeight)
         panel.maxSize = NSSize(width: panelWidth, height: max(minHeight, screenHeight))
     }
 
-    /// Reflects `panelPositionLocked` onto the live panel. Both `isMovable`
-    /// (blocks programmatic/title-bar-style moves) and
-    /// `isMovableByWindowBackground` (blocks the click-drag-anywhere
-    /// behavior this borderless panel relies on day to day) are set
-    /// together since either alone wouldn't fully prevent an accidental
-    /// drag. Defaults to unlocked, so out of the box nothing changes.
+    /// Reflects `panelPositionLocked` onto the live panel. `isMovable` is
+    /// kept in sync for any AppKit-native move machinery that might consult
+    /// it (Mission Control, accessibility), but the actual enforcement for
+    /// our own move path is the `!panelPositionLocked` guard inside
+    /// `moveWindow(cumulativeScreenDelta:)` — `isMovableByWindowBackground`
+    /// is no longer part of this at all (see setupOverlayPanel's comment on
+    /// why it's permanently `false` now). Defaults to unlocked, so out of
+    /// the box nothing changes.
     private func applyPanelLockState() {
         guard let panel = overlayPanel else { return }
         panel.isMovable = !panelPositionLocked
-        panel.isMovableByWindowBackground = !panelPositionLocked
     }
 
     /// The panel's very first frame, placed at the top-right of the main
@@ -534,16 +580,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    /// Item 2 bug fix: the smallest height a manual drag can shrink the
+    /// panel to — distinct from `computedContentHeight()`, which is the
+    /// tab's *default* (non-dragged) size. Before this fix the resize floor
+    /// WAS `computedContentHeight()`, i.e. identical to the default size, so
+    /// dragging could only ever grow the panel — shrinking below where you
+    /// started was impossible (reported: wanting to shrink down to ~1.5
+    /// session rows). On the Main tab with Sessions expanded, this swaps in
+    /// `SectionLayout.sessionsMinContentHeight` for the full
+    /// `sessionsExpandedExtra`; every other case (Graph/Plan fit, or Main
+    /// with Sessions collapsed) has no shrinkable content, so it's identical
+    /// to `computedContentHeight()`.
+    private func minimumContentHeight() -> CGFloat {
+        guard graphModel.selectedTab == .main, sessionsModel.sessionsExpanded else {
+            return computedContentHeight()
+        }
+        return collapsedPanelHeight + SectionLayout.sessionsMinContentHeight + SectionLayout.siblingSpacing
+    }
+
     /// Item 2: `computedContentHeight()` plus however much extra height the
     /// user has dragged the panel to on the Main tab (see
     /// `PanelSizeState`/`windowDidResize`) — the Sessions ScrollView is the
     /// only thing that can absorb that extra space (OverlayView adds it to
     /// `SectionLayout.sessionsContentHeight`), so it only applies there; the
     /// Graph/Plan fit tabs always get exactly their fixed content height.
+    /// `userExtraHeight` can be negative now (shrinking below the default —
+    /// see minimumContentHeight()'s doc comment), so this is clamped to
+    /// never go below the floor regardless of what's currently published.
+    ///
+    /// Bug fix (handle "floating" mid-window): this used to only guard on
+    /// the Main tab, not on Sessions actually being expanded — so with
+    /// Sessions collapsed, a nonzero `userExtraHeight` (e.g. persisted from
+    /// an earlier drag) still inflated the window past its content, since
+    /// nothing in OverlayView absorbs that extra when the Sessions
+    /// ScrollView isn't even rendered. The window grew but the visible card
+    /// stayed at its short collapsed height, leaving the resize handle
+    /// (bottom-anchored to the window, not the card) stranded over blank
+    /// space instead of flush against the card's visible bottom edge.
+    /// `minimumContentHeight()` already had this exact double guard — this
+    /// just brings currentPanelHeight() in line with it.
     private func currentPanelHeight() -> CGFloat {
         let base = computedContentHeight()
-        guard graphModel.selectedTab == .main else { return base }
-        return base + panelSizeState.userExtraHeight
+        guard graphModel.selectedTab == .main, sessionsModel.sessionsExpanded else { return base }
+        return max(minimumContentHeight(), base + panelSizeState.userExtraHeight)
     }
 
     /// Item 1 fix: resizes the panel while preserving its TOP-RIGHT corner,
@@ -593,29 +672,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.setFrame(newFrame, display: true, animate: false)
     }
 
+    /// Item 2 bug fix: the actual entry point for user-driven resizing now
+    /// that native edge-drag doesn't exist for a borderless panel (see
+    /// setupOverlayPanel's styleMask comment) — OverlayView's resizeHandle
+    /// calls this with the *absolute* extra height its drag gesture wants
+    /// (drag-start extra + cumulative delta), and this clamps it to
+    /// [minimumContentHeight() - base, screen-visible-height - base],
+    /// publishes it (so the Sessions ScrollView resizes live), persists it,
+    /// and resizes the real NSPanel frame. Only meaningful on the Main tab —
+    /// resizeHandle only renders there — but clamps against
+    /// `computedContentHeight()`/`minimumContentHeight()` regardless of tab
+    /// so a stray call elsewhere can't misbehave.
+    ///
+    /// Item 2 bug fix: `extra` can now be negative — the floor used to be
+    /// `0` (i.e. never smaller than the tab's default size), which is why
+    /// the panel could only ever grow from a drag, never shrink below where
+    /// it started.
+    private func setUserExtraHeight(_ extra: CGFloat) {
+        guard sessionsModel.sessionsExpanded, let panel = overlayPanel else { return }
+        let base = computedContentHeight()
+        let screenHeight = (panel.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame.height ?? 2000
+        let minExtra = minimumContentHeight() - base
+        let maxExtra = max(minExtra, screenHeight - base)
+        let clamped = min(max(minExtra, extra), maxExtra)
+        guard abs(clamped - panelSizeState.userExtraHeight) > 0.01 else { return }
+        panelSizeState.userExtraHeight = clamped
+        UserDefaults.standard.set(Double(clamped), forKey: Self.userExtraHeightDefaultsKey)
+        updatePanelSize()
+    }
+
+    /// Bug fix (move+resize firing together, and moving from anywhere on the
+    /// panel): the panel's move path now that `isMovableByWindowBackground`
+    /// is permanently off (see setupOverlayPanel) — OverlayView's
+    /// MoveHandleView, scoped to just the title row (not the tab pills, not
+    /// the rest of the card), calls this with the cumulative screen-space
+    /// delta since its own mouseDown. `panelPositionLocked` is checked here
+    /// directly (not via `isMovable`) since that's the actual source of
+    /// truth `toggleLockPosition` writes to. Origin is captured lazily on
+    /// the first delta of a drag and cleared by `onMoveDragEnded` (wired in
+    /// setupOverlayPanel) rather than here, so a drag that starts while
+    /// locked and is unlocked mid-drag doesn't jump using a stale origin.
+    private func moveWindow(cumulativeScreenDelta: CGSize) {
+        guard !panelPositionLocked, let panel = overlayPanel else { return }
+        if moveDragStartOrigin == nil {
+            moveDragStartOrigin = panel.frame.origin
+        }
+        guard let start = moveDragStartOrigin else { return }
+        let newOrigin = NSPoint(x: start.x + cumulativeScreenDelta.width, y: start.y + cumulativeScreenDelta.height)
+        panel.setFrame(NSRect(origin: newOrigin, size: panel.frame.size), display: true, animate: false)
+    }
+
     // MARK: - NSWindowDelegate (item 2: user-resizable panel height)
 
-    /// Fires continuously while the user drags the panel's resizable bottom
-    /// edge (width can't change — minSize.width == maxSize.width — so every
-    /// live resize is purely a height change), AND once for each of our own
-    /// programmatic `setFrame` calls (`updatePanelSize`, `snapToTopRight`).
-    /// The `abs(...) > 0.5` guard is what keeps those programmatic
-    /// round-trips from perturbing the persisted value: a programmatic
+    /// Historically this was the only path from a user drag to
+    /// `panelSizeState` (back when the panel's styleMask was expected to
+    /// support native edge-drag resize). It doesn't — see setupOverlayPanel's
+    /// styleMask comment — so `setUserExtraHeight` above is the real path
+    /// now. This delegate method still fires for our own programmatic
+    /// `setFrame` calls (`updatePanelSize`, `snapToTopRight`), but the
+    /// `abs(...) > 0.5` guard makes it a no-op for those: a programmatic
     /// resize always sets `frame.height = computedContentHeight() +
-    /// panelSizeState.userExtraHeight` (see `currentPanelHeight()`), so
-    /// recomputing `extra` from the resulting frame lands back on the same
-    /// value modulo floating-point noise, rather than double-counting it.
+    /// panelSizeState.userExtraHeight`, so recomputing `extra` from the
+    /// resulting frame lands back on the same value modulo floating-point
+    /// noise. Left in place as a harmless safety net rather than removed.
     ///
-    /// Only the Main tab has anywhere to put extra height (the Sessions
-    /// ScrollView — see OverlayView's `panelSize.userExtraHeight` use) and
-    /// its minSize == maxSize on the Graph/Plan fit tabs make those
-    /// effectively non-resizable, so this early-returns there rather than
-    /// recording a meaningless "extra" against those tabs' fixed height.
+    /// Item 2 bug fix: no longer `max(0, ...)` — `userExtraHeight` can be
+    /// negative now (shrinking below the tab's default size, see
+    /// minimumContentHeight()'s doc comment), and clamping this recomputed
+    /// value to 0 was fighting every shrink: after setUserExtraHeight set a
+    /// negative extra and resized the frame, this would recompute `extra` as
+    /// 0 (clamped), see it differed from the real negative value, and
+    /// immediately snap `panelSizeState.userExtraHeight` back to 0 — the
+    /// panel visibly bouncing back to default the instant you shrank it.
     func windowDidResize(_ notification: Notification) {
         guard let panel = notification.object as? NSPanel, panel === overlayPanel else { return }
-        guard graphModel.selectedTab == .main else { return }
+        guard graphModel.selectedTab == .main, sessionsModel.sessionsExpanded else { return }
         let base = computedContentHeight()
-        let extra = max(0, panel.frame.height - base)
+        let extra = panel.frame.height - base
         guard abs(extra - panelSizeState.userExtraHeight) > 0.5 else { return }
         panelSizeState.userExtraHeight = extra
         UserDefaults.standard.set(Double(extra), forKey: Self.userExtraHeightDefaultsKey)

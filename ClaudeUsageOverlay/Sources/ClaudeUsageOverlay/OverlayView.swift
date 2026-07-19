@@ -29,6 +29,17 @@ enum SectionLayout {
     /// OverlayView.body's outer `VStack(spacing: 8)`.
     static let siblingSpacing: CGFloat = 8
     static let sessionsContentHeight: CGFloat = 220
+    /// Item 2 bug fix: the smallest the user can manually shrink the
+    /// Sessions ScrollView to via resizeHandle — enough for one full row
+    /// plus roughly half of the next (a session row is ~31pt: 4pt v-padding
+    /// + a ~12pt title line + 1pt spacing + a ~10pt subtitle line + 4pt
+    /// v-padding, with a 6pt VStack gap between rows), signaling there's
+    /// more to scroll/resize into rather than hard-cropping mid-row.
+    /// Distinct from `sessionsContentHeight` above, which stays the
+    /// *default* (non-dragged) size — before this fix the resize floor was
+    /// wrongly pinned to that same default, so dragging could only grow the
+    /// panel, never shrink it below its starting size.
+    static let sessionsMinContentHeight: CGFloat = 54
 }
 
 struct OverlayView: View {
@@ -42,12 +53,33 @@ struct OverlayView: View {
     @ObservedObject var graph: GraphModel
     /// Item 2 (resizable panel): the panel's user-dragged "extra" height
     /// beyond its content-computed base — see AppDelegate.PanelSizeState's
-    /// doc comment. Read by sessionsSection to grow the Sessions ScrollView
-    /// live as the user resizes.
-    @ObservedObject var panelSize: PanelSizeState
+    /// doc comment.
+    ///
+    /// Item 2 stutter fix: deliberately NOT `@ObservedObject` here. That was
+    /// the actual cause of the reported drag stutter — with it observed at
+    /// this (OverlayView) level, EVERY published change (i.e. every single
+    /// mouseDragged tick, dozens/sec) invalidated this view's entire `body`,
+    /// which re-runs `combinedSessionRows`' full sort on every pixel of
+    /// drag. Held as a plain reference instead; only
+    /// `ResizableSessionsHeight` below (a dedicated leaf view) subscribes to
+    /// it, so a live drag only ever re-diffs that one small subtree.
+    let panelSize: PanelSizeState
     /// Opens the larger, resizable graph window (item 3) — forwarded down to
     /// GraphView's expand button.
     var onExpandGraph: () -> Void = {}
+    /// Item 2 bug fix: called with the *absolute* extra height resizeHandle's
+    /// drag gesture wants (not a delta) — AppDelegate.setUserExtraHeight
+    /// clamps and applies it to both `panelSize` and the real NSPanel frame.
+    /// See setupOverlayPanel's styleMask comment for why this exists at all
+    /// (borderless panels don't get native edge-drag resize).
+    var onResizeDrag: (CGFloat) -> Void = { _ in }
+    /// Bug fix (move+resize firing together): called with the CUMULATIVE
+    /// screen-space delta since titleBarDragArea's own mouseDown (see
+    /// MoveHandleView's doc comment) — AppDelegate.moveWindow turns that
+    /// into an absolute target origin. `onMoveDragEnded` clears
+    /// AppDelegate's drag-start bookkeeping.
+    var onMoveDragChanged: (CGSize) -> Void = { _ in }
+    var onMoveDragEnded: () -> Void = {}
 
     /// Sort-deadband state (see combinedSessionRows): an ordered list of row
     /// ids from the last computed arrangement, used as the tiebreak below.
@@ -58,6 +90,12 @@ struct OverlayView: View {
     /// models above do that), which is exactly what's wanted here: this is
     /// a derived cache, not source-of-truth state.
     @State private var sessionOrderMemory = SessionOrderMemory()
+    /// Item 2 bug fix: the extra height at the moment the current resize
+    /// drag began, captured on the gesture's first `onChanged` and cleared
+    /// on `onEnded` — DragGesture's `translation` is cumulative from
+    /// gesture-start, not a per-event delta, so this is what turns that
+    /// cumulative translation into an absolute target height.
+    @State private var dragStartExtra: CGFloat?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -66,20 +104,41 @@ struct OverlayView: View {
             // (right-aligned, title left) to reclaim that row's height for
             // an always-on-top panel where vertical economy is the point.
             HStack {
-                Text("Claude Usage")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.9))
-                Spacer()
-                if model.isLoggedOut {
-                    Text("Sign in needed")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(.orange)
-                } else if let err = model.lastError {
-                    Text(err)
-                        .font(.system(size: 9))
-                        .foregroundColor(.red.opacity(0.85))
-                        .lineLimit(1)
+                // Bug fix (drag-anywhere-moves, and racing the resize
+                // handle): this used to move the whole panel via
+                // `isMovableByWindowBackground` on ANY background drag. Now
+                // only this title/spacer/error region is a drag-to-move
+                // target — scoped by putting MoveHandleRepresentable behind
+                // just these views in their own ZStack, as a sibling to
+                // tabSwitch rather than wrapping it, so the tab pills' own
+                // tap gestures are entirely untouched.
+                // Bug fix (click-hijack): this used to be a ZStack with
+                // MoveHandleRepresentable as an unconstrained peer — with no
+                // `.frame()` of its own, a plain NSViewRepresentable has no
+                // size opinion and simply accepts whatever's proposed to it,
+                // which (via the outer VStack's later
+                // `.frame(maxWidth:.infinity, maxHeight:.infinity)`) could be
+                // the ENTIRE window. `.background()` instead proposes
+                // exactly this HStack's own resolved size to the
+                // representable, so it can never be bigger than the visible
+                // title text/spacer region it's meant to scope to.
+                HStack {
+                    Text("Claude Usage")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                    Spacer()
+                    if model.isLoggedOut {
+                        Text("Sign in needed")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(.orange)
+                    } else if let err = model.lastError {
+                        Text(err)
+                            .font(.system(size: 9))
+                            .foregroundColor(.red.opacity(0.85))
+                            .lineLimit(1)
+                    }
                 }
+                .background(MoveHandleRepresentable(onDragChanged: onMoveDragChanged, onDragEnded: onMoveDragEnded))
                 tabSwitch
             }
 
@@ -107,6 +166,216 @@ struct OverlayView: View {
         // Pin it to the top so it stays flush with the anchored top edge
         // instead of SwiftUI centering it in the leftover space.
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // Item 2 bug fix: only the Main tab has anywhere to put extra height
+        // (the Sessions ScrollView) — Graph/Plan fit have a fixed panel
+        // height (AppDelegate.computedContentHeight), so the handle would
+        // just do nothing there and its cursor/affordance would be a lie.
+        //
+        // Bug fix (handle "floating" mid-window): also gated on
+        // `sessions.sessionsExpanded` now — with Sessions collapsed there's
+        // no ScrollView to absorb extra height either (mirrors
+        // AppDelegate.currentPanelHeight()'s matching guard), so showing the
+        // handle here would offer a resize that visibly does nothing but
+        // inflate blank window space below the card.
+        .overlay(alignment: .bottom) {
+            if graph.selectedTab == .main && sessions.sessionsExpanded {
+                resizeHandle
+            }
+        }
+    }
+
+    // MARK: - Resize handle
+
+    /// A visible grab strip pinned to the panel's bottom edge. Exists
+    /// because a borderless NSPanel never gets AppKit's native edge-drag
+    /// resize no matter what's in its styleMask — see AppDelegate.
+    /// setupOverlayPanel's comment.
+    ///
+    /// Item 2 tracking-accuracy fix: this used to use SwiftUI's
+    /// `DragGesture`, whose `translation` is measured in the dragged view's
+    /// OWN coordinate frame — but that frame moves, because the handle is
+    /// pinned to the panel's bottom edge, which is exactly what we're
+    /// resizing IN RESPONSE to the drag being measured. Each tick's motion
+    /// partially cancels against the view's own resulting repositioning, so
+    /// the measured translation consistently undercounts real cursor
+    /// movement (reported: "only about half of where the cursor drags to").
+    /// `ResizeHandleRepresentable` below tracks via `NSEvent.mouseLocation`
+    /// instead — real SCREEN coordinates, entirely decoupled from any
+    /// window's own frame, so resizing the window mid-drag can't feed back
+    /// into the measurement.
+    private var resizeHandle: some View {
+        ZStack {
+            Capsule()
+                .fill(Color.white.opacity(0.25))
+                .frame(width: 32, height: 4)
+            ResizeHandleRepresentable(
+                onDragChanged: { delta in
+                    if dragStartExtra == nil {
+                        dragStartExtra = panelSize.userExtraHeight
+                    }
+                    onResizeDrag((dragStartExtra ?? 0) + delta)
+                },
+                onDragEnded: {
+                    dragStartExtra = nil
+                }
+            )
+        }
+        // Bug fix (click-hijack): `minHeight` alone is a FLOOR, not a
+        // ceiling — it doesn't stop the flexible, opinion-less
+        // ResizeHandleRepresentable from accepting whatever height gets
+        // proposed to it, which via the enclosing `.overlay(alignment:
+        // .bottom)` (attached to a `maxHeight: .infinity` frame) could be
+        // the entire window. Since `.overlay` content sits topmost in
+        // z-order — and AppKit hit-testing always hands mouseDown to the
+        // frontmost subview under the cursor — a window-sized
+        // ResizeHandleView silently swallowed every click before any
+        // SwiftUI button/toggle underneath ever saw it. `maxHeight: 12`
+        // caps it to the intended thin strip.
+        .frame(maxWidth: .infinity, minHeight: 12, maxHeight: 12)
+    }
+
+    // MARK: - Resize handle (native mouse tracking)
+
+    /// Bridges `ResizeHandleView` (below) into SwiftUI. `onDragChanged`
+    /// fires on every `mouseDragged` with the cumulative screen-space delta
+    /// since `mouseDown` (not a per-event delta); `onDragEnded` fires once
+    /// on `mouseUp`.
+    private struct ResizeHandleRepresentable: NSViewRepresentable {
+        var onDragChanged: (CGFloat) -> Void
+        var onDragEnded: () -> Void
+
+        func makeNSView(context: Context) -> ResizeHandleView {
+            let view = ResizeHandleView()
+            view.onDragChanged = onDragChanged
+            view.onDragEnded = onDragEnded
+            return view
+        }
+
+        func updateNSView(_ nsView: ResizeHandleView, context: Context) {
+            nsView.onDragChanged = onDragChanged
+            nsView.onDragEnded = onDragEnded
+        }
+
+        /// Bug fix (click-hijack) belt-and-braces: a plain NSViewRepresentable
+        /// has no size opinion of its own and accepts whatever ancestor
+        /// modifiers propose, which is what let this balloon to cover the
+        /// whole window (see resizeHandle's doc comment). The `maxHeight: 12`
+        /// on that ancestor frame is the real fix; this gives the
+        /// representable an explicit opinion too, so a future ancestor
+        /// change can't silently reopen the same hit-testing hijack.
+        func sizeThatFits(_ proposal: ProposedViewSize, nsView: ResizeHandleView, context: Context) -> CGSize? {
+            CGSize(width: proposal.width ?? 280, height: min(proposal.height ?? 12, 12))
+        }
+    }
+
+    /// Raw AppKit mouse tracking for the resize handle — see resizeHandle's
+    /// doc comment for why SwiftUI's `DragGesture` doesn't work here.
+    /// `NSEvent.mouseLocation` is screen space (AppKit: y increases
+    /// upward), so dragging the mouse DOWN decreases it; `delta` is negated
+    /// so a downward drag (which should grow the panel) reports positive.
+    private final class ResizeHandleView: NSView {
+        var onDragChanged: ((CGFloat) -> Void)?
+        var onDragEnded: (() -> Void)?
+        private var dragStartScreenY: CGFloat?
+        private var trackingArea: NSTrackingArea?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingArea { removeTrackingArea(trackingArea) }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                owner: self, userInfo: nil)
+            addTrackingArea(area)
+            trackingArea = area
+        }
+
+        override func mouseEntered(with event: NSEvent) { NSCursor.resizeUpDown.push() }
+        override func mouseExited(with event: NSEvent) { NSCursor.pop() }
+
+        override func mouseDown(with event: NSEvent) {
+            dragStartScreenY = NSEvent.mouseLocation.y
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let startY = dragStartScreenY else { return }
+            onDragChanged?(startY - NSEvent.mouseLocation.y)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            dragStartScreenY = nil
+            onDragEnded?()
+        }
+    }
+
+    // MARK: - Title bar (move) handle
+
+    /// Bridges `MoveHandleView` (below) into SwiftUI, mirroring
+    /// `ResizeHandleRepresentable` above. `onDragChanged` fires on every
+    /// `mouseDragged` with the cumulative screen-space delta since
+    /// `mouseDown` (not a per-event delta); `onDragEnded` fires once on
+    /// `mouseUp`.
+    private struct MoveHandleRepresentable: NSViewRepresentable {
+        var onDragChanged: (CGSize) -> Void
+        var onDragEnded: () -> Void
+
+        func makeNSView(context: Context) -> MoveHandleView {
+            let view = MoveHandleView()
+            view.onDragChanged = onDragChanged
+            view.onDragEnded = onDragEnded
+            return view
+        }
+
+        func updateNSView(_ nsView: MoveHandleView, context: Context) {
+            nsView.onDragChanged = onDragChanged
+            nsView.onDragEnded = onDragEnded
+        }
+
+        /// Bug fix (click-hijack) belt-and-braces: the `.background()` on
+        /// the title `HStack` (see body) is the real fix — it proposes
+        /// exactly that HStack's own resolved size rather than an
+        /// unconstrained ZStack peer. This gives the representable an
+        /// explicit size opinion too (16pt covers the 11pt title font's line
+        /// height with headroom) so a future restructure can't silently
+        /// reopen the same window-covering hijack this class of view is
+        /// prone to.
+        func sizeThatFits(_ proposal: ProposedViewSize, nsView: MoveHandleView, context: Context) -> CGSize? {
+            CGSize(width: proposal.width ?? 0, height: min(proposal.height ?? 16, 16))
+        }
+    }
+
+    /// Bug fix (move+resize firing together): replaces
+    /// `NSPanel.isMovableByWindowBackground` (which made the ENTIRE panel a
+    /// move target, including the resize handle's own region — the two
+    /// raced on the same gesture) with an explicit drag region scoped to
+    /// just the title row. Uses the same raw `NSEvent.mouseLocation`
+    /// tracking as `ResizeHandleView` rather than a SwiftUI `DragGesture`,
+    /// for the same reason: a `DragGesture`'s translation is measured in the
+    /// dragged view's own coordinate frame, which moves as the window moves
+    /// in response, undercounting real cursor movement. Delta here is
+    /// screen-space and needs no sign flip (unlike the resize handle's
+    /// negated Y) — AppKit's window-origin Y and `NSEvent.mouseLocation`'s Y
+    /// both increase upward, so "cursor moved up 10pt" and "window should
+    /// move up 10pt" are already the same sign.
+    private final class MoveHandleView: NSView {
+        var onDragChanged: ((CGSize) -> Void)?
+        var onDragEnded: (() -> Void)?
+        private var dragStartScreenLocation: NSPoint?
+
+        override func mouseDown(with event: NSEvent) {
+            dragStartScreenLocation = NSEvent.mouseLocation
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let start = dragStartScreenLocation else { return }
+            let current = NSEvent.mouseLocation
+            onDragChanged?(CGSize(width: current.x - start.x, height: current.y - start.y))
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            dragStartScreenLocation = nil
+            onDragEnded?()
+        }
     }
 
     // MARK: - Tab switch
@@ -145,11 +414,11 @@ struct OverlayView: View {
 
     @ViewBuilder
     private var mainTabContent: some View {
-        row(label: "Session (5h)", percent: model.sessionPercent, resetText: model.resetText(for: model.sessionResetsAt))
+        row(label: "Session (5h)", percent: model.sessionPercent, estimatedPercent: model.sessionEstimatedPercent, resetText: model.resetText(for: model.sessionResetsAt))
         // Item 2: the standalone "updated Xm" line is gone — folded onto the
         // Weekly row's reset caption line instead (right-aligned, italic),
         // saving the row entirely.
-        row(label: "Weekly", percent: model.weeklyPercent, resetText: model.resetText(for: model.weeklyResetsAt), trailingCaption: model.lastUpdatedText)
+        row(label: "Weekly", percent: model.weeklyPercent, estimatedPercent: model.weeklyEstimatedPercent, resetText: model.resetText(for: model.weeklyResetsAt), trailingCaption: model.lastUpdatedText)
 
         Divider().background(Color.white.opacity(0.15))
 
@@ -201,57 +470,85 @@ struct OverlayView: View {
         }
 
         if sessions.sessionsExpanded {
-            // Item 4: fixed height (see SectionLayout's doc comment) instead
-            // of the old `.frame(maxHeight: 300)`, so this block's rendered
-            // height never depends on whether Recent chats is expanded.
-            Group {
-                // Item 3 (merge): chats folded in here too, so "no rows at
-                // all" now depends on all three sources being empty. Chat
-                // fetch failures (isLoggedOut/lastError) are deliberately
-                // not surfaced with their own message here anymore (unlike
-                // the old standalone Recent chats section) — both fetchers
-                // share the same underlying webview session, so a real
-                // sign-out is already flagged at the title row's
-                // `model.isLoggedOut`/`model.lastError`; a chats-only
-                // hiccup just means zero chat rows join the list below,
-                // which reads fine on its own.
-                if sessions.sessions.isEmpty && cloudSessions.sessions.isEmpty && chats.chats.isEmpty {
-                    Text("No sessions")
-                        .font(.system(size: 9))
-                        .foregroundColor(.white.opacity(0.4))
-                } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 6) {
-                            // Status classification item: local, cloud, and
-                            // (item 3) chat rows are merged into one list and
-                            // sorted by status (needs-input first, then
-                            // running, then idle/done — chats always fall
-                            // into idle/done) rather than rendered as
-                            // separate, independently-ordered blocks — a
-                            // needs-input cloud session shouldn't be buried
-                            // below a pile of idle local ones just because of
-                            // which model it came from.
-                            ForEach(combinedSessionRows) { row in
-                                switch row {
-                                case .local(let entry):
-                                    sessionRow(entry)
-                                case .cloud(let entry):
-                                    cloudSessionRow(entry)
-                                case .chat(let entry):
-                                    chatRow(entry)
+            // Item 2 stutter fix: the frame that actually grows with the
+            // drag is now isolated inside ResizableSessionsHeight (a leaf
+            // view that alone observes `panelSize`) rather than applied
+            // inline here — see OverlayView.panelSize's doc comment for why
+            // that isolation is what fixes the stutter.
+            ResizableSessionsHeight(panelSize: panelSize) {
+                // Item 4: fixed height (see SectionLayout's doc comment)
+                // instead of the old `.frame(maxHeight: 300)`, so this
+                // block's rendered height never depends on whether Recent
+                // chats is expanded.
+                Group {
+                    // Item 3 (merge): chats folded in here too, so "no rows
+                    // at all" now depends on all three sources being empty.
+                    // Chat fetch failures (isLoggedOut/lastError) are
+                    // deliberately not surfaced with their own message here
+                    // anymore (unlike the old standalone Recent chats
+                    // section) — both fetchers share the same underlying
+                    // webview session, so a real sign-out is already
+                    // flagged at the title row's
+                    // `model.isLoggedOut`/`model.lastError`; a chats-only
+                    // hiccup just means zero chat rows join the list below,
+                    // which reads fine on its own.
+                    if sessions.sessions.isEmpty && cloudSessions.sessions.isEmpty && chats.chats.isEmpty {
+                        Text("No sessions")
+                            .font(.system(size: 9))
+                            .foregroundColor(.white.opacity(0.4))
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 6) {
+                                // Status classification item: local, cloud,
+                                // and (item 3) chat rows are merged into one
+                                // list and sorted by status (needs-input
+                                // first, then running, then idle/done —
+                                // chats always fall into idle/done) rather
+                                // than rendered as separate,
+                                // independently-ordered blocks — a
+                                // needs-input cloud session shouldn't be
+                                // buried below a pile of idle local ones
+                                // just because of which model it came from.
+                                ForEach(combinedSessionRows) { row in
+                                    switch row {
+                                    case .local(let entry):
+                                        sessionRow(entry)
+                                    case .cloud(let entry):
+                                        cloudSessionRow(entry)
+                                    case .chat(let entry):
+                                        chatRow(entry)
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            // Item 2 (resizable panel): `panelSize.userExtraHeight` is
-            // whatever the user has dragged the panel taller than its
-            // content-computed base — see AppDelegate.PanelSizeState and
-            // updatePanelSize()'s doc comments. Added ONLY here (not to
-            // Recent chats or any other section) per the resize spec: extra
-            // height the user drags in always goes to Sessions.
-            .frame(height: SectionLayout.sessionsContentHeight + panelSize.userExtraHeight, alignment: .top)
+        }
+    }
+
+    /// Item 2 stutter fix: the only piece of the Sessions section that needs
+    /// to react live to a resize drag, isolated into its own tiny view so
+    /// that reacting to it doesn't also force OverlayView.body — and
+    /// therefore combinedSessionRows' full sort — to re-run on every pixel
+    /// of drag. See OverlayView.panelSize's doc comment for the full
+    /// diagnosis.
+    private struct ResizableSessionsHeight<Content: View>: View {
+        @ObservedObject var panelSize: PanelSizeState
+        @ViewBuilder let content: Content
+
+        var body: some View {
+            content
+                // Item 2 bug fix: extra height can now go negative (down to
+                // the `sessionsMinContentHeight` floor set in
+                // AppDelegate.setUserExtraHeight) so the user can shrink
+                // below the default, not just grow beyond it — `max(...)`
+                // here is a defensive clamp matching that same floor in
+                // case `panelSize` is ever set from somewhere else.
+                .frame(
+                    height: max(SectionLayout.sessionsMinContentHeight, SectionLayout.sessionsContentHeight + panelSize.userExtraHeight),
+                    alignment: .top
+                )
         }
     }
 
@@ -689,22 +986,41 @@ struct OverlayView: View {
         NSWorkspace.shared.open(url)
     }
 
-    /// Item 3B (click-to-open, local CLI/Cowork rows): deep-links into
-    /// Claude Desktop's own `claude://resume?session={id}` route, which
-    /// imports this CLI transcript into the Desktop app and brings it to
-    /// the foreground — reverse-engineered from
-    /// /Applications/Claude.app/Contents/Resources/app.asar and verified
-    /// empirically (see this repo's item-3 report for the exact strings and
-    /// the main.log confirmation of a real, successful import against a
-    /// live session id). `entry.id` is the same session_id/UUID key
-    /// state.json is keyed by, which is exactly what the `session` query
-    /// param expects (the app validates it as a UUID before doing anything
-    /// with it). Applied to both plain CLI and Cowork rows uniformly, since
-    /// both are stored under the same session_id shape — only the plain-CLI
-    /// case was independently confirmed against a live import, though.
+    /// Item 3B (click-to-open, local CLI/Cowork rows): originally deep-linked
+    /// into Claude Desktop's own `claude://resume?session={id}` route
+    /// (reverse-engineered from
+    /// /Applications/Claude.app/Contents/Resources/app.asar — LocalSession-
+    /// Manager.importCliSession), which imports the transcript and brings
+    /// Desktop to the foreground.
+    ///
+    /// Item 3B bug fix (round 1): a real user report caught this creating
+    /// duplicate tabs for Cowork rows — importCliSession keys every import
+    /// as `local_<cliSessionId>` and only dedupes against ITS OWN prior
+    /// imports, with no awareness that a native Cowork tab might already
+    /// reference that same CLI transcript via that tab's own internal
+    /// `cliSessionId` field. So clicking didn't focus the existing tab — it
+    /// silently created a second, generic ("General coding session") static
+    /// copy and switched focus to *that*, which is also why the live tab's
+    /// auto/permission mode appeared to vanish: it hadn't been disabled, the
+    /// click had just navigated to a different session object that never
+    /// had it set. Fixed by no longer deep-linking Cowork rows — just
+    /// foreground Desktop and leave tab selection to the user.
+    ///
+    /// Item 3B bug fix (round 2): a follow-up report showed the exact same
+    /// duplicate-"General coding session"-tab symptom on plain CLI/Code
+    /// rows too — so the earlier assumption that CLI sessions are safe
+    /// (because they'd have no pre-existing native tab to collide with) was
+    /// wrong; Desktop can end up with its own native representation of a
+    /// CLI session in other ways (e.g. its own Code-session browsing), and
+    /// importCliSession has no way to detect that from outside any more
+    /// than it could for Cowork. No URL fixes this — it's a gap in
+    /// Desktop's own import path, not a wrong query param — so ALL local
+    /// rows (CLI and Cowork alike) now just foreground Claude Desktop and
+    /// leave tab selection to the user.
     private func openLocalSession(_ entry: SessionEntry) {
-        guard let url = URL(string: "claude://resume?session=\(entry.id)") else { return }
-        NSWorkspace.shared.open(url)
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.anthropic.claudefordesktop") {
+            NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration())
+        }
     }
 
     /// Item 3B (click-to-open, cloud session rows): see the "Item 3B
@@ -867,10 +1183,18 @@ struct OverlayView: View {
     /// `model.lastUpdatedText`), renders right-aligned and italicized on the
     /// same line as `resetText` — this is what let the old standalone
     /// "updated Xm" line under the usage rows be deleted entirely.
+    ///
+    /// `estimatedPercent` (projected usage at reset — see
+    /// UsageModel.estimatedPercent) shows up two ways: as a muted
+    /// "(N%)" next to the actual percent, and as a small dot on the bar at
+    /// the projected position. If the projection exceeds 100%, the dot
+    /// turns red and pins to the 100% mark instead of running off the end of
+    /// the bar, and the "(N%)" label turns red too.
     @ViewBuilder
-    private func row(label: String, percent: Int?, resetText: String, trailingCaption: String? = nil) -> some View {
+    private func row(label: String, percent: Int?, estimatedPercent: Int? = nil, resetText: String, trailingCaption: String? = nil) -> some View {
+        let willExceed = (estimatedPercent ?? 0) > 100
         VStack(alignment: .leading, spacing: 3) {
-            HStack {
+            HStack(spacing: 4) {
                 Text(label)
                     .font(.system(size: 10))
                     .foregroundColor(.white.opacity(0.7))
@@ -878,6 +1202,11 @@ struct OverlayView: View {
                 Text(percent != nil ? "\(percent!)%" : "—")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(.white.opacity(0.95))
+                if let estimatedPercent {
+                    Text("(\(estimatedPercent)%)")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(willExceed ? .red.opacity(0.9) : .white.opacity(0.45))
+                }
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
@@ -886,6 +1215,15 @@ struct OverlayView: View {
                     RoundedRectangle(cornerRadius: 3)
                         .fill(barColor(percent))
                         .frame(width: geo.size.width * CGFloat(min(max(percent ?? 0, 0), 100)) / 100.0)
+                    if let estimatedPercent {
+                        let dotRadius: CGFloat = 2.5
+                        let fraction = CGFloat(min(max(estimatedPercent, 0), 100)) / 100.0
+                        let x = min(max(geo.size.width * fraction, dotRadius), geo.size.width - dotRadius)
+                        Circle()
+                            .fill(willExceed ? Color.red : Color.white)
+                            .frame(width: dotRadius * 2, height: dotRadius * 2)
+                            .position(x: x, y: geo.size.height / 2)
+                    }
                 }
             }
             .frame(height: 5)

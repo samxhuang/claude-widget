@@ -17,8 +17,35 @@ final class UsageModel: ObservableObject {
 
     @Published var now: Date = Date()
 
+    private static let sessionWindowDuration: TimeInterval = 5 * 3600
+    private static let weeklyWindowDuration: TimeInterval = 7 * 24 * 3600
+
     func tick() {
         now = Date()
+    }
+
+    /// Projects where `percent` will land by `resetsAt` if usage keeps
+    /// accruing at whatever rate it has so far this window: elapsed time is
+    /// `windowDuration - remaining`, and the projection scales `percent` by
+    /// `windowDuration / elapsed`. Nil in the first minute of a window,
+    /// where a near-zero elapsed denominator would blow the projection up
+    /// to something meaningless.
+    private func estimatedPercent(percent: Int?, resetsAt: Date?, windowDuration: TimeInterval) -> Int? {
+        guard let percent = percent, let resetsAt = resetsAt else { return nil }
+        let remaining = resetsAt.timeIntervalSince(now)
+        guard remaining > 0, remaining < windowDuration else { return nil }
+        let elapsed = windowDuration - remaining
+        guard elapsed > 60 else { return nil }
+        let projected = Double(percent) * windowDuration / elapsed
+        return Int(projected.rounded())
+    }
+
+    var sessionEstimatedPercent: Int? {
+        estimatedPercent(percent: sessionPercent, resetsAt: sessionResetsAt, windowDuration: Self.sessionWindowDuration)
+    }
+
+    var weeklyEstimatedPercent: Int? {
+        estimatedPercent(percent: weeklyPercent, resetsAt: weeklyResetsAt, windowDuration: Self.weeklyWindowDuration)
     }
 
     func apply(usage: [String: Any]) {

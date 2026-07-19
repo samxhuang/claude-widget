@@ -15,7 +15,8 @@
       "Bash(.venv/bin/pip install *)",
       "Bash(.venv/bin/python --version)",
       "Bash(brew --prefix snappy)",
-      "Bash(ls -la /Users/sam/git/claude-widget/.venv/bin/python 2>&1)"
+      "Bash(ls -la /Users/sam/git/claude-widget/.venv/bin/python 2>&1)",
+      "Bash(swift build *)"
     ]
   }
 }

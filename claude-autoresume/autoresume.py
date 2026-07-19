@@ -378,6 +378,25 @@ def classify_work_status(
         for name, _ in pending:
             if name == "Bash" and have_ps and pid is not None:
                 tool_grace = 0.0  # executing Bash always has a shell child
+            elif name in SUBAGENT_TOOLS:
+                # Bug fix: SUBAGENT_TOOLS was defined (see its doc comment —
+                # liveness is the subagents/ sidecar dir, not this age check)
+                # but never actually consulted here, so a pending Agent/Task
+                # call fell into the `else` bucket below and got only
+                # PENDING_SLOW_GRACE_SECONDS (60s) — the grace meant for
+                # WebFetch/MCP calls that really do resolve in tens of
+                # seconds. Subagent delegation routinely runs far longer
+                # than that between sidecar writes (a long "thinking" burst,
+                # a slow nested tool call), and a pending Agent/Task call has
+                # no permission-prompt semantics at all — any human-facing
+                # approval happens inside the SUBAGENT's own transcript, not
+                # as a blocking state on this one — so there is no reading
+                # of "stale" here that means needs_input. Rule 3 above
+                # already returns "running" whenever the sidecar looks
+                # fresh; if we get here the sidecar merely looks quiet
+                # *right now*, which just means still-running, so this never
+                # times out.
+                tool_grace = float("inf")
             elif name in INSTANT_TOOLS:
                 tool_grace = float(PENDING_INSTANT_GRACE_SECONDS)
             else:
@@ -402,7 +421,24 @@ def classify_work_status(
 
     # Rule 6: mid-turn (streaming, human prompt just sent, tool_result just
     # landed) — running while recently touched.
-    if (now - mtime) <= WORK_STATUS_RUNNING_WINDOW_SECONDS:
+    #
+    # Deleted-session fix: "recently touched" is judged by the last
+    # conversational event's OWN embedded timestamp when it has one, not the
+    # file's mtime. Deleting a session's imported copy in Claude Desktop's
+    # GUI touches the underlying CLI transcript (observed live: Desktop
+    # metadata events — ai-title/custom-title/last-prompt — appended at the
+    # tail, +343 bytes), which refreshes mtime without any new conversation
+    # having happened. Under the old
+    # mtime-only check that rewrite read as "fresh human prompt, Claude is
+    # about to respond" -> a false ~90s "running" flicker right after the
+    # user deleted the session. The tail event's own timestamp is immune to
+    # metadata-only touches (every real conversational event — streamed
+    # blocks, prompts, tool_results — carries a fresh one), so it's strictly
+    # the better signal; mtime stays as the fallback for events without a
+    # parseable timestamp.
+    last_conv_ts = _parse_event_time(last_conv) if last_conv is not None else None
+    reference_ts = last_conv_ts if last_conv_ts is not None else mtime
+    if (now - reference_ts) <= WORK_STATUS_RUNNING_WINDOW_SECONDS:
         return "running"
     return "idle"
 
@@ -926,6 +962,74 @@ def resume_due_sessions(state: dict) -> None:
         entry["force_resume"] = False
 
 
+def prune_deleted_sessions(state: dict) -> None:
+    """Immediate cleanup for sessions removed via Claude Desktop's own GUI
+    (its "Delete" action archives — sets isArchived: true on the metadata —
+    rather than touching files on disk; confirmed by reading
+    AutoArchiveEngine in Claude.app's own app.asar, which treats isArchived
+    as the terminal state for a session).
+
+    Without this, a deleted session lingers: scan_sessions()/
+    scan_cowork_sessions() only ever clean up an entry when they *revisit*
+    its backing file/metadata and find it stale — but scan_cowork_sessions
+    skips archived entries with an early `continue` before reaching that
+    cleanup, and scan_sessions simply never revisits a jsonl file that no
+    longer exists at all. Either way the entry just sits in state.json,
+    frozen, until prune_old_entries' much looser ACTIVE_STALE_MINUTES
+    (60 min) safety net eventually catches it — that's the delay reported as
+    "deleted sessions keep showing up in the widget".
+
+    This checks existence/archived-state directly (independent of any
+    mtime/scan-window cutoff) so a deletion is reflected on the very next
+    poll cycle instead. Only touches un-`handled` entries — handled ones
+    (already resumed or failed) are prune_old_entries' business, not this
+    one's.
+
+    Note: this only catches sessions whose *backing file is actually gone or
+    archived*. A CLI/Code session's raw ~/.claude/projects transcript isn't
+    necessarily touched by deleting Desktop's own imported copy of it (that
+    copy is a separate `local_<id>` wrapper — see OverlayView.openLocalSession
+    in the widget) — if the underlying transcript still exists, the widget
+    is correctly reflecting a CLI session that's still genuinely there.
+    """
+    if not state:
+        return
+
+    existing_jsonl_stems = set()
+    if PROJECTS_DIR.is_dir():
+        for project_folder in PROJECTS_DIR.iterdir():
+            if project_folder.is_dir():
+                existing_jsonl_stems.update(p.stem for p in project_folder.glob("*.jsonl"))
+
+    live_cowork_ids = set()
+    if COWORK_SESSIONS_DIR.is_dir():
+        for meta_path in COWORK_SESSIONS_DIR.rglob("local_*.json"):
+            session_dir = meta_path.with_suffix("")
+            if not session_dir.is_dir() or not (session_dir / "audit.jsonl").exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(errors="ignore"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if _truthy(meta.get("isArchived")):
+                continue
+            live_cowork_ids.add(meta.get("sessionId") or meta_path.stem)
+
+    stale = []
+    for session_id, entry in state.items():
+        if entry.get("handled"):
+            continue
+        if entry.get("project_name") == "Cowork":
+            if session_id not in live_cowork_ids:
+                stale.append(session_id)
+        elif session_id not in existing_jsonl_stems:
+            stale.append(session_id)
+
+    for session_id in stale:
+        log(f"Session {session_id} deleted/archived on disk — removing from widget immediately")
+        del state[session_id]
+
+
 def prune_old_entries(state: dict) -> None:
     now = time.time()
     handled_cutoff = now - PRUNE_AFTER_HOURS * 3600
@@ -965,6 +1069,7 @@ def main() -> None:
                 # via resume_armed; logs intended actions to daemon.log instead
                 # of performing any live UI automation.
                 cowork_resume.process_armed_sessions(state, log)
+                prune_deleted_sessions(state)
                 prune_old_entries(state)
                 save_state(state)
         except Exception as e:  # daemon must never die from a single bad cycle
