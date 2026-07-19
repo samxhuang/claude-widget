@@ -54,6 +54,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import cowork_resume  # Track 1: Cowork resume automation scaffolding — see that module's
+                       # docstring. Hardcoded dry-run; see DRY_RUN there.
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -512,6 +515,15 @@ def scan_cowork_sessions(state: dict) -> None:
                 "handled": False,
                 "handled_at": None,
                 "status": "active",
+                # Widget-owned, additive fields (Track 1: Cowork auto-resume
+                # via UI automation — see cowork_resume.py). Same pattern as
+                # enabled/force_resume above: default off, only the widget
+                # flips resume_armed, only cowork_resume.py flips
+                # needs_attention. Since the block below (the `existing`
+                # branch) never touches these keys, they survive every scan
+                # cycle once set, exactly like enabled/force_resume do.
+                "resume_armed": False,
+                "needs_attention": False,
             }
 
 
@@ -595,6 +607,11 @@ def main() -> None:
                 scan_sessions(state)
                 scan_cowork_sessions(state)
                 resume_due_sessions(state)
+                # Track 1 scaffolding: dry-run only (see cowork_resume.DRY_RUN).
+                # Only touches Cowork sessions the widget has explicitly armed
+                # via resume_armed; logs intended actions to daemon.log instead
+                # of performing any live UI automation.
+                cowork_resume.process_armed_sessions(state, log)
                 prune_old_entries(state)
                 save_state(state)
         except Exception as e:  # daemon must never die from a single bad cycle

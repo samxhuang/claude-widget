@@ -16,6 +16,20 @@ struct SessionEntry: Identifiable, Equatable, Hashable {
     var handled: Bool
     var status: String       // "active" | "waiting"
 
+    /// Cowork-only: opt-in "arm" for OS-level UI automation of Claude
+    /// Desktop's native Resume space, orchestrated by the daemon's
+    /// cowork_resume module. Deliberately separate from `enabled` (which
+    /// drives the CLI resume path and doesn't apply to Cowork rows at all)
+    /// — nothing here ever arms itself; default is always off, and as of
+    /// this build the daemon-side automation is hardcoded to dry-run, so
+    /// arming only produces log lines, not live clicks.
+    var resumeArmed: Bool
+    /// Daemon-set: the automation orchestrator hit an ambiguous match or
+    /// couldn't complete a resume attempt and needs a human to look. Purely
+    /// informational here — the widget doesn't clear it, only the daemon
+    /// (on a subsequent successful resume) does.
+    var needsAttention: Bool
+
     var isActive: Bool { status == "active" }
 
     /// Cowork sessions have no rate-limit/resume cycle — Cowork manages its
@@ -102,7 +116,9 @@ final class SessionsModel: ObservableObject {
                     enabled: dict["enabled"] as? Bool ?? false,
                     forceResume: dict["force_resume"] as? Bool ?? false,
                     handled: handled,
-                    status: dict["status"] as? String ?? "active"
+                    status: dict["status"] as? String ?? "active",
+                    resumeArmed: dict["resume_armed"] as? Bool ?? false,
+                    needsAttention: dict["needs_attention"] as? Bool ?? false
                 ))
             }
             // Rate-limited (waiting) sessions first, soonest reset first; active ones after.
@@ -136,6 +152,18 @@ final class SessionsModel: ObservableObject {
     func resumeNow(_ sessionId: String) {
         mutate(sessionId: sessionId) { entry in
             entry["force_resume"] = true
+        }
+        refresh()
+    }
+
+    /// Cowork-only "arm" toggle for the (currently dry-run-only) UI
+    /// automation resume path. Same locked read-modify-write pattern as
+    /// `setEnabled`/`resumeNow` — this is a pure state-file write, it does
+    /// not itself trigger any automation. The daemon's cowork_resume
+    /// module is what reads this flag on its next poll cycle.
+    func setResumeArmed(_ sessionId: String, _ armed: Bool) {
+        mutate(sessionId: sessionId) { entry in
+            entry["resume_armed"] = armed
         }
         refresh()
     }

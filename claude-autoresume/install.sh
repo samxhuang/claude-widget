@@ -30,6 +30,7 @@ echo "==> Installing daemon script to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR" "$STATE_DIR/logs"
 cp autoresume.py "$INSTALL_DIR/autoresume.py"
 chmod +x "$INSTALL_DIR/autoresume.py"
+cp cowork_resume.py "$INSTALL_DIR/cowork_resume.py"
 
 echo "==> Writing LaunchAgent plist to $PLIST_PATH ..."
 mkdir -p "$LAUNCH_AGENTS_DIR"

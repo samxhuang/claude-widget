@@ -118,6 +118,11 @@ struct OverlayView: View {
                         .foregroundColor(.white.opacity(0.4))
                         .lineLimit(1)
                 }
+                if entry.needsAttention {
+                    Text("needs attention")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.red.opacity(0.9))
+                }
             }
 
             Spacer()
@@ -135,7 +140,36 @@ struct OverlayView: View {
                 .foregroundColor(.blue.opacity(0.9))
             }
 
-            if !entry.isCowork {
+            if entry.isCowork {
+                // Cowork rows never show the CLI-oriented `enabled` toggle
+                // (there's no rate-limit/resume cycle for Cowork to opt
+                // into) — this is a distinct control: arming OS-level UI
+                // automation of Claude Desktop's Resume space. Styled in
+                // red/bolt to visually set it apart from the ordinary blue
+                // `enabled` switch and make an armed row impossible to miss
+                // at a glance. Nothing here fires automatically — arming
+                // just flips a flag in state.json; the daemon-side
+                // automation itself is hardcoded to dry-run until an
+                // explicit follow-up sign-off.
+                HStack(spacing: 3) {
+                    if entry.resumeArmed {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 8))
+                            .foregroundColor(.red.opacity(0.9))
+                    }
+                    Toggle("", isOn: Binding(
+                        get: { entry.resumeArmed },
+                        set: { sessions.setResumeArmed(entry.id, $0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
+                    .tint(.red)
+                }
+                .help(entry.resumeArmed
+                      ? "Armed: the daemon will attempt to auto-resume this Cowork session via UI automation (currently dry-run only — logs intent, does not click anything)"
+                      : "Arm auto-resume for this Cowork session via UI automation of Claude Desktop's Resume space (currently dry-run only)")
+            } else {
                 Toggle("", isOn: Binding(
                     get: { entry.enabled },
                     set: { sessions.setEnabled(entry.id, $0) }
