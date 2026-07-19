@@ -54,6 +54,8 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from autoresume_config import load_config  # stdlib-only sibling; account/budget config (C1)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -61,7 +63,7 @@ from pathlib import Path
 HOME = Path.home()
 DEFAULT_STATE_DIR = HOME / ".claude-autoresume"
 
-CURRENT_PLAN = "max_20x"
+CURRENT_PLAN = "max_20x"  # default only; the live plan is config["account"]["plan"] (see autoresume_config)
 TIER_MULTIPLIERS = {"pro": 1, "max_5x": 5, "max_20x": 20}
 TIER_PRICE_USD = {"pro": 20, "max_5x": 100, "max_20x": 200}
 TIER_ORDER = ("pro", "max_5x", "max_20x")  # cheapest first
@@ -69,6 +71,9 @@ TIER_ORDER = ("pro", "max_5x", "max_20x")  # cheapest first
 ROLLING_WINDOW_HOURS = 5
 MA_WINDOWS_DAYS = (1, 7, 30, 90)
 MONTHLY_RUN_RATE_DAYS = 30.44
+
+# Budget (API-account dollar limits) — see _budget_block / autoresume_config C1.
+BUDGET_PROJECTION_MIN_ELAPSED_SECONDS = 3600  # suppress linear projection in a period's first hour
 
 # ---------------------------------------------------------------------------
 # Pricing — resolution chain: override > fetched cache > bundled defaults
@@ -646,7 +651,8 @@ def _tier_projection(observed: dict) -> dict:
     return projection
 
 
-def _verdict(tier_projection: dict, run_rate: dict, days_covered_widest: int, widest_window: int) -> dict:
+def _verdict(tier_projection: dict, run_rate: dict, days_covered_widest: int, widest_window: int,
+             current_plan: str = CURRENT_PLAN) -> dict:
     plans = {}
     run_rate_value = run_rate.get("value_usd_per_month")
     for tier in TIER_ORDER:
@@ -691,7 +697,7 @@ def _verdict(tier_projection: dict, run_rate: dict, days_covered_widest: int, wi
     elif viable_tiers:
         cheapest = viable_tiers[0]
         qualifier = " (based on limited, preliminary data — recheck once more history is collected)" if preliminary else ""
-        if cheapest == CURRENT_PLAN:
+        if cheapest == current_plan:
             recommendation = (
                 f"Your current plan, {tier_label[cheapest]}, matches your usage — "
                 f"projected peak utilization stays under the cap{qualifier}."
@@ -716,6 +722,109 @@ def _verdict(tier_projection: dict, run_rate: dict, days_covered_widest: int, wi
 
 
 # ---------------------------------------------------------------------------
+# Budget windows (API-account dollar limits, config-driven)
+# ---------------------------------------------------------------------------
+
+def _budget_period_bounds(now: datetime, kind: str, week_start: str, tzname: str) -> tuple[datetime, datetime]:
+    """Calendar-period bounds for the budget window containing `now`,
+    returned as UTC-aware datetimes.
+
+    `kind` is "monthly" (calendar month) or "weekly" (calendar week starting
+    `week_start`, "monday" or "sunday" — deliberately NOT the Max rolling-7d
+    window). `tzname` is "local" (system tz) or "utc".
+
+    DST-safe: for the "local" case each boundary's wall-clock midnight is
+    localized on its own date via stdlib naive-datetime `.astimezone()` (a
+    naive datetime is presumed to be system-local time, converted with the
+    correct offset for that specific date), so a period spanning a DST
+    transition still resolves to true local midnight at both ends. Pure
+    stdlib — no zoneinfo key lookup required.
+    """
+    now = _ensure_utc(now)
+    if tzname == "utc":
+        ref = now  # already UTC-aware
+        def to_utc(y: int, m: int, d: int) -> datetime:
+            return datetime(y, m, d, tzinfo=timezone.utc)
+    else:  # "local"
+        ref = now.astimezone()  # aware datetime in the system-local tz
+        def to_utc(y: int, m: int, d: int) -> datetime:
+            # naive -> presumed local, localized on its own date (DST-correct)
+            return datetime(y, m, d).astimezone(timezone.utc)
+
+    if kind == "monthly":
+        start = to_utc(ref.year, ref.month, 1)
+        if ref.month == 12:
+            end = to_utc(ref.year + 1, 1, 1)
+        else:
+            end = to_utc(ref.year, ref.month + 1, 1)
+    else:  # "weekly"
+        start_weekday = 6 if week_start == "sunday" else 0  # Python weekday(): Mon=0 .. Sun=6
+        ref_date = ref.date()
+        days_back = (ref_date.weekday() - start_weekday) % 7
+        start_date = ref_date - timedelta(days=days_back)
+        end_date = start_date + timedelta(days=7)
+        start = to_utc(start_date.year, start_date.month, start_date.day)
+        end = to_utc(end_date.year, end_date.month, end_date.day)
+
+    return start, end
+
+
+def _budget_window(hourly_cost: dict, now: datetime, limit_usd, kind: str,
+                   week_start: str, tzname: str) -> dict | None:
+    """One budget window (C2) or None when its limit is unconfigured.
+
+    Spend = sum of the already-priced `hourly_cost` UTC hour buckets falling
+    within the current calendar period (downstream of the pricing chain — this
+    never re-resolves rates). Projection is linear (spent / elapsed fraction),
+    suppressed in the period's first hour where too little has elapsed to
+    extrapolate. `includes_remote` is False until the remote-token merge lands.
+    """
+    if limit_usd is None:
+        return None
+    now = _ensure_utc(now)
+    limit = float(limit_usd)
+    period_start, period_end = _budget_period_bounds(now, kind, week_start, tzname)
+
+    spent = float(sum(c for h, c in hourly_cost.items() if period_start <= h < period_end))
+    pct = round(spent / limit * 100.0, 1) if limit > 0 else None
+
+    projected_usd = None
+    projected_pct = None
+    elapsed = (now - period_start).total_seconds()
+    total = (period_end - period_start).total_seconds()
+    if elapsed >= BUDGET_PROJECTION_MIN_ELAPSED_SECONDS and total > 0:
+        elapsed_fraction = elapsed / total
+        if elapsed_fraction > 0:
+            projected = spent / elapsed_fraction
+            projected_usd = round(projected, 2)
+            projected_pct = round(projected / limit * 100.0, 1) if limit > 0 else None
+
+    return {
+        "limit_usd": round(limit, 2),
+        "spent_usd": round(spent, 2),
+        "pct": pct,
+        "projected_usd": projected_usd,
+        "projected_pct": projected_pct,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "includes_remote": False,
+    }
+
+
+def _budget_block(hourly_cost: dict, now: datetime, config: dict) -> dict:
+    """The `budget` top-level block (C2): weekly/monthly windows, each null
+    when its limit is unconfigured. Emitted for every account type (the widget
+    decides whether to surface it)."""
+    budget = config.get("budget", {}) or {}
+    week_start = budget.get("week_start", "monday")
+    tzname = budget.get("timezone", "local")
+    return {
+        "weekly": _budget_window(hourly_cost, now, budget.get("weekly_usd"), "weekly", week_start, tzname),
+        "monthly": _budget_window(hourly_cost, now, budget.get("monthly_usd"), "monthly", week_start, tzname),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Top-level compute()
 # ---------------------------------------------------------------------------
 
@@ -726,6 +835,11 @@ def compute(state_dir: Path, now: datetime) -> dict:
     null/empty with a warning rather than raising."""
     now = _ensure_utc(now)
     usage_dir = state_dir / "usage"
+
+    # Account/budget config (C1) — re-read each compute(); missing/malformed
+    # yields full defaults (Max, plan max_20x, no budget) = pre-config behavior.
+    config = load_config(state_dir)
+    current_plan = config["account"]["plan"]
 
     warnings: list[str] = []
     assumptions: list[str] = [
@@ -809,7 +923,7 @@ def compute(state_dir: Path, now: datetime) -> dict:
 
     widest_window = MA_WINDOWS_DAYS[-1]
     days_covered_widest = moving_averages[f"{widest_window}d"]["days_covered"]
-    verdict = _verdict(tier_projection, run_rate, days_covered_widest, widest_window)
+    verdict = _verdict(tier_projection, run_rate, days_covered_widest, widest_window, current_plan)
 
     # Graph-ready cost series for the widget's usage-over-time view. Hourly
     # covers the widget's 24h/7d/1mo ranges; daily keeps the 3mo view compact.
@@ -836,9 +950,23 @@ def compute(state_dir: Path, now: datetime) -> dict:
         }
     all_models_cost_usd = round(sum(t["cost_usd"] for t in totals_by_model.values()), 2)
 
+    budget = _budget_block(hourly_cost, now, config)
+    # Only extend assumptions when a budget is actually configured, so the
+    # default-config output stays byte-compatible with the pre-budget file.
+    if budget["weekly"] is not None or budget["monthly"] is not None:
+        assumptions.append(
+            "Budget spend sums the API-equivalent cost of hourly usage buckets within the current "
+            "calendar period; a bucket straddling a period boundary can misattribute up to 1 hour of cost."
+        )
+        assumptions.append(
+            "Budget spend can undercount usage from before 2026-07-18, when hourly cost collection began."
+        )
+
     return {
         "generated_at": now.isoformat(),
-        "current_plan": CURRENT_PLAN,
+        "current_plan": current_plan,
+        "account": {"type": config["account"]["type"], "plan": config["account"]["plan"]},
+        "budget": budget,
         "cost_series": {"hourly": hourly_series, "daily": daily_series},
         "moving_averages": moving_averages,
         "monthly_run_rate": run_rate,

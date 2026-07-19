@@ -458,5 +458,217 @@ class LiteLLMConversionTests(unittest.TestCase):
         }))
 
 
+# ---------------------------------------------------------------------------
+# Account + budget blocks (C1/C2)
+# ---------------------------------------------------------------------------
+
+def _config(account=None, budget=None) -> dict:
+    cfg = {"version": 1}
+    if account is not None:
+        cfg["account"] = account
+    if budget is not None:
+        cfg["budget"] = budget
+    return cfg
+
+
+class AccountBlockTests(TempStateDirTestCase):
+    def test_default_account_block_when_no_config(self):
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+        # No config.json -> defaults: max / max_20x, byte-compatible current_plan.
+        self.assertEqual(result["current_plan"], "max_20x")
+        self.assertEqual(result["account"], {"type": "max", "plan": "max_20x"})
+        # budget block always present; both windows null when unconfigured.
+        self.assertEqual(result["budget"], {"weekly": None, "monthly": None})
+
+    def test_account_type_and_plan_flow_from_config(self):
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "api", "plan": "max_5x"}))
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+        self.assertEqual(result["account"], {"type": "api", "plan": "max_5x"})
+        self.assertEqual(result["current_plan"], "max_5x")
+
+    def test_verdict_uses_config_plan_for_current_match(self):
+        # Utilization that makes only max_20x viable; with current_plan=max_20x
+        # the recommendation phrases it as "Your current plan".
+        rows = [{
+            "ts_start": "2026-07-01T00:00:00+00:00", "n": 10,
+            "five_hour": {"min": 10, "max": 40, "avg": 25, "last": 30},
+            "seven_day": {"min": 5, "max": 20, "avg": 15, "last": 18},
+        }]
+        _write_jsonl(self.usage_dir / "snapshots_1h.jsonl", rows)
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "max_20x"}))
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+        self.assertIn("Your current plan", result["verdict"]["recommendation"])
+
+
+class BudgetPeriodBoundsTests(unittest.TestCase):
+    def test_monthly_bounds_utc(self):
+        now = datetime(2026, 7, 19, 15, 0, tzinfo=timezone.utc)
+        start, end = plan_fit._budget_period_bounds(now, "monthly", "monday", "utc")
+        self.assertEqual(start, datetime(2026, 7, 1, tzinfo=timezone.utc))
+        self.assertEqual(end, datetime(2026, 8, 1, tzinfo=timezone.utc))
+
+    def test_monthly_bounds_december_wraps_year(self):
+        now = datetime(2026, 12, 20, 8, 0, tzinfo=timezone.utc)
+        start, end = plan_fit._budget_period_bounds(now, "monthly", "monday", "utc")
+        self.assertEqual(start, datetime(2026, 12, 1, tzinfo=timezone.utc))
+        self.assertEqual(end, datetime(2027, 1, 1, tzinfo=timezone.utc))
+
+    def test_weekly_bounds_monday_start_utc(self):
+        # 2026-07-19 is a Sunday; week starting Monday -> Mon 2026-07-13.
+        now = datetime(2026, 7, 19, 23, 0, tzinfo=timezone.utc)
+        start, end = plan_fit._budget_period_bounds(now, "weekly", "monday", "utc")
+        self.assertEqual(start, datetime(2026, 7, 13, tzinfo=timezone.utc))
+        self.assertEqual(end, datetime(2026, 7, 20, tzinfo=timezone.utc))
+
+    def test_weekly_bounds_sunday_start_utc(self):
+        # 2026-07-19 is a Sunday; week starting Sunday -> that same Sunday.
+        now = datetime(2026, 7, 19, 1, 0, tzinfo=timezone.utc)
+        start, end = plan_fit._budget_period_bounds(now, "weekly", "sunday", "utc")
+        self.assertEqual(start, datetime(2026, 7, 19, tzinfo=timezone.utc))
+        self.assertEqual(end, datetime(2026, 7, 26, tzinfo=timezone.utc))
+
+    def test_local_bounds_are_utc_aware_and_span_a_calendar_month(self):
+        # tz "local": result is UTC-aware, exactly one month apart, and the
+        # month-length matches a calendar month (28-31 days) regardless of the
+        # runner's local zone / DST.
+        now = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+        start, end = plan_fit._budget_period_bounds(now, "monthly", "monday", "local")
+        self.assertEqual(start.tzinfo, timezone.utc)
+        self.assertEqual(end.tzinfo, timezone.utc)
+        self.assertLess(start, now)
+        self.assertLessEqual(now, end)
+        span_days = (end - start).total_seconds() / 86400.0
+        self.assertTrue(27.9 <= span_days <= 31.1, span_days)
+
+
+class BudgetBlockTests(TempStateDirTestCase):
+    # opus cost per hour = input_tok * 5 / 1e6, priced by the bundled chain.
+    def _hour_cost(self, hour_key: str, cost_usd: float) -> dict:
+        input_tok = int(cost_usd * 1_000_000 / 5)
+        return {hour_key: {"code_cli": {"claude-opus-4-5-x": {"input": input_tok, "output": 0}}}}
+
+    def _compute(self, hours, budget=None, account=None, now=None):
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly(hours))
+        if budget is not None or account is not None:
+            _write_json(self.state_dir / "config.json", _config(account=account, budget=budget))
+        return plan_fit.compute(self.state_dir, now)
+
+    def test_none_budget_both_windows_null(self):
+        result = self._compute({}, budget={"weekly_usd": None, "monthly_usd": None,
+                                            "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc))
+        self.assertIsNone(result["budget"]["weekly"])
+        self.assertIsNone(result["budget"]["monthly"])
+
+    def test_monthly_only_budget(self):
+        # Two hours of $30 each inside July -> spent 60 against a $500 monthly.
+        hours = {}
+        hours.update(self._hour_cost("2026-07-05T09", 30.0))
+        hours.update(self._hour_cost("2026-07-12T09", 30.0))
+        result = self._compute(hours, budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                              "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc))
+        self.assertIsNone(result["budget"]["weekly"])
+        m = result["budget"]["monthly"]
+        self.assertAlmostEqual(m["limit_usd"], 500.0, places=2)
+        self.assertAlmostEqual(m["spent_usd"], 60.0, places=2)
+        self.assertAlmostEqual(m["pct"], 12.0, places=1)
+        self.assertEqual(m["period_start"], "2026-07-01T00:00:00+00:00")
+        self.assertEqual(m["period_end"], "2026-08-01T00:00:00+00:00")
+        self.assertFalse(m["includes_remote"])
+
+    def test_weekly_only_budget(self):
+        # now = Sun 2026-07-19; Monday-start week = Mon 07-13 .. Sun 07-19.
+        # $10 on 07-14 (in week) + $10 on 07-10 (previous week, excluded).
+        hours = {}
+        hours.update(self._hour_cost("2026-07-14T09", 10.0))
+        hours.update(self._hour_cost("2026-07-10T09", 10.0))
+        result = self._compute(hours, budget={"weekly_usd": 200.0, "monthly_usd": None,
+                                              "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc))
+        self.assertIsNone(result["budget"]["monthly"])
+        w = result["budget"]["weekly"]
+        self.assertAlmostEqual(w["spent_usd"], 10.0, places=2)
+        self.assertAlmostEqual(w["pct"], 5.0, places=1)
+        self.assertEqual(w["period_start"], "2026-07-13T00:00:00+00:00")
+        self.assertEqual(w["period_end"], "2026-07-20T00:00:00+00:00")
+
+    def test_both_budgets_configured(self):
+        hours = {}
+        hours.update(self._hour_cost("2026-07-14T09", 40.0))
+        result = self._compute(hours, budget={"weekly_usd": 200.0, "monthly_usd": 500.0,
+                                              "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc))
+        self.assertIsNotNone(result["budget"]["weekly"])
+        self.assertIsNotNone(result["budget"]["monthly"])
+        self.assertAlmostEqual(result["budget"]["weekly"]["spent_usd"], 40.0, places=2)
+        self.assertAlmostEqual(result["budget"]["monthly"]["spent_usd"], 40.0, places=2)
+        # Budget assumptions get appended once a budget is configured.
+        self.assertTrue(any("Budget spend sums" in a for a in result["assumptions"]))
+        self.assertTrue(any("2026-07-18" in a for a in result["assumptions"]))
+
+    def test_budget_emitted_even_for_max_account(self):
+        result = self._compute({}, account={"type": "max", "plan": "max_20x"},
+                               budget={"weekly_usd": None, "monthly_usd": 100.0,
+                                       "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(result["account"]["type"], "max")
+        self.assertIsNotNone(result["budget"]["monthly"])
+
+    def test_projection_null_in_first_hour_of_period(self):
+        # now is 30 min into the month -> less than an hour elapsed.
+        hours = self._hour_cost("2026-07-01T00", 5.0)
+        result = self._compute(hours, budget={"weekly_usd": None, "monthly_usd": 500.0,
+                                              "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 1, 0, 30, tzinfo=timezone.utc))
+        m = result["budget"]["monthly"]
+        self.assertIsNone(m["projected_usd"])
+        self.assertIsNone(m["projected_pct"])
+        self.assertAlmostEqual(m["spent_usd"], 5.0, places=2)
+
+    def test_projection_present_after_first_hour(self):
+        # Halfway through a 31-day month with $100 spent -> ~$200 projected.
+        hours = self._hour_cost("2026-07-05T00", 100.0)
+        # 2026-07-16 12:00 is ~ the midpoint of July (31 days).
+        result = self._compute(hours, budget={"weekly_usd": None, "monthly_usd": 1000.0,
+                                              "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
+        m = result["budget"]["monthly"]
+        self.assertAlmostEqual(m["spent_usd"], 100.0, places=2)
+        self.assertIsNotNone(m["projected_usd"])
+        # Midpoint -> projection roughly doubles spend.
+        self.assertTrue(180.0 <= m["projected_usd"] <= 220.0, m["projected_usd"])
+        self.assertAlmostEqual(m["projected_pct"], m["projected_usd"] / 1000.0 * 100.0, places=1)
+
+    def test_spent_zero_on_empty_hours(self):
+        result = self._compute({}, budget={"weekly_usd": 50.0, "monthly_usd": 500.0,
+                                            "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 16, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(result["budget"]["weekly"]["spent_usd"], 0.0)
+        self.assertEqual(result["budget"]["monthly"]["spent_usd"], 0.0)
+        self.assertEqual(result["budget"]["weekly"]["pct"], 0.0)
+
+    def test_month_boundary_excludes_prior_month_spend(self):
+        # $500 spent on the last day of June, $20 on the first day of July.
+        # A July monthly budget must see only the $20 (spend >= period start).
+        hours = {}
+        hours.update(self._hour_cost("2026-06-30T23", 500.0))
+        hours.update(self._hour_cost("2026-07-01T10", 20.0))
+        result = self._compute(hours, budget={"weekly_usd": None, "monthly_usd": 1000.0,
+                                              "week_start": "monday", "timezone": "utc"},
+                               now=datetime(2026, 7, 3, 12, 0, tzinfo=timezone.utc))
+        m = result["budget"]["monthly"]
+        self.assertAlmostEqual(m["spent_usd"], 20.0, places=2)
+        self.assertEqual(m["period_start"], "2026-07-01T00:00:00+00:00")
+
+
 if __name__ == "__main__":
     unittest.main()
