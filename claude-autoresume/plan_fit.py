@@ -643,7 +643,21 @@ def _build_cost_series(hours: dict, override: dict, cache_models: dict, warnings
     return hourly_cost, daily_cost, days_with_data, totals_by_model
 
 
-def _moving_averages(daily_cost: dict, days_with_data: set, now: datetime) -> dict:
+def _moving_averages(daily_cost: dict, days_with_data: set, now: datetime,
+                     earliest_data: datetime | None = None) -> dict:
+    """$/day per window, where the denominator is the REAL elapsed time the
+    data could have covered — fractional days from max(window start, first
+    data point) to `now` — not the count of calendar days touched.
+
+    Day-counting quantized 1.33 days of history up to 2 "covered days" and
+    deflated the rate ~35% (and, symmetrically, treated a genuinely idle day
+    with no store entry as nonexistent time, inflating it). The fractional
+    denominator matches the Graph tab's period-total estimate, so the two no
+    longer disagree about what "your pace" is. `days_covered` stays the
+    integer calendar-day count for the maturity captions ("2/7 days
+    collected"). Falls back to day-counting if `earliest_data` is absent or
+    inconsistent with `now` (clock skew).
+    """
     today = now.date()
     result = {}
     for window_days in MA_WINDOWS_DAYS:
@@ -655,7 +669,12 @@ def _moving_averages(daily_cost: dict, days_with_data: set, now: datetime) -> di
             value = None
         else:
             total = sum(daily_cost.get(d, 0.0) for d in covered)
-            value = total / days_covered
+            span_start = datetime(window_start.year, window_start.month,
+                                  window_start.day, tzinfo=timezone.utc)
+            if earliest_data is not None and earliest_data > span_start:
+                span_start = earliest_data
+            elapsed_days = (now - span_start).total_seconds() / 86400.0
+            value = total / elapsed_days if elapsed_days > 0 else total / days_covered
         result[f"{window_days}d"] = {
             "value_usd_per_day": round(value, 2) if value is not None else None,
             "days_covered": days_covered,
@@ -1111,7 +1130,8 @@ def compute(state_dir: Path, now: datetime) -> dict:
                     "still being used, but a refresh is recommended."
                 )
 
-    moving_averages = _moving_averages(daily_cost, days_with_data, now)
+    earliest_data = min(hourly_cost) if hourly_cost else None
+    moving_averages = _moving_averages(daily_cost, days_with_data, now, earliest_data)
     run_rate = _monthly_run_rate(moving_averages)
     cost_peaks = _cost_peaks(hourly_cost)
 

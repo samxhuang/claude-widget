@@ -65,23 +65,46 @@ class MovingAverageTests(TempStateDirTestCase):
         result = plan_fit.compute(self.state_dir, now)
         ma = result["moving_averages"]
 
+        # Fractional-elapsed-time denominators (matching the Graph tab's
+        # estimate), not calendar-day counts. Earliest data = Jul 16 09:00.
+        # 1d window: $10 spent in the 12h elapsed today -> $20/day pace.
         self.assertEqual(ma["1d"]["days_covered"], 1)
         self.assertEqual(ma["1d"]["window_days"], 1)
-        self.assertAlmostEqual(ma["1d"]["value_usd_per_day"], 10.0, places=2)
+        self.assertAlmostEqual(ma["1d"]["value_usd_per_day"], 20.0, places=2)
 
+        # 7d/30d/90d windows all start before the data does, so the span is
+        # Jul 16 09:00 -> Jul 18 12:00 = 2.125 days; $30 / 2.125 = $14.12.
         self.assertEqual(ma["7d"]["days_covered"], 3)
         self.assertEqual(ma["7d"]["window_days"], 7)
-        self.assertAlmostEqual(ma["7d"]["value_usd_per_day"], 10.0, places=2)
+        self.assertAlmostEqual(ma["7d"]["value_usd_per_day"], 30.0 / 2.125, places=2)
 
         self.assertEqual(ma["30d"]["days_covered"], 3)
         self.assertEqual(ma["90d"]["days_covered"], 3)
-        self.assertAlmostEqual(ma["30d"]["value_usd_per_day"], 10.0, places=2)
-        self.assertAlmostEqual(ma["90d"]["value_usd_per_day"], 10.0, places=2)
+        self.assertAlmostEqual(ma["30d"]["value_usd_per_day"], 30.0 / 2.125, places=2)
+        self.assertAlmostEqual(ma["90d"]["value_usd_per_day"], 30.0 / 2.125, places=2)
 
         # Monthly run-rate should use the 7d MA as its basis.
         rr = result["monthly_run_rate"]
         self.assertEqual(rr["basis"], "7d")
-        self.assertAlmostEqual(rr["value_usd_per_month"], 10.0 * 30.44, places=2)
+        self.assertAlmostEqual(rr["value_usd_per_month"], round(30.0 / 2.125, 2) * 30.44, places=2)
+
+    def test_mature_window_uses_elapsed_window_span(self):
+        # Data older than the whole 1d window: the window's own span (midnight
+        # -> now) is the denominator, and only the window's days are summed.
+        hours = {}
+        for day in (10, 11, 12, 13, 14, 15, 16, 17, 18):
+            hours[f"2026-07-{day:02d}T03"] = {
+                "code_cli": {"claude-opus-4-5-x": {"input": 2_000_000, "output": 0}}}
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly(hours))
+
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+        ma = result["moving_averages"]
+        # 1d: $10 today over 12h elapsed -> $20/day.
+        self.assertAlmostEqual(ma["1d"]["value_usd_per_day"], 20.0, places=2)
+        # 7d: window Jul 12..18 -> $70 over 6.5 elapsed days.
+        self.assertEqual(ma["7d"]["days_covered"], 7)
+        self.assertAlmostEqual(ma["7d"]["value_usd_per_day"], 70.0 / 6.5, places=2)
 
     def test_zero_days_covered_gives_null_value(self):
         _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
