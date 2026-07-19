@@ -54,6 +54,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import plan_fit        # Usage analytics: plan-fit computation + pricing refresh
+import usage_collector  # Usage analytics: token collection from transcripts + snapshot compaction
 import cowork_resume  # Track 1: Cowork resume automation scaffolding — see that module's
                        # docstring. Hardcoded dry-run; see DRY_RUN there.
 
@@ -76,6 +78,11 @@ LOG_DIR = STATE_DIR / "logs"
 DAEMON_LOG = STATE_DIR / "daemon.log"
 
 POLL_INTERVAL_SECONDS = 30
+# Usage analytics run much less often than the session poll. Collection is
+# incremental (byte offsets) so an hourly cadence loses nothing; pricing
+# refresh hits the network, so at most daily.
+USAGE_COLLECT_INTERVAL_SECONDS = 60 * 60
+PRICING_REFRESH_INTERVAL_SECONDS = 24 * 60 * 60
 # Only look at session files touched in the last N minutes when scanning at
 # all — no need to re-read your entire session history every cycle.
 SCAN_WINDOW_MINUTES = 20
@@ -600,6 +607,10 @@ def main() -> None:
     log(f"claude-autoresume daemon starting (poll every {POLL_INTERVAL_SECONDS}s). "
         f"Default is OFF for every detected session — resumes only happen via the widget.")
     log(f"Watching {PROJECTS_DIR} and {COWORK_SESSIONS_DIR}")
+    # 0 = run on the first cycle after startup, so a fresh deploy bootstraps
+    # the usage store immediately instead of waiting a full interval.
+    last_usage_run = 0.0
+    last_pricing_run = 0.0
     while True:
         try:
             with StateLock():
@@ -616,6 +627,22 @@ def main() -> None:
                 save_state(state)
         except Exception as e:  # daemon must never die from a single bad cycle
             log(f"ERROR in poll cycle: {e!r}")
+        # Usage analytics: outside StateLock on purpose — these touch only
+        # STATE_DIR/usage/*, never state.json, and collect() takes its own
+        # lock against concurrent CLI invocations.
+        try:
+            now_mono = time.time()
+            if now_mono - last_pricing_run >= PRICING_REFRESH_INTERVAL_SECONDS:
+                last_pricing_run = now_mono
+                plan_fit.refresh_pricing(STATE_DIR)
+            if now_mono - last_usage_run >= USAGE_COLLECT_INTERVAL_SECONDS:
+                last_usage_run = now_mono
+                usage_collector.collect(STATE_DIR, quiet=True)
+                usage_collector.compact(STATE_DIR, quiet=True)
+                plan_fit.write_plan_fit(STATE_DIR, datetime.now().astimezone())
+                log("usage analytics: collected, compacted, plan_fit.json refreshed")
+        except Exception as e:
+            log(f"ERROR in usage analytics cycle: {e!r}")
         time.sleep(POLL_INTERVAL_SECONDS)
 
 

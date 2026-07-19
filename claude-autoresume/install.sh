@@ -31,6 +31,8 @@ mkdir -p "$INSTALL_DIR" "$STATE_DIR/logs"
 cp autoresume.py "$INSTALL_DIR/autoresume.py"
 chmod +x "$INSTALL_DIR/autoresume.py"
 cp cowork_resume.py "$INSTALL_DIR/cowork_resume.py"
+cp usage_collector.py "$INSTALL_DIR/usage_collector.py"
+cp plan_fit.py "$INSTALL_DIR/plan_fit.py"
 
 echo "==> Writing LaunchAgent plist to $PLIST_PATH ..."
 mkdir -p "$LAUNCH_AGENTS_DIR"
