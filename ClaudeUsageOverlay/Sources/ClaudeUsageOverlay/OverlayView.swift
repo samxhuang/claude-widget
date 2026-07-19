@@ -582,11 +582,17 @@ struct OverlayView: View {
     /// ticked off the shared UI cadence) is the clock for the countdown.
     @ViewBuilder
     private func budgetRow(label: String, window w: BudgetWindow) -> some View {
+        // When the projection overshoots the limit, the red-pinned dot says
+        // "over" but not by how much — append the projected dollar landing
+        // and the overrun ("proj $612 (+$112)") to the spent/limit caption.
+        let caption = [planFit.budgetSpentText(w), planFit.budgetOverrunText(w)]
+            .compactMap { $0 }
+            .joined(separator: " · ")
         row(label: label,
             percent: planFit.budgetPct(w),
             estimatedPercent: planFit.budgetProjectedPct(w),
             resetText: planFit.budgetResetText(w, now: sessions.now),
-            trailingCaption: planFit.budgetSpentText(w))
+            trailingCaption: caption)
     }
 
     // MARK: - Interrupted sessions

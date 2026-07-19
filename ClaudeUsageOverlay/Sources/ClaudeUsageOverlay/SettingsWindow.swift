@@ -108,11 +108,13 @@ struct AccountBudgetSection: View {
     @State private var monthlyText: String = ""
     @State private var weekStart: String = "monday"
     @State private var seeded = false
-    /// Finding 2: snapshot of the section-owned config fields as this section
-    /// last seeded or persisted them. Used to tell an *external* config edit
-    /// (ConfigStore.reloadIfChanged picking up a hand-edited config.json) apart
-    /// from the echo of our own write — only the former should re-seed the
-    /// fields, so in-progress typing isn't stomped by our own persist round-trip.
+    /// Snapshot of the section-owned config fields as this section last
+    /// seeded them or wrote them via Apply. Fields now buffer locally until
+    /// Apply (no save-on-change), so this serves two jobs: `isDirty`
+    /// (edits differ from what's applied → enable Apply/Cancel) and external-
+    /// edit attribution (a config change arriving while the user has NO
+    /// pending edits re-seeds the fields; one arriving mid-edit leaves their
+    /// typing alone — they can Cancel to pick it up).
     @State private var lastSyncedSnapshot: SectionSnapshot?
 
     /// The subset of AppConfig this section reads/writes, compared to decide
@@ -136,6 +138,26 @@ struct AccountBudgetSection: View {
     private var weeklyValid: Bool { Self.isValidBudget(weeklyText) }
     private var monthlyValid: Bool { Self.isValidBudget(monthlyText) }
 
+    /// The fields as currently edited (not yet applied), in snapshot form.
+    private var editedSnapshot: SectionSnapshot {
+        SectionSnapshot(
+            choice: accountChoice,
+            weeklyUsd: weeklyText.isEmpty ? nil : Double(weeklyText),
+            monthlyUsd: monthlyText.isEmpty ? nil : Double(monthlyText),
+            weekStart: weekStart
+        )
+    }
+
+    private var hasInvalidInput: Bool {
+        (!weeklyText.isEmpty && !weeklyValid) || (!monthlyText.isEmpty && !monthlyValid)
+    }
+
+    /// Edits differ from the live config (or hold invalid text worth
+    /// cancelling out of). Drives the Apply/Cancel enabled state.
+    private var isDirty: Bool {
+        hasInvalidInput || editedSnapshot != snapshot(of: configStore.config)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Account & Budget")
@@ -147,7 +169,6 @@ struct AccountBudgetSection: View {
                 }
             }
             .pickerStyle(.menu)
-            .onChange(of: accountChoice) { _ in persistAccount() }
 
             // Budget fields are meaningful for both account types (the daemon
             // emits the budget block for Max too — the widget just doesn't
@@ -160,7 +181,6 @@ struct AccountBudgetSection: View {
                         Text("$")
                         TextField("none", text: $weeklyText)
                             .frame(width: 100)
-                            .onChange(of: weeklyText) { _ in persistBudget() }
                         if !weeklyText.isEmpty && !weeklyValid {
                             Text("must be a positive number").foregroundColor(.red).font(.caption)
                         }
@@ -172,7 +192,6 @@ struct AccountBudgetSection: View {
                         Text("$")
                         TextField("none", text: $monthlyText)
                             .frame(width: 100)
-                            .onChange(of: monthlyText) { _ in persistBudget() }
                         if !monthlyText.isEmpty && !monthlyValid {
                             Text("must be a positive number").foregroundColor(.red).font(.caption)
                         }
@@ -187,7 +206,6 @@ struct AccountBudgetSection: View {
                     }
                     .labelsHidden()
                     .frame(width: 140)
-                    .onChange(of: weekStart) { _ in persistBudget() }
                 }
             }
 
@@ -196,17 +214,28 @@ struct AccountBudgetSection: View {
                  : "Budgets are saved but the main tab shows Max session/weekly percentages for this account type.")
                 .font(.caption)
                 .foregroundColor(.secondary)
+
+            // Edits buffer locally until Apply — nothing is written on
+            // change, so it's unambiguous when settings take effect. Both
+            // buttons stay disabled while the fields match the live config.
+            HStack {
+                Spacer()
+                Button("Cancel") { applyConfig(configStore.config) }
+                    .disabled(!isDirty)
+                Button("Apply") { applyEdits() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!isDirty || hasInvalidInput)
+            }
         }
         .onAppear(perform: seedFromConfig)
         // Finding 2: the Settings window is kept alive (isReleasedWhenClosed =
         // false), so an externally-edited config.json picked up by
         // ConfigStore.reloadIfChanged must reflect here without a relaunch.
-        // Mirror the HostRow re-seed — but only when the incoming change didn't
-        // originate from this section's own persist (compare against the last
-        // snapshot we wrote/seeded), so our own write's echo doesn't clobber a
-        // value the user is mid-typing.
+        // Re-seed only when the user has no pending edits relative to what we
+        // last seeded/applied — an external change arriving mid-edit leaves
+        // their typing alone (Cancel discards it and picks up the new values).
         .onChange(of: configStore.config) { newConfig in
-            if snapshot(of: newConfig) != lastSyncedSnapshot {
+            if editedSnapshot == lastSyncedSnapshot {
                 applyConfig(newConfig)
             }
         }
@@ -231,26 +260,17 @@ struct AccountBudgetSection: View {
         lastSyncedSnapshot = snapshot(of: c)
     }
 
-    private func persistAccount() {
+    /// Apply: write all buffered edits to config in one go. Only reachable
+    /// with valid input (the button disables on hasInvalidInput). Records the
+    /// applied snapshot so the resulting config publish isn't mistaken for an
+    /// external edit.
+    private func applyEdits() {
         let (type, plan) = accountChoice.typeAndPlan(preservingPlan: configStore.config.accountPlan)
         configStore.setAccount(type: type, plan: plan)
-        // Record what we just wrote so the resulting config change isn't
-        // mistaken for an external edit and re-seeded on top of live edits.
-        lastSyncedSnapshot = snapshot(of: configStore.config)
-    }
-
-    private func persistBudget() {
-        // Empty ⇒ nil (unconfigured). Invalid partial input ⇒ don't persist
-        // this keystroke; the red caption already flags it and a later valid
-        // edit saves.
-        let weekly = weeklyText.isEmpty ? nil : Double(weeklyText)
-        let monthly = monthlyText.isEmpty ? nil : Double(monthlyText)
-        if (!weeklyText.isEmpty && weekly == nil) || (!monthlyText.isEmpty && monthly == nil) {
-            return
-        }
-        configStore.setBudget(weeklyUsd: weekly, monthlyUsd: monthly,
+        configStore.setBudget(weeklyUsd: weeklyText.isEmpty ? nil : Double(weeklyText),
+                              monthlyUsd: monthlyText.isEmpty ? nil : Double(monthlyText),
                               weekStart: weekStart, timezone: configStore.config.timezone)
-        lastSyncedSnapshot = snapshot(of: configStore.config)
+        lastSyncedSnapshot = editedSnapshot
     }
 
     private static func isValidBudget(_ s: String) -> Bool {

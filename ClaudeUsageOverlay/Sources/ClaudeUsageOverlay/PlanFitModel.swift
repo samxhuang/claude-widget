@@ -377,10 +377,24 @@ final class PlanFitModel: ObservableObject {
         return "resets in \(DurationFormat.compact(interval))"
     }
 
+    /// When the linear projection lands past the limit: "proj $612 (+$112)" —
+    /// the dollar figure the period is on track to reach and how far over the
+    /// budget that is. nil when there's no projection or it's within budget,
+    /// so callers can append it only in the overrun case. Whole dollars — a
+    /// projection is an estimate, cents would be false precision.
+    func budgetOverrunText(_ w: BudgetWindow) -> String? {
+        guard let projected = w.projectedUsd, let limit = w.limitUsd,
+              projected > limit else { return nil }
+        let proj = String(format: "$%.0f", projected)
+        let over = String(format: "$%.0f", projected - limit)
+        return "proj \(proj) (+\(over))"
+    }
+
     /// Compact one-liner for the Plan-fit tab's API-account budget summary,
-    /// e.g. "Weekly $61 / $200 (31%)". Whole dollars only — the tab is a
-    /// reference view, not the live bar. Returns nil when the period is
-    /// unconfigured so the caller can omit the line.
+    /// e.g. "Weekly $61 / $200 (31%)", plus the projected overrun when the
+    /// period is on track to blow through the limit. Whole dollars only — the
+    /// tab is a reference view, not the live bar. Returns nil when the period
+    /// is unconfigured so the caller can omit the line.
     func budgetSummaryLine(label: String, window: BudgetWindow?) -> String? {
         guard let w = window, let limit = w.limitUsd else { return nil }
         let spent = String(format: "$%.0f", w.spentUsd ?? 0)
@@ -388,6 +402,9 @@ final class PlanFitModel: ObservableObject {
         var line = "\(label) \(spent) / \(limitText)"
         if let pct = w.pct {
             line += String(format: " (%.0f%%)", pct)
+        }
+        if let overrun = budgetOverrunText(w) {
+            line += " — \(overrun) over"
         }
         return line
     }
