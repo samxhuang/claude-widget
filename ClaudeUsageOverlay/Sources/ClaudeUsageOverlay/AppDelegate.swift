@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let sessionsModel = SessionsModel()
     private let chatsModel = ChatsModel()
     private let planFitModel = PlanFitModel()
+    private let graphModel = GraphModel()
     // One hidden, authenticated WKWebView shared by both fetchers — see
     // ClaudeWebSession's header comment for why this isn't two webviews.
     private let webSession = ClaudeWebSession()
@@ -26,17 +27,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Anchored to the top-right corner of the screen — resizing only moves
     // the bottom edge, never the top-right one.
     private let panelWidth: CGFloat = 280
-    private let collapsedPanelHeight: CGFloat = 214
-    private let sessionsExpandedExtra: CGFloat = 290
-    private let chatsExpandedExtra: CGFloat = 280
+    // +3pt so the collapsed Plan fit row (the last thing in the card) isn't
+    // flush against the panel's bottom edge — pairs with the matching
+    // .padding(.bottom, 3) on planFitSection's header row in OverlayView.
+    private let collapsedPanelHeight: CGFloat = 217
+    // Both sections are wrapped in a ScrollView, so these only need to cover
+    // a handful of visible rows — the ScrollView absorbs any overflow rather
+    // than the panel growing to fit every entry. Halved from their original
+    // values, which left roughly 2x the space actually needed on screen.
+    private let sessionsExpandedExtra: CGFloat = 145
+    private let chatsExpandedExtra: CGFloat = 140
     // Plan fit isn't wrapped in a ScrollView (unlike Sessions/Chats) since
     // its content is a fixed handful of lines, so this needs to cover the
     // full expanded height: up to 4 moving-average lines, the API-equivalent
     // line, the peaks line, up to 3 tier lines, and the (possibly
     // two-line-wrapped) maturity + recommendation text.
     private let planFitExpandedExtra: CGFloat = 260
+    // The Graph tab replaces the collapsible-sections layout entirely with a
+    // period picker plus two stacked mini-charts, so it gets its own fixed
+    // height rather than participating in the collapsed/expanded-extras math
+    // above.
+    private let graphPanelHeight: CGFloat = 400
     private var panelTopY: CGFloat = 0
     private var panelRightX: CGFloat = 0
+
+    private static let panelLockedDefaultsKey = "panelPositionLocked"
+    /// Persisted; defaults to unlocked so existing drag-to-move behavior is
+    /// unchanged until the user opts in from the menu.
+    private var panelPositionLocked: Bool = UserDefaults.standard.bool(forKey: AppDelegate.panelLockedDefaultsKey) {
+        didSet {
+            UserDefaults.standard.set(panelPositionLocked, forKey: Self.panelLockedDefaultsKey)
+            applyPanelLockState()
+        }
+    }
 
     // How often we hit claude.ai's usage endpoint. Kept conservative on
     // purpose — this is an unofficial, undocumented endpoint and there's no
@@ -62,14 +85,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.chatsFetcher.refresh()
         }
 
-        // Plan fit reads a local file (no webview dependency), so it can
-        // refresh immediately rather than waiting on the webview navigation.
+        // Plan fit and the graph data both read local files (no webview
+        // dependency), so they can refresh immediately rather than waiting
+        // on the webview navigation.
         planFitModel.refresh()
+        graphModel.refresh()
 
         dataTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.fetcher.refresh()
             self?.chatsFetcher.refresh()
             self?.planFitModel.refresh()
+            self?.graphModel.refresh()
         }
         uiTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.model.tick()
@@ -108,6 +134,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.statusItem.menu?.item(withTitle: "Show Plan Fit")?.state = expanded ? .on : .off
             }
             .store(in: &cancellables)
+
+        // The Graph tab uses a fixed panel height distinct from the
+        // collapsed/expanded-extras math the Main tab uses, so switching
+        // tabs needs the same resize-on-change treatment as the collapsible
+        // sections above.
+        graphModel.$selectedTab
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updatePanelSize()
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Status bar menu
@@ -144,6 +182,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(planFitToggleItem)
 
         menu.addItem(.separator())
+
+        let lockPositionItem = NSMenuItem(title: "Lock Position", action: #selector(toggleLockPosition), keyEquivalent: "")
+        lockPositionItem.target = self
+        lockPositionItem.state = panelPositionLocked ? .on : .off
+        menu.addItem(lockPositionItem)
+
+        menu.addItem(.separator())
         menu.addItem(withTitle: "Sign In…", action: #selector(presentLoginWindow), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Sign Out", action: #selector(signOut), keyEquivalent: "").target = self
         menu.addItem(.separator())
@@ -167,6 +212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePlanFitSection() {
         planFitModel.planFitExpanded.toggle()
+    }
+
+    @objc private func toggleLockPosition() {
+        panelPositionLocked.toggle()
+        statusItem.menu?.item(withTitle: "Lock Position")?.state = panelPositionLocked ? .on : .off
     }
 
     @objc private func toggleOverlay() {
@@ -206,7 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupOverlayPanel() {
         let initialHeight = currentPanelHeight()
 
-        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, planFit: planFitModel))
+        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, planFit: planFitModel, graph: graphModel))
         // Without this, NSHostingView installs Auto Layout min/max-size
         // constraints on itself (macOS 13+ default: .standardBounds) that
         // reflect the SwiftUI content's intrinsic size — and since it's the
@@ -239,6 +289,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         panel.orderFrontRegardless()
         self.overlayPanel = panel
+        applyPanelLockState()
+    }
+
+    /// Reflects `panelPositionLocked` onto the live panel. Both `isMovable`
+    /// (blocks programmatic/title-bar-style moves) and
+    /// `isMovableByWindowBackground` (blocks the click-drag-anywhere
+    /// behavior this borderless panel relies on day to day) are set
+    /// together since either alone wouldn't fully prevent an accidental
+    /// drag. Defaults to unlocked, so out of the box nothing changes.
+    private func applyPanelLockState() {
+        guard let panel = overlayPanel else { return }
+        panel.isMovable = !panelPositionLocked
+        panel.isMovableByWindowBackground = !panelPositionLocked
     }
 
     /// Records the top-right corner (in screen coordinates) the panel should
@@ -255,10 +318,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSRect(x: panelRightX - panelWidth, y: panelTopY - height, width: panelWidth, height: height)
     }
 
-    /// Sessions, Recent chats, and Plan fit are independently collapsible,
-    /// so the panel's height is the collapsed base plus whichever of the
-    /// three sections' extra heights currently apply.
+    /// On the Main tab, Sessions, Recent chats, and Plan fit are
+    /// independently collapsible, so the panel's height is the collapsed
+    /// base plus whichever of the three sections' extra heights currently
+    /// apply. The Graph tab replaces all of that with its own fixed height.
     private func currentPanelHeight() -> CGFloat {
+        if graphModel.selectedTab == .graph {
+            return graphPanelHeight
+        }
         var height = collapsedPanelHeight
         if sessionsModel.sessionsExpanded { height += sessionsExpandedExtra }
         if chatsModel.chatsExpanded { height += chatsExpandedExtra }

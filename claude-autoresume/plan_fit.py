@@ -811,6 +811,17 @@ def compute(state_dir: Path, now: datetime) -> dict:
     days_covered_widest = moving_averages[f"{widest_window}d"]["days_covered"]
     verdict = _verdict(tier_projection, run_rate, days_covered_widest, widest_window)
 
+    # Graph-ready cost series for the widget's usage-over-time view. Hourly
+    # covers the widget's 24h/7d/1mo ranges; daily keeps the 3mo view compact.
+    # Keys are ISO timestamps so Swift can parse without knowing bucket rules.
+    hourly_cutoff = _ensure_utc(now) - timedelta(days=35)
+    hourly_series = {
+        h.isoformat(): round(c, 4)
+        for h, c in sorted(hourly_cost.items())
+        if h >= hourly_cutoff
+    }
+    daily_series = {d.isoformat(): round(c, 2) for d, c in sorted(daily_cost.items())}
+
     totals_out = {}
     for model_id, t in sorted(totals_by_model.items()):
         totals_out[model_id] = {
@@ -828,6 +839,7 @@ def compute(state_dir: Path, now: datetime) -> dict:
     return {
         "generated_at": now.isoformat(),
         "current_plan": CURRENT_PLAN,
+        "cost_series": {"hourly": hourly_series, "daily": daily_series},
         "moving_averages": moving_averages,
         "monthly_run_rate": run_rate,
         "cost_peaks": cost_peaks,

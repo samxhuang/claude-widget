@@ -6,6 +6,7 @@ struct OverlayView: View {
     @ObservedObject var sessions: SessionsModel
     @ObservedObject var chats: ChatsModel
     @ObservedObject var planFit: PlanFitModel
+    @ObservedObject var graph: GraphModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -26,24 +27,13 @@ struct OverlayView: View {
                 }
             }
 
-            row(label: "Session (5h)", percent: model.sessionPercent, resetText: model.resetText(for: model.sessionResetsAt))
-            row(label: "Weekly", percent: model.weeklyPercent, resetText: model.resetText(for: model.weeklyResetsAt))
+            tabSwitch
 
-            Text(model.lastUpdatedText)
-                .font(.system(size: 8.5))
-                .foregroundColor(.white.opacity(0.4))
-
-            Divider().background(Color.white.opacity(0.15))
-
-            sessionsSection
-
-            Divider().background(Color.white.opacity(0.15))
-
-            chatsSection
-
-            Divider().background(Color.white.opacity(0.15))
-
-            planFitSection
+            if graph.selectedTab == .main {
+                mainTabContent
+            } else {
+                GraphView(model: graph)
+            }
         }
         .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
         .frame(width: 280)
@@ -61,6 +51,60 @@ struct OverlayView: View {
         // Pin it to the top so it stays flush with the anchored top edge
         // instead of SwiftUI centering it in the leftover space.
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    // MARK: - Tab switch
+
+    /// Small pill-style tab switch between the existing main view (usage
+    /// bars + sessions + chats + plan fit) and the new Graph view. Styled to
+    /// match the panel's existing dark, compact controls rather than a
+    /// native segmented control, which would look out of place here.
+    private var tabSwitch: some View {
+        HStack(spacing: 4) {
+            tabButton(title: "Main", tab: .main)
+            tabButton(title: "Graph", tab: .graph)
+            Spacer()
+        }
+    }
+
+    private func tabButton(title: String, tab: PanelTab) -> some View {
+        Text(title)
+            .font(.system(size: 9.5, weight: graph.selectedTab == tab ? .bold : .medium))
+            .foregroundColor(graph.selectedTab == tab ? .white : .white.opacity(0.5))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill(graph.selectedTab == tab ? Color.white.opacity(0.18) : Color.clear)
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                guard graph.selectedTab != tab else { return }
+                graph.toggleTab()
+            }
+    }
+
+    // MARK: - Main tab content
+
+    @ViewBuilder
+    private var mainTabContent: some View {
+        row(label: "Session (5h)", percent: model.sessionPercent, resetText: model.resetText(for: model.sessionResetsAt))
+        row(label: "Weekly", percent: model.weeklyPercent, resetText: model.resetText(for: model.weeklyResetsAt))
+
+        Text(model.lastUpdatedText)
+            .font(.system(size: 8.5))
+            .foregroundColor(.white.opacity(0.4))
+
+        Divider().background(Color.white.opacity(0.15))
+
+        sessionsSection
+
+        Divider().background(Color.white.opacity(0.15))
+
+        chatsSection
+
+        Divider().background(Color.white.opacity(0.15))
+
+        planFitSection
     }
 
     // MARK: - Interrupted sessions
@@ -314,6 +358,11 @@ struct OverlayView: View {
             }
         }
         .contentShape(Rectangle())
+        // Collapsed, this header row is the last thing in the card — without
+        // a little breathing room here the text sits flush against the
+        // panel's bottom edge. Only needed while collapsed; expanded state
+        // already has plenty of trailing content below it.
+        .padding(.bottom, planFit.planFitExpanded ? 0 : 3)
         .onTapGesture {
             planFit.toggleExpanded()
         }
