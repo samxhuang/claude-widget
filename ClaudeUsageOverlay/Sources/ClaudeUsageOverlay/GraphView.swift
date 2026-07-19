@@ -153,7 +153,7 @@ struct GraphView: View {
     private func axisLabel(for date: Date) -> String {
         let f = DateFormatter()
         switch model.period {
-        case .day: f.dateFormat = "ha"
+        case .fiveHour, .day: f.dateFormat = "ha"
         case .week: f.dateFormat = "EEE"
         case .month, .threeMonth: f.dateFormat = "M/d"
         }

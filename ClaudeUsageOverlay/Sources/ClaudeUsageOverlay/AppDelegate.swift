@@ -25,8 +25,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Panel sizing: fixed width, height computed from which of the three
     // collapsible sections (Sessions, Recent chats, Plan fit) are expanded.
-    // Anchored to the top-right corner of the screen — resizing only moves
-    // the bottom edge, never the top-right one.
+    // Anchored to the panel's own top-right corner — resizing only moves the
+    // bottom edge, never the top-right one. Item 1 fix: this used to be a
+    // screen-relative anchor computed once at launch (panelTopY/panelRightX)
+    // and never updated, so a resize would silently snap the panel back to
+    // its launch position instead of preserving wherever it currently was
+    // (e.g. after a manual drag) — see updatePanelSize's doc comment for the
+    // full diagnosis. It's now derived from the panel's live frame on every
+    // resize instead of a cached value.
     private let panelWidth: CGFloat = 280
     // Item 1 audit: every constant below was calibrated against SwiftUI's
     // own ground-truth fitting size (NSHostingView.intrinsicContentSize for
@@ -70,8 +76,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // ~100pt of dead space at the bottom. Item 2's y-axis label gutters sit
     // inside the charts' existing frame(height:) and don't add any height.
     private let graphPanelHeight: CGFloat = 316
-    private var panelTopY: CGFloat = 0
-    private var panelRightX: CGFloat = 0
 
     private static let panelLockedDefaultsKey = "panelPositionLocked"
     /// Persisted; defaults to unlocked so existing drag-to-move behavior is
@@ -205,6 +209,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        // Pairs naturally with Lock Position below: snap flush into the
+        // corner, then lock it there.
+        let snapToTopRightItem = NSMenuItem(title: "Snap to Top Right", action: #selector(snapToTopRight), keyEquivalent: "")
+        snapToTopRightItem.target = self
+        menu.addItem(snapToTopRightItem)
+
         let lockPositionItem = NSMenuItem(title: "Lock Position", action: #selector(toggleLockPosition), keyEquivalent: "")
         lockPositionItem.target = self
         lockPositionItem.state = panelPositionLocked ? .on : .off
@@ -318,8 +328,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.contentView = hosting
 
-        computeAnchor(width: panelWidth)
-        panel.setFrame(frameForCurrentAnchor(height: initialHeight), display: false)
+        panel.setFrame(initialPanelFrame(height: initialHeight), display: false)
 
         panel.orderFrontRegardless()
         self.overlayPanel = panel
@@ -338,18 +347,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = !panelPositionLocked
     }
 
-    /// Records the top-right corner (in screen coordinates) the panel should
-    /// stay pinned to, independent of its current height.
-    private func computeAnchor(width: CGFloat) {
-        guard let screen = NSScreen.main else { return }
+    /// The panel's very first frame, placed at the top-right of the main
+    /// screen's visible area (i.e. below the menu bar) with a comfortable
+    /// margin. This is the *only* place a screen-derived position is
+    /// computed — every subsequent resize (see updatePanelSize below)
+    /// preserves whatever top-right corner the panel already occupies
+    /// rather than re-deriving one, so a manual drag away from this default
+    /// sticks.
+    private func initialPanelFrame(height: CGFloat) -> NSRect {
         let margin: CGFloat = 14
-        let visible = screen.visibleFrame
-        panelRightX = visible.maxX - margin
-        panelTopY = visible.maxY - margin
-    }
-
-    private func frameForCurrentAnchor(height: CGFloat) -> NSRect {
-        NSRect(x: panelRightX - panelWidth, y: panelTopY - height, width: panelWidth, height: height)
+        let visible = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let x = visible.maxX - margin - panelWidth
+        let y = visible.maxY - margin - height
+        return NSRect(x: x, y: y, width: panelWidth, height: height)
     }
 
     /// On the Main tab, Sessions, Recent chats, and Plan fit are
@@ -367,11 +378,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return height
     }
 
+    /// Item 1 fix: resizes the panel while preserving its TOP-RIGHT corner,
+    /// i.e. it grows/shrinks purely downward-and-leftward from wherever that
+    /// corner currently is. NSWindow.setFrame's default behavior anchors the
+    /// window's *origin* (bottom-left corner) and grows toward the top-right
+    /// on a height/width change — harmless for a window anchored at its
+    /// bottom-left, but exactly backwards for this panel, which the user
+    /// anchors at its TOP-right (e.g. flush into the screen's top-right
+    /// corner to minimize screen use): a height change would silently walk
+    /// the top edge upward/downward and away from wherever they'd placed it,
+    /// which is what item 1 reported as "jumps off the top-right edge" on a
+    /// Main/Graph tab switch (tabs have different fixed/derived heights, so
+    /// nearly every switch is a resize).
+    ///
+    /// Deriving the new origin from the panel's own *current* frame (rather
+    /// than a screen-relative anchor computed once at launch and never
+    /// updated) also fixes a second bug that compounds the first: the panel
+    /// is user-draggable via isMovableByWindowBackground whenever unlocked,
+    /// and a launch-time anchor has no way of tracking that drag — so even
+    /// a perfectly top-right-preserving resize would have snapped back to
+    /// the *original* launch position instead of wherever the user last put
+    /// it. Reading `panel.frame` here means the most recent drag (or the
+    /// initial placement, if never dragged) IS the anchor, full stop.
+    ///
+    /// Applied unconditionally — locked or unlocked — per the task: the
+    /// panel should always grow/shrink from its current top edge, and
+    /// "locked" only needs to additionally block drag/move, which
+    /// applyPanelLockState already handles separately.
     private func updatePanelSize() {
         guard let panel = overlayPanel else { return }
+        let oldFrame = panel.frame
+        let newHeight = currentPanelHeight()
+        let newOrigin = NSPoint(x: oldFrame.maxX - panelWidth, y: oldFrame.maxY - newHeight)
+        let newFrame = NSRect(origin: newOrigin, size: NSSize(width: panelWidth, height: newHeight))
         // No animation: keeps this a plain, immediate resize with no
         // in-flight state that could interact oddly with the click that
         // triggered it.
-        panel.setFrame(frameForCurrentAnchor(height: currentPanelHeight()), display: true, animate: false)
+        panel.setFrame(newFrame, display: true, animate: false)
+    }
+
+    /// Item 1: moves the panel flush to the top-right corner of whichever
+    /// screen it's currently on (falling back to the main screen if, for
+    /// some reason, the panel isn't associated with one yet), respecting the
+    /// menu bar via visibleFrame and a small 4pt inset. A user action from
+    /// the menu — pairs naturally with "Lock Position" (snap, then lock) —
+    /// rather than something applied automatically on every resize, per the
+    /// task: auto-re-snapping on every resize would fight a user who
+    /// deliberately dragged the panel somewhere else.
+    @objc private func snapToTopRight() {
+        guard let panel = overlayPanel else { return }
+        let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first
+        guard let visible = screen?.visibleFrame else { return }
+        let inset: CGFloat = 4
+        let height = panel.frame.height
+        let newOrigin = NSPoint(x: visible.maxX - inset - panelWidth, y: visible.maxY - inset - height)
+        let newFrame = NSRect(origin: newOrigin, size: NSSize(width: panelWidth, height: height))
+        panel.setFrame(newFrame, display: true, animate: false)
     }
 }

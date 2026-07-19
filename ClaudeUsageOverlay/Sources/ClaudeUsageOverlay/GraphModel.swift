@@ -11,6 +11,11 @@ enum PanelTab: String {
 /// bucket width for the utilization chart, chosen so a full period
 /// downsamples to at most ~300 drawn points.
 enum GraphPeriod: String, CaseIterable, Identifiable {
+    // First in declaration order = first in GraphPeriod.allCases = first
+    // (leftmost) segment in both period pickers. 5h matches Claude's
+    // five-hour rate-limit window, making it the natural "current session"
+    // view — hence it leads.
+    case fiveHour = "5h"
     case day = "24h"
     case week = "7d"
     case month = "1mo"
@@ -20,6 +25,7 @@ enum GraphPeriod: String, CaseIterable, Identifiable {
 
     var durationSeconds: TimeInterval {
         switch self {
+        case .fiveHour: return 5 * 3600
         case .day: return 24 * 3600
         case .week: return 7 * 24 * 3600
         case .month: return 30 * 24 * 3600
@@ -29,6 +35,11 @@ enum GraphPeriod: String, CaseIterable, Identifiable {
 
     var utilBucketSeconds: TimeInterval {
         switch self {
+        // Raw snapshots land roughly every 2 minutes (SnapshotLogger's
+        // minInterval), so 2-min buckets are the finest granularity that
+        // actually exists — a 5h window is ~150 of them, well under the
+        // ~300-point downsampling target, so this never over-aggregates.
+        case .fiveHour: return 2 * 60     // ~150 buckets
         case .day: return 5 * 60          // ~288 buckets
         case .week: return 30 * 60        // ~336 buckets
         case .month: return 3 * 3600      // ~240 buckets
@@ -49,6 +60,16 @@ enum GraphPeriod: String, CaseIterable, Identifiable {
 struct UtilBucket: Identifiable {
     let id = UUID()
     var date: Date
+    /// This bucket's actual width in seconds — i.e. it covers
+    /// [date, date + bucketSeconds). Item 2: threaded through from wherever
+    /// each bucket is built below (rather than the hover readout guessing a
+    /// width from pixel distance), so the readout's displayed range always
+    /// matches the granularity actually rendered. Usually equal to the
+    /// period's nominal `utilBucketSeconds`, but the trailing bucket of a
+    /// period is clamped to the real data window (typically "now"), so it
+    /// carries its own possibly-shorter width instead of overstating one
+    /// that hasn't happened yet.
+    var bucketSeconds: TimeInterval
     var fiveAvg: Double?
     var fiveMax: Double?
     var sevenAvg: Double?
@@ -59,6 +80,10 @@ struct UtilBucket: Identifiable {
 struct CostBucket: Identifiable {
     let id = UUID()
     var date: Date
+    /// This bucket's width in seconds (an hour, several hours, or a day —
+    /// see hourlyCostBuckets/dailyCostBuckets below), threaded through for
+    /// the same reason as UtilBucket.bucketSeconds.
+    var bucketSeconds: TimeInterval
     var usd: Double
 }
 
@@ -300,23 +325,30 @@ final class GraphModel: ObservableObject {
         while t < end {
             let bEnd = min(t.addingTimeInterval(bucketSeconds), end)
 
+            // The trailing bucket of a period is often clamped against `end`
+            // (usually "now"), so its real width can be shorter than the
+            // nominal bucketSeconds — carry the actual width, not the
+            // nominal one, so a hover readout over it doesn't show a range
+            // extending past "now".
+            let actualWidth = bEnd.timeIntervalSince(t)
+
             let rawSlice = raw.filter { $0.date >= t && $0.date < bEnd }
             if !rawSlice.isEmpty {
                 let fiveVals = rawSlice.compactMap { $0.five }
                 let sevenVals = rawSlice.compactMap { $0.seven }
                 buckets.append(UtilBucket(
-                    date: t,
+                    date: t, bucketSeconds: actualWidth,
                     fiveAvg: average(fiveVals), fiveMax: fiveVals.max(),
                     sevenAvg: average(sevenVals), sevenMax: sevenVals.max()
                 ))
             } else {
                 let rows15 = b15.filter { $0.tsStart >= t && $0.tsStart < bEnd }
                 if !rows15.isEmpty {
-                    buckets.append(combineBucketRows(rows15, date: t))
+                    buckets.append(combineBucketRows(rows15, date: t, bucketSeconds: actualWidth))
                 } else {
                     let rows1h = b1h.filter { $0.tsStart >= t && $0.tsStart < bEnd }
                     if !rows1h.isEmpty {
-                        buckets.append(combineBucketRows(rows1h, date: t))
+                        buckets.append(combineBucketRows(rows1h, date: t, bucketSeconds: actualWidth))
                     }
                     // else: no data at any tier for this time range — leave a gap.
                 }
@@ -326,9 +358,9 @@ final class GraphModel: ObservableObject {
         return buckets
     }
 
-    private static func combineBucketRows(_ rows: [BucketRow], date: Date) -> UtilBucket {
+    private static func combineBucketRows(_ rows: [BucketRow], date: Date, bucketSeconds: TimeInterval) -> UtilBucket {
         UtilBucket(
-            date: date,
+            date: date, bucketSeconds: bucketSeconds,
             fiveAvg: average(rows.compactMap { $0.fiveAvg }),
             fiveMax: rows.compactMap { $0.fiveMax }.max(),
             sevenAvg: average(rows.compactMap { $0.sevenAvg }),
@@ -356,6 +388,8 @@ final class GraphModel: ObservableObject {
         let comps = cal.dateComponents([.year, .month, .day, .hour], from: start)
         var t = cal.date(from: comps) ?? start
 
+        let stepSeconds = Double(stepHours) * 3600
+
         var out: [CostBucket] = []
         while t < end {
             var sum = 0.0
@@ -366,8 +400,8 @@ final class GraphModel: ObservableObject {
                 sum += hourly[hourDate] ?? 0
                 slots += 1
             }
-            out.append(CostBucket(date: t, usd: slots > 0 ? sum / Double(slots) : 0))
-            t = t.addingTimeInterval(Double(stepHours) * 3600)
+            out.append(CostBucket(date: t, bucketSeconds: stepSeconds, usd: slots > 0 ? sum / Double(slots) : 0))
+            t = t.addingTimeInterval(stepSeconds)
         }
         return out
     }
@@ -387,7 +421,7 @@ final class GraphModel: ObservableObject {
         var out: [CostBucket] = []
         while t < end {
             let key = fmt.string(from: t)
-            out.append(CostBucket(date: t, usd: daily[key] ?? 0))
+            out.append(CostBucket(date: t, bucketSeconds: 86400, usd: daily[key] ?? 0))
             t = cal.date(byAdding: .day, value: 1, to: t) ?? t.addingTimeInterval(86400)
         }
         return out

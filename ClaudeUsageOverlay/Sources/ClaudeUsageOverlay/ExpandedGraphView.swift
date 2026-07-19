@@ -172,34 +172,82 @@ struct ExpandedGraphView: View {
 
     // MARK: - Floating readout
 
-    /// A stock-chart-style readout: while hovering, shows the exact
-    /// timestamp under the cursor plus the utilization (avg/peak/7d) and
-    /// cost values nearest that instant. Rendered as a fixed bar under both
-    /// charts rather than a tooltip that tracks the cursor pixel-for-pixel —
-    /// simpler to keep legible at this window's default size, and it never
-    /// occludes the chart it's describing.
+    /// A stock-chart-style readout: while hovering, shows the utilization
+    /// (avg/peak/7d) and cost values nearest that instant, each labeled with
+    /// the time RANGE of the specific bucket it came from (item 2) rather
+    /// than the exact instant under the cursor — a single timestamp
+    /// misleadingly implies more precision than an averaged/summed bucket
+    /// actually has. The two series can have different bucket widths at the
+    /// same period (e.g. 1mo: 3h utilization buckets vs 3h cost bars happen
+    /// to match, but 3mo: 8h utilization buckets vs 1-day cost bars don't),
+    /// so each gets its own range label rather than sharing one. Rendered as
+    /// a fixed bar under both charts rather than a tooltip that tracks the
+    /// cursor pixel-for-pixel — simpler to keep legible at this window's
+    /// default size, and it never occludes the chart it's describing.
     @ViewBuilder
     private var readoutBar: some View {
-        HStack(spacing: 16) {
+        VStack(alignment: .leading, spacing: 4) {
             if let hd = hoverDate {
-                Text(readoutTimeFormatter.string(from: hd))
-                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
-                    .foregroundColor(.white.opacity(0.85))
-
                 let ub = nearestUtilBucket(to: hd)
-                readoutValue("5h avg", ub?.fiveAvg.map { String(format: "%.0f%%", $0) } ?? "—", .cyan)
-                readoutValue("5h peak", ub?.fiveMax.map { String(format: "%.0f%%", $0) } ?? "—", .cyan.opacity(0.6))
-                readoutValue("7d avg", ub?.sevenAvg.map { String(format: "%.0f%%", $0) } ?? "—", .purple)
+                HStack(spacing: 16) {
+                    Text(ub.map { bucketRangeLabel(start: $0.date, bucketSeconds: $0.bucketSeconds) } ?? "—")
+                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                        .foregroundColor(.white.opacity(0.85))
+                    readoutValue("5h avg", ub?.fiveAvg.map { String(format: "%.0f%%", $0) } ?? "—", .cyan)
+                    readoutValue("5h peak", ub?.fiveMax.map { String(format: "%.0f%%", $0) } ?? "—", .cyan.opacity(0.6))
+                    readoutValue("7d avg", ub?.sevenAvg.map { String(format: "%.0f%%", $0) } ?? "—", .purple)
+                }
 
                 let cb = nearestCostBucket(to: hd)
-                readoutValue("cost", cb.map { GraphMetrics.dollarTick($0.usd) } ?? "—", .green)
+                HStack(spacing: 16) {
+                    Text(cb.map { bucketRangeLabel(start: $0.date, bucketSeconds: $0.bucketSeconds) } ?? "—")
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundColor(.white.opacity(0.5))
+                    readoutValue("cost", cb.map { GraphMetrics.dollarTick($0.usd) } ?? "—", .green)
+                }
             } else {
                 Text("Hover a chart for details · drag to zoom")
                     .font(.system(size: 9))
                     .foregroundColor(.white.opacity(0.3))
             }
         }
-        .frame(height: 16)
+    }
+
+    /// Formats a bucket's [start, start + bucketSeconds) span as a human
+    /// range, at whatever granularity that bucket actually is:
+    ///   - >= 1 day (3mo view's daily cost bars): just the date — "Jul 18"
+    ///   - >= 1 hour (cost bars, and month/3mo's coarser util buckets):
+    ///     hour range — "3–4 PM"
+    ///   - < 1 hour (2m/5m/15m/30m util buckets): minute range —
+    ///     "3:42–3:44 PM"
+    /// A day prefix ("Jul 18, 3–4 PM") is added whenever the selected period
+    /// spans more than a day, so an hour/minute range is never ambiguous
+    /// about which day it falls on.
+    private func bucketRangeLabel(start: Date, bucketSeconds: TimeInterval) -> String {
+        if bucketSeconds >= 24 * 3600 {
+            let f = DateFormatter()
+            f.dateFormat = "MMM d"
+            return f.string(from: start)
+        }
+
+        let end = start.addingTimeInterval(bucketSeconds)
+        var dayPrefix = ""
+        if model.period.durationSeconds > 24 * 3600 {
+            let df = DateFormatter()
+            df.dateFormat = "MMM d, "
+            dayPrefix = df.string(from: start)
+        }
+
+        let startFmt = DateFormatter()
+        let endFmt = DateFormatter()
+        if bucketSeconds < 3600 {
+            startFmt.dateFormat = "h:mm"
+            endFmt.dateFormat = "h:mm a"
+        } else {
+            startFmt.dateFormat = "h"
+            endFmt.dateFormat = "h a"
+        }
+        return "\(dayPrefix)\(startFmt.string(from: start))–\(endFmt.string(from: end))"
     }
 
     private func readoutValue(_ label: String, _ value: String, _ color: Color) -> some View {
@@ -217,16 +265,6 @@ struct ExpandedGraphView: View {
 
     private func nearestCostBucket(to date: Date) -> CostBucket? {
         model.costBuckets.min { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) }
-    }
-
-    private var readoutTimeFormatter: DateFormatter {
-        let f = DateFormatter()
-        switch model.period {
-        case .day: f.dateFormat = "h:mm a"
-        case .week: f.dateFormat = "EEE h:mm a"
-        case .month, .threeMonth: f.dateFormat = "MMM d, h:mm a"
-        }
-        return f
     }
 
     // MARK: - Shared helpers
@@ -270,7 +308,10 @@ struct ExpandedGraphView: View {
             f.dateFormat = "h:mm a"
         } else {
             switch model.period {
-            case .day: f.dateFormat = "ha"
+            // Unreachable for .fiveHour in practice (its full period is
+            // always under 36h, so the branch above always wins), but the
+            // switch must stay exhaustive.
+            case .fiveHour, .day: f.dateFormat = "ha"
             case .week: f.dateFormat = "EEE"
             case .month, .threeMonth: f.dateFormat = "M/d"
             }
