@@ -116,6 +116,13 @@ final class GraphModel: ObservableObject {
     /// Muted "collecting since Jul 18" note shown when the earliest known
     /// data point covers less than half the selected period.
     @Published var coverageNote: String?
+    /// Header readout for the cost chart: the summed API-equivalent cost of
+    /// the buckets actually plotted ("measured"), plus a linear full-period
+    /// estimate when the cost data doesn't span the whole selected period
+    /// (collection only started 2026-07-18, so the wider periods are partial
+    /// for a while). e.g. "$18.42" (full coverage) or "$18.42 · est $210"
+    /// (partial). nil when there's no cost data at all in the period.
+    @Published var costSummary: String?
 
     private let usageDir: URL
     private var lastToggleAt: Date = .distantPast
@@ -210,6 +217,9 @@ final class GraphModel: ObservableObject {
         costBuckets = period == .threeMonth
             ? Self.dailyCostBuckets(start: start, end: end, daily: dailyCost)
             : Self.hourlyCostBuckets(start: start, end: end, hourly: hourlyCost)
+        costSummary = Self.costSummaryText(
+            buckets: costBuckets, start: start, end: end,
+            earliest: costDataEarliest(), duration: period.durationSeconds)
 
         if let last = rawSnapshots.last {
             latestFiveHour = last.five
@@ -235,6 +245,49 @@ final class GraphModel: ObservableObject {
         } else {
             coverageNote = "collecting…"
         }
+    }
+
+    /// Earliest instant the cost series has any data for — the boundary
+    /// between "measured $0 because nothing ran" and "no measurement exists".
+    /// Daily keys are "YYYY-MM-DD" UTC (see plan_fit's cost_series).
+    private func costDataEarliest() -> Date? {
+        var earliest = hourlyCost.keys.min()
+        if let firstDaily = dailyCost.keys.min() {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd"
+            f.timeZone = TimeZone(identifier: "UTC")
+            if let d = f.date(from: firstDaily), earliest == nil || d < earliest! {
+                earliest = d
+            }
+        }
+        return earliest
+    }
+
+    /// "$18.42" when the cost data spans the whole period, "$18.42 · est $210"
+    /// when it starts partway through (linear scale-up of the measured sum to
+    /// the full period — same extrapolation style as the budget projection).
+    /// The estimate is suppressed below 5% coverage, where scaling up a sliver
+    /// would be noise presented as a number. nil when nothing is measured and
+    /// nothing can be estimated.
+    static func costSummaryText(buckets: [CostBucket], start: Date, end: Date,
+                                earliest: Date?, duration: TimeInterval) -> String? {
+        guard let earliest = earliest, earliest < end, duration > 0 else { return nil }
+        let measured = buckets.reduce(0) { $0 + $1.usd }
+        let text = "$" + Self.compactDollars(measured)
+        let covered = end.timeIntervalSince(max(earliest, start))
+        let coverage = covered / duration
+        if coverage >= 0.98 { return text }
+        guard coverage >= 0.05 else { return text }
+        let estimate = measured / coverage
+        return "\(text) · est $\(Self.compactDollars(estimate))"
+    }
+
+    /// "0.42" / "8.5" / "210" — decimals only where they carry information,
+    /// mirroring GraphView's axis-label style.
+    private static func compactDollars(_ v: Double) -> String {
+        if v < 1 { return String(format: "%.2f", v) }
+        if v < 10 { return String(format: "%.1f", v) }
+        return String(format: "%.0f", v)
     }
 
     // MARK: - Parsing

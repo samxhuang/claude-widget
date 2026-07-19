@@ -66,6 +66,15 @@ struct ExpandedGraphView: View {
                 Text("API-EQUIVALENT COST")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(.white.opacity(0.6))
+                // Same period-total readout as the panel's Graph tab (see
+                // GraphModel.costSummary): measured sum, plus "est" scaled to
+                // the full period while cost data is still partial.
+                if let summary = model.costSummary {
+                    Text(summary)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.85))
+                        .help("Summed API-equivalent cost of the plotted period; \"est\" scales the measured total to the full period when data doesn't cover all of it yet.")
+                }
                 Spacer()
                 Text(model.period.costUnitLabel)
                     .font(.system(size: 9))

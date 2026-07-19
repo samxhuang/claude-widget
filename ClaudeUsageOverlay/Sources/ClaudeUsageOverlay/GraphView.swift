@@ -89,6 +89,15 @@ struct GraphView: View {
                 Text("API-EQUIVALENT COST")
                     .font(.system(size: 8.5, weight: .semibold))
                     .foregroundColor(.white.opacity(0.55))
+                // Measured total for the visible period, plus a linear
+                // full-period estimate while cost data only covers part of
+                // it (see GraphModel.costSummary).
+                if let summary = model.costSummary {
+                    Text(summary)
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.8))
+                        .help("Summed API-equivalent cost of the plotted period; \"est\" scales the measured total to the full period when data doesn't cover all of it yet.")
+                }
                 Spacer()
                 Text(model.period.costUnitLabel)
                     .font(.system(size: 8))
