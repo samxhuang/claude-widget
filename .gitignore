@@ -1,3 +1,9 @@
+# macOS Finder junk
+.DS_Store
+
+# Local Claude Code permission allowlist (machine-local, not project config)
+.claude/settings.local.json
+
 # Diagnostic dumps from debugging sessions (contain session transcript content)
 diagnostics/
 
