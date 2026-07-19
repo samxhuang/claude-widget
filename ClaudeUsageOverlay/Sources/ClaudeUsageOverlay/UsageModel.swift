@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import ClaudeAPI
 
 /// Holds the latest usage numbers pulled from claude.ai and formats them
 /// for display. `now` is ticked by a lightweight timer so the "resets in
@@ -48,32 +49,20 @@ final class UsageModel: ObservableObject {
         estimatedPercent(percent: weeklyPercent, resetsAt: weeklyResetsAt, windowDuration: Self.weeklyWindowDuration)
     }
 
-    func apply(usage: [String: Any]) {
-        if let five = usage["five_hour"] as? [String: Any] {
-            sessionPercent = Self.intValue(five["utilization"])
-            sessionResetsAt = Self.parseDate(five["resets_at"] as? String)
+    /// Field normalization (raw JSON → percents/dates) happens in the
+    /// ClaudeAPI module; this model only republishes the typed report.
+    /// Windows the API omitted keep their previous published values, same
+    /// as the old dict-parsing behavior.
+    func apply(report: UsageReport) {
+        if report.session.percent != nil || report.session.resetsAt != nil {
+            sessionPercent = report.session.percent
+            sessionResetsAt = report.session.resetsAt
         }
-        if let seven = usage["seven_day"] as? [String: Any] {
-            weeklyPercent = Self.intValue(seven["utilization"])
-            weeklyResetsAt = Self.parseDate(seven["resets_at"] as? String)
+        if report.weekly.percent != nil || report.weekly.resetsAt != nil {
+            weeklyPercent = report.weekly.percent
+            weeklyResetsAt = report.weekly.resetsAt
         }
         lastUpdated = Date()
-    }
-
-    private static func intValue(_ any: Any?) -> Int? {
-        if let n = any as? NSNumber { return n.intValue }
-        if let i = any as? Int { return i }
-        return nil
-    }
-
-    private static func parseDate(_ s: String?) -> Date? {
-        guard let s = s else { return nil }
-        let f1 = ISO8601DateFormatter()
-        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f1.date(from: s) { return d }
-        let f2 = ISO8601DateFormatter()
-        f2.formatOptions = [.withInternetDateTime]
-        return f2.date(from: s)
     }
 
     func resetText(for date: Date?) -> String {

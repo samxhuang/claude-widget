@@ -1,5 +1,6 @@
 import Cocoa
 import WebKit
+import ClaudeAPI
 
 /// A plain, visible window with an embedded WKWebView pointed at claude.ai's
 /// login page. You sign in here exactly like a normal browser tab, once.
@@ -14,7 +15,7 @@ final class LoginWindowController: NSWindowController {
 
         let frame = NSRect(x: 0, y: 0, width: 480, height: 720)
         let webView = WKWebView(frame: frame, configuration: config)
-        webView.load(URLRequest(url: URL(string: "https://claude.ai/login")!))
+        webView.load(URLRequest(url: ClaudeWebURLs.login))
 
         let window = NSWindow(
             contentRect: frame,

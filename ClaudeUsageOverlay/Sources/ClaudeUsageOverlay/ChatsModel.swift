@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import ClaudeAPI
 
 /// One recent claude.ai conversation, as returned by the chat_conversations
 /// list endpoint.
@@ -41,25 +42,13 @@ final class ChatsModel: ObservableObject {
         now = Date()
     }
 
-    func apply(chats rawChats: [[String: Any]]) {
-        let parsed: [ChatEntry] = rawChats.compactMap { dict in
-            guard let uuid = dict["uuid"] as? String else { return nil }
-            let name = dict["name"] as? String ?? ""
-            let updatedAt = Self.parseDate(dict["updated_at"] as? String)
-            return ChatEntry(uuid: uuid, name: name, updatedAt: updatedAt)
+    /// Raw-JSON normalization moved into the ClaudeAPI module; this just
+    /// re-shapes the typed DTOs into the UI's ChatEntry rows.
+    func apply(conversations: [ChatConversation]) {
+        chats = conversations.map {
+            ChatEntry(uuid: $0.id, name: $0.title, updatedAt: $0.updatedAt)
         }
-        chats = parsed
         lastUpdated = Date()
-    }
-
-    private static func parseDate(_ s: String?) -> Date? {
-        guard let s = s else { return nil }
-        let f1 = ISO8601DateFormatter()
-        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f1.date(from: s) { return d }
-        let f2 = ISO8601DateFormatter()
-        f2.formatOptions = [.withInternetDateTime]
-        return f2.date(from: s)
     }
 
     /// Compact "5m ago" / "3h ago" / "2d ago" relative label, matching the

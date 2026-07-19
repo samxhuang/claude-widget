@@ -21,6 +21,29 @@ collection both start 2026-07-18, so 30d/90d moving averages don't mature
 until Aug/Oct 2026 — don't be surprised by sparse plan-fit numbers before
 then.
 
+## ClaudeAPI module (claude.ai internal-API isolation, 2026-07-19)
+
+All knowledge of claude.ai's internal HTTP API (endpoint paths, JSON field
+names, status vocabularies, deep-link URL shapes) lives in ONE SwiftPM
+target: `ClaudeUsageOverlay/Sources/ClaudeAPI/` (WebSession = hidden authed
+WKWebView transport; Client = ClaudeAPIClient, the only entry point; Models
+= public DTOs; DeepLinks = ClaudeWebURLs; Validate = contract validator;
+CONTRACT.md = observed endpoint shapes, kept current). When the internal
+API changes, fix that module only — the app consumes typed DTOs
+(UsageReport / ChatConversation / CloudSessionRecord / CloudWorkState) and
+must not learn raw field names. Enforced by
+`scripts/check_api_boundary.sh` (grep; comment lines allowed; carve-out
+for SnapshotLogger/GraphModel/PlanFitModel which own widget-side on-disk
+formats whose names historically mirror the API's but are frozen
+independently). Contract validation:
+`ClaudeUsageOverlay.app/Contents/MacOS/ClaudeUsageOverlay --validate-api
+[--json] [--dump-raw <scratch-dir>]` — must run from the PACKAGED app
+binary (cookie-store bundle-id keying), exits 0 pass / 1 contract drift /
+2 logged-out. The `/validate-claude-api` command
+(`.claude/commands/validate-claude-api.md`) wraps the full
+validate→diagnose→fix-module-only→re-verify loop; design rationale in
+`docs/claude-api-module-plan.md`.
+
 ## Hard constraints (do not relax without explicit sign-off)
 
 - **Opt-in only.** Nothing auto-resumes or auto-automates without an

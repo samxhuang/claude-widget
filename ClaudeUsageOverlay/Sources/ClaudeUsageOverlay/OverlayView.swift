@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ClaudeAPI
 
 /// Single source of truth for the fixed height the Sessions section's
 /// expanded ScrollView content occupies. AppDelegate's currentPanelHeight()
@@ -1189,8 +1190,7 @@ struct OverlayView: View {
     /// owns — simple and reliable, and it's the same place the user would
     /// end up reading/replying anyway.
     private func openChat(_ uuid: String) {
-        guard let url = URL(string: "https://claude.ai/chat/\(uuid)") else { return }
-        NSWorkspace.shared.open(url)
+        NSWorkspace.shared.open(ClaudeWebURLs.chat(id: uuid))
     }
 
     /// Item 3B (click-to-open, local CLI/Cowork rows): originally deep-linked
@@ -1252,16 +1252,13 @@ struct OverlayView: View {
         }
     }
 
-    /// Item 3B (click-to-open, cloud session rows): see the "Item 3B
-    /// click-to-open findings" block at the bottom of ChatsFetcher.swift for
-    /// what was actually probed/confirmed about claude.ai's URL shape for a
-    /// `/recents` code/cowork session — no reliable per-session deep link
-    /// was found (candidate paths 200'd identically for real vs. bogus
-    /// ids), so this opens the claude.ai home page rather than guessing a
-    /// path that might 404 or land somewhere confusing.
+    /// Item 3B (click-to-open, cloud session rows): no reliable per-session
+    /// deep link exists for a cloud Code/Cowork session — see the probe
+    /// findings in ClaudeAPI/CONTRACT.md ("Deep links") — so this opens the
+    /// claude.ai home page rather than guessing a path that might 404 or
+    /// land somewhere confusing.
     private func openCloudSession(_ entry: CloudSessionEntry) {
-        guard let url = URL(string: "https://claude.ai") else { return }
-        NSWorkspace.shared.open(url)
+        NSWorkspace.shared.open(ClaudeWebURLs.home)
     }
 
     // MARK: - Plan fit (item 3: its own tab, not a Main-tab collapsible

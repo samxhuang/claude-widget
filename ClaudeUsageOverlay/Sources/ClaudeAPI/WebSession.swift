@@ -16,8 +16,8 @@ enum ClaudeWebSessionError: LocalizedError {
     }
 }
 
-/// Owns the single hidden WKWebView that both UsageFetcher and ChatsFetcher
-/// run their fetch() calls inside. WKWebView's default (persistent) website
+/// Owns the single hidden WKWebView that ClaudeAPIClient runs all its
+/// fetch() calls inside. WKWebView's default (persistent) website
 /// data store is the same store the real claude.ai login uses, so once
 /// you've signed in once (in the LoginWindowController), this webview
 /// carries the same session cookie and can call claude.ai's own endpoints
@@ -178,20 +178,7 @@ final class ClaudeWebSession: NSObject, WKNavigationDelegate {
         }
     }
 
-    /// S9: shared org-selection snippet interpolated into every claude.ai
-    /// fetch script (UsageFetcher's usage call, ChatsFetcher's
-    /// chat_conversations and /recents calls). Multi-org accounts previously
-    /// got `orgs[0]` — arbitrary. This prefers an org whose `capabilities`
-    /// array (when present) advertises a chat-capable surface, falling back to
-    /// `orgs[0]` otherwise. Defensive: `capabilities` may be absent entirely
-    /// (`Array.isArray` guards that), in which case the fallback applies.
-    /// Assumes the calling script has already fetched `orgs`; defines `orgId`.
-    static let orgSelectionJS = """
-      const pickOrg = (list) => {
-        const wanted = ['chat', 'claude_pro', 'raven'];
-        const preferred = list.find(o => Array.isArray(o.capabilities) && o.capabilities.some(c => wanted.includes(c)));
-        return preferred || list[0];
-      };
-      const orgId = pickOrg(orgs).uuid;
-    """
+    // S9's shared org-selection snippet moved to ClaudeAPIClient
+    // (orgPreambleJS) when the fetch scripts were consolidated there — one
+    // copy of the org-selection knowledge, next to the scripts that use it.
 }

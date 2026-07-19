@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import ClaudeAPI
 
 /// One cloud-only Cowork/Code session surfaced via claude.ai's `/recents`
 /// endpoint (item 4: "cloud sessions are invisible"). These run entirely
@@ -14,11 +15,10 @@ struct CloudSessionEntry: Identifiable, Equatable, Hashable {
     var title: String
     var updatedAt: Date?
     /// Status classification item: unified running/needs-input/idle
-    /// classification, computed at fetch time by
-    /// CloudSessionsModel.mapWorkStatus from the raw `status`/
-    /// `worker_status` fields /recents returns (see that function's doc
-    /// comment for the values actually observed against the live,
-    /// authenticated endpoint). Always populated (never nil) since — unlike
+    /// classification. The raw API vocabulary is interpreted inside the
+    /// ClaudeAPI module (see its CONTRACT.md for the values actually
+    /// observed live); CloudSessionsModel.displayStatus then maps the
+    /// module's CloudWorkState onto this. Always populated (never nil) since — unlike
     /// the local daemon's state.json field — this is computed fresh on every
     /// fetch, no stale-build fallback needed.
     var workStatus: SessionWorkStatus
@@ -86,9 +86,9 @@ final class CloudSessionsModel: ObservableObject {
         now = Date()
     }
 
-    /// Replaces the full list with `raw` (already normalized down to the
-    /// `{id, title, updated_at}` shape ChatsFetcher's JS produces — see its
-    /// header comment), filtered to just the ones NOT already tracked
+    /// Replaces the full list with `records` (typed CloudSessionRecords
+    /// from the ClaudeAPI module — all raw-JSON parsing happens there),
+    /// filtered to just the ones NOT already tracked
     /// locally, sorted newest-first, and capped to the `displayCap` most
     /// recent. `localIds` is SessionsModel.sessions' ids at the time of the
     /// call — passed in rather than this model reaching for SessionsModel
@@ -116,11 +116,11 @@ final class CloudSessionsModel: ObservableObject {
     /// would still collapse — accepted as rare (a specific shared title on two
     /// concurrently-live sessions is unlikely) and strictly narrower than the
     /// previous any-title-match behavior.
-    func apply(raw: [[String: Any]], localIds: Set<String>, localTitles: Set<String>,
+    func apply(records: [CloudSessionRecord], localIds: Set<String>, localTitles: Set<String>,
                localStartDates: [Date] = []) {
         let cutoff = Date().addingTimeInterval(-Self.lookbackWindow)
-        let parsed: [CloudSessionEntry] = raw.compactMap { dict in
-            guard let id = dict["id"] as? String, !id.isEmpty, !localIds.contains(id) else { return nil }
+        let parsed: [CloudSessionEntry] = records.compactMap { record in
+            guard !localIds.contains(record.id) else { return nil }
             // Cloud echo of a locally-tracked CLI session. Verified against a
             // live /recents dump: these rows id as opaque cse_* tokens with
             // EVERY linking field null (no session uuid, no bound device, no
@@ -144,12 +144,11 @@ final class CloudSessionsModel: ObservableObject {
             // session's echo ages out of the lookback — accepted; the
             // alternative was a phantom copy of every live local session at
             // the top of the list.
-            if let createdStr = dict["created_at"] as? String,
-               let created = Self.parseDate(createdStr),
+            if let created = record.createdAt,
                localStartDates.contains(where: { abs($0.timeIntervalSince(created)) < 30 }) {
                 return nil
             }
-            let title = dict["title"] as? String ?? ""
+            let title = record.title
             let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             // S5(b): only treat a title match as a dedupe signal when the title
             // is specific — skip empty/"untitled"/known-generic-default titles
@@ -158,16 +157,11 @@ final class CloudSessionsModel: ObservableObject {
             // sessions by the caller.
             let titleIsSpecific = !normalizedTitle.isEmpty && !Self.genericTitles.contains(normalizedTitle)
             if titleIsSpecific && localTitles.contains(normalizedTitle) { return nil }
-            let updatedAt = Self.parseDate(dict["updated_at"] as? String)
             // Same 30-minute lookback as local sessions: idle cloud sessions
             // age out of the list rather than lingering for days. Unparseable
             // dates are treated as stale, not shown forever.
-            guard let updated = updatedAt, updated >= cutoff else { return nil }
-            let rawStatus = (dict["status"] as? String)?.trimmingCharacters(in: .whitespaces).lowercased()
-            let workStatus = Self.mapWorkStatus(
-                status: dict["status"] as? String,
-                workerStatus: dict["worker_status"] as? String
-            )
+            guard let updated = record.updatedAt, updated >= cutoff else { return nil }
+            let workStatus = Self.displayStatus(for: record.workState)
             // Deleted-session fix (2026-07-19): deleting a session in Claude
             // Desktop's GUI archives its cloud copy rather than removing it
             // from /recents right away, so a deleted session would linger
@@ -184,8 +178,8 @@ final class CloudSessionsModel: ObservableObject {
             // duplicate "General coding session" imports the old deep-link
             // click behavior created — see OverlayView.openLocalSession —
             // after those dups are deleted.)
-            if rawStatus == "archived" && workStatus == .idle { return nil }
-            return CloudSessionEntry(id: id, title: title, updatedAt: updated, workStatus: workStatus)
+            if record.isArchived && workStatus == .idle { return nil }
+            return CloudSessionEntry(id: record.id, title: title, updatedAt: updated, workStatus: workStatus)
         }
         // Newest-first: /recents already comes back sorted this way, but
         // sort explicitly rather than depend on an undocumented endpoint's
@@ -200,67 +194,21 @@ final class CloudSessionsModel: ObservableObject {
         sessions = Array(sorted.prefix(Self.displayCap))
     }
 
-    /// Maps /recents' raw `status`/`worker_status` fields to the unified
-    /// SessionWorkStatus. Verified empirically (2026-07-19) against the
-    /// live, authenticated endpoint via the widget's own webview (ran the
-    /// real app, captured its stdout across two ~2-minute refresh cycles).
-    /// Every combo actually observed across 13 raw items, both cycles:
-    ///   status=active   worker_status=idle
-    ///   status=archived worker_status=idle
-    ///   status=archived worker_status=running
-    /// i.e. `worker_status: "running"` is confirmed real (it's what an
-    /// actively-executing session reports, consistent with this account
-    /// having live Code sessions running while this was captured) — but,
-    /// surprisingly, it showed up paired with `status: "archived"`, not
-    /// `status: "active"` as originally hypothesized; "archived" here
-    /// evidently describes something else (e.g. whether the item is pinned
-    /// to a visible surface) rather than whether the underlying worker is
-    /// still going. No `status`/`worker_status` value resembling
-    /// "waiting"/"needs input"/"blocked" was observed in this data — this
-    /// account's sessions were either running or fully idle at capture
-    /// time, so the needs-input branches below are an unverified,
-    /// conservative forward guess (keyword-matched), not confirmed against
-    /// real data. `worker_status` is the more specific of the two fields
-    /// (describes the underlying Code/Cowork worker process directly), so
-    /// it takes priority over the coarser `status` field when both are
-    /// present. Falls back to `.idle` for anything not recognized (stale/
-    /// finished sessions, or a future endpoint change) rather than guessing
-    /// — a false "idle" undersells a session's activity but never wrongly
-    /// demands the user's attention, which is the safer direction to err
-    /// for a field whose full value space isn't confirmed.
-    ///
-    /// Item 3B update (2026-07-19): `worker_status: "requires_action"` was
-    /// subsequently observed on a real, live session with a pending
-    /// permission-prompt-style action (a Bash tool call awaiting approval)
-    /// — a genuine needs-input case the keyword list above didn't catch (it
-    /// doesn't contain "wait"/"input"/"pending"/"blocked" and isn't
-    /// "paused"). Added as an explicit exact match now that it's
-    /// empirically confirmed, rather than folded into the fuzzier
-    /// `.contains` checks meant for still-unverified guesses.
-    static func mapWorkStatus(status: String?, workerStatus: String?) -> SessionWorkStatus {
-        let w = workerStatus?.trimmingCharacters(in: .whitespaces).lowercased()
-        let s = status?.trimmingCharacters(in: .whitespaces).lowercased()
-
-        if let w {
-            if w == "running" || w == "active" || w == "executing" || w == "working" {
-                return .running
-            }
-            if w == "requires_action" || w.contains("wait") || w.contains("input") || w.contains("pending") || w.contains("blocked") || w == "paused" {
-                return .needsInput
-            }
+    /// The raw `status`/`worker_status` vocabulary interpretation moved
+    /// into the ClaudeAPI module (ClaudeAPIClient.mapWorkState — it's
+    /// internal-API knowledge, empirically derived; see the module's
+    /// CONTRACT.md for the observed value log). What stays here is the
+    /// display policy: `.unknown` (fields present but unrecognized — likely
+    /// an API change) renders as idle, because a false "idle" undersells a
+    /// session's activity but never wrongly demands the user's attention.
+    /// The validator (--validate-api) flags `.unknown` separately, so the
+    /// degradation is detected rather than silent.
+    static func displayStatus(for state: CloudWorkState) -> SessionWorkStatus {
+        switch state {
+        case .running: return .running
+        case .needsInput: return .needsInput
+        case .idle, .unknown: return .idle
         }
-        if let s {
-            if s.contains("wait") || s.contains("input") || s.contains("blocked") || s == "needs_attention" {
-                return .needsInput
-            }
-            if s == "active" && w == nil {
-                // No worker_status to disambiguate further; a bare "active"
-                // status with nothing else is the best signal available that
-                // something is happening.
-                return .running
-            }
-        }
-        return .idle
     }
 
     /// Whether `entry` was updated recently enough to treat as "active right
@@ -268,16 +216,6 @@ final class CloudSessionsModel: ObservableObject {
     func isActive(_ entry: CloudSessionEntry) -> Bool {
         guard let date = entry.updatedAt else { return false }
         return now.timeIntervalSince(date) < Self.activeWindow
-    }
-
-    private static func parseDate(_ s: String?) -> Date? {
-        guard let s = s else { return nil }
-        let f1 = ISO8601DateFormatter()
-        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f1.date(from: s) { return d }
-        let f2 = ISO8601DateFormatter()
-        f2.formatOptions = [.withInternetDateTime]
-        return f2.date(from: s)
     }
 
     /// Compact "5m ago" / "3h ago" / "2d ago" label, matching

@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import ClaudeAPI
 
 /// Appends one usage snapshot per successful UsageFetcher refresh to
 /// ~/.claude-autoresume/usage/snapshots.jsonl. A separate Python compactor
@@ -43,37 +44,43 @@ final class SnapshotLogger {
         self.lockURL = dir.appendingPathComponent("snapshots.lock")
     }
 
-    /// `usage` is the raw JSON object returned by claude.ai's
-    /// GET /organizations/{id}/usage endpoint (the `{ five_hour, seven_day,
-    /// ... }` object) — callers are expected to only call this on a
-    /// confirmed-successful, logged-in fetch; failures/loggedOut are never
-    /// passed in, so there's nothing to filter here.
-    func record(usage: [String: Any]) {
+    /// `report` is ClaudeAPI's typed decode of a confirmed-successful,
+    /// logged-in usage fetch — failures/loggedOut are never passed in, so
+    /// there's nothing to filter here.
+    ///
+    /// On-disk format note: the `five_hour`/`seven_day`/`utilization`/
+    /// `resets_at` names below are the WIDGET'S OWN snapshot format (parsed
+    /// by GraphModel and the Python compactor) — they historically mirror
+    /// the API's names, but they are frozen here regardless of what the API
+    /// renames itself to. The window values come from the report's `*Raw`
+    /// fields (exposed for exactly this purpose) and the `raw` payload is
+    /// the opaque `rawJSON` blob, kept whole for future analytics.
+    func record(report: UsageReport) {
         let now = Date()
         guard now.timeIntervalSince(lastWriteAt) >= minInterval else { return }
-        guard let line = Self.buildLine(usage: usage, timestamp: now) else { return }
+        guard let line = Self.buildLine(report: report, timestamp: now) else { return }
         lastWriteAt = now
         ioQueue.async { [weak self] in
             self?.append(line: line)
         }
     }
 
-    private static func buildLine(usage: [String: Any], timestamp: Date) -> String? {
+    private static func buildLine(report: UsageReport, timestamp: Date) -> String? {
         let tsFormatter = ISO8601DateFormatter()
         tsFormatter.formatOptions = [.withInternetDateTime]
 
-        func window(_ dict: [String: Any]?) -> [String: Any] {
+        func window(_ w: UsageWindow) -> [String: Any] {
             [
-                "utilization": (dict?["utilization"] as? NSNumber) ?? NSNull(),
-                "resets_at": (dict?["resets_at"] as? String) ?? NSNull()
+                "utilization": w.utilizationRaw ?? NSNull(),
+                "resets_at": w.resetsAtRaw ?? NSNull()
             ]
         }
 
         let entry: [String: Any] = [
             "ts": tsFormatter.string(from: timestamp),
-            "five_hour": window(usage["five_hour"] as? [String: Any]),
-            "seven_day": window(usage["seven_day"] as? [String: Any]),
-            "raw": usage
+            "five_hour": window(report.session),
+            "seven_day": window(report.weekly),
+            "raw": report.rawJSON
         ]
 
         guard JSONSerialization.isValidJSONObject(entry),

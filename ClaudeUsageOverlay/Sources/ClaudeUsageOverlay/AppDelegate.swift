@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import Combine
+import ClaudeAPI
 
 /// Item 2 (user-resizable panel height): how much taller the user has
 /// dragged the panel beyond its content-computed base height. `0` means the
@@ -39,9 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // remote openLocalSession branch.
     private let configStore = ConfigStore()
     private var settingsWindowController: SettingsWindowController?
-    // One hidden, authenticated WKWebView shared by both fetchers — see
-    // ClaudeWebSession's header comment for why this isn't two webviews.
-    private let webSession = ClaudeWebSession()
+    // The single gateway to claude.ai's internal API (owns the one hidden,
+    // authenticated WKWebView both fetchers share) — all endpoint/shape
+    // knowledge lives in the ClaudeAPI module behind this client.
+    private let apiClient = ClaudeAPIClient()
     private var fetcher: UsageFetcher!
     private var chatsFetcher: ChatsFetcher!
     private var loginWindowController: LoginWindowController?
@@ -227,10 +229,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setupStatusItem()
         setupOverlayPanel()
 
-        fetcher = UsageFetcher(session: webSession, model: model, onLoginNeeded: { [weak self] in
+        fetcher = UsageFetcher(client: apiClient, model: model, onLoginNeeded: { [weak self] in
             self?.showLoginWindow(userInitiated: false)
         })
-        chatsFetcher = ChatsFetcher(session: webSession, model: chatsModel, cloudSessions: cloudSessionsModel, localSessionIds: { [weak self] in
+        chatsFetcher = ChatsFetcher(client: apiClient, model: chatsModel, cloudSessions: cloudSessionsModel, localSessionIds: { [weak self] in
             Set(self?.sessionsModel.sessions.map { $0.id } ?? [])
         }, localSessionTitles: { [weak self] in
             // S5(b): only feed RECENTLY-ACTIVE local session titles into the
