@@ -266,8 +266,11 @@ final class GraphModel: ObservableObject {
     /// "$18.42" when the cost data spans the whole period, "$18.42 · est $210"
     /// when it starts partway through (linear scale-up of the measured sum to
     /// the full period — same extrapolation style as the budget projection).
-    /// The estimate is suppressed below 5% coverage, where scaling up a sliver
-    /// would be noise presented as a number. nil when nothing is measured and
+    /// The estimate needs at least an hour of measured data (the budget
+    /// projection's suppression rule) — an absolute floor, NOT a fraction of
+    /// the period: a percent floor made the est vanish on exactly the wide
+    /// periods (1mo/3mo) where collection-started-Jul-18 coverage is thinnest
+    /// and the estimate is most wanted. nil when nothing is measured and
     /// nothing can be estimated.
     static func costSummaryText(buckets: [CostBucket], start: Date, end: Date,
                                 earliest: Date?, duration: TimeInterval) -> String? {
@@ -277,7 +280,7 @@ final class GraphModel: ObservableObject {
         let covered = end.timeIntervalSince(max(earliest, start))
         let coverage = covered / duration
         if coverage >= 0.98 { return text }
-        guard coverage >= 0.05 else { return text }
+        guard covered >= 3600 else { return text }
         let estimate = measured / coverage
         return "\(text) · est $\(Self.compactDollars(estimate))"
     }
