@@ -71,7 +71,10 @@ TIER_ORDER = ("pro", "max_5x", "max_20x")  # cheapest first
 
 ROLLING_WINDOW_HOURS = 5
 MA_WINDOWS_DAYS = (1, 7, 30, 90)
-MONTHLY_RUN_RATE_DAYS = 30.44
+# 30 (not the 30.44 calendar-month average) so "monthly run rate" and the
+# widget Graph tab's 1mo period estimate — a literal 30-day window — quote the
+# same pace against the same month definition instead of disagreeing by 1.5%.
+MONTHLY_RUN_RATE_DAYS = 30.0
 
 # Budget (API-account dollar limits) — see _budget_block / autoresume_config C1.
 BUDGET_PROJECTION_MIN_ELAPSED_SECONDS = 3600  # suppress linear projection in a period's first hour

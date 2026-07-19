@@ -86,7 +86,8 @@ class MovingAverageTests(TempStateDirTestCase):
         # Monthly run-rate should use the 7d MA as its basis.
         rr = result["monthly_run_rate"]
         self.assertEqual(rr["basis"], "7d")
-        self.assertAlmostEqual(rr["value_usd_per_month"], round(30.0 / 2.125, 2) * 30.44, places=2)
+        self.assertAlmostEqual(rr["value_usd_per_month"],
+                               round(30.0 / 2.125, 2) * plan_fit.MONTHLY_RUN_RATE_DAYS, places=2)
 
     def test_mature_window_uses_elapsed_window_span(self):
         # Data older than the whole 1d window: the window's own span (midnight
