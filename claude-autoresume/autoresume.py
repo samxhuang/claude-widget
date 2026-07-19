@@ -111,6 +111,71 @@ PRUNE_AFTER_HOURS = 48
 # Drop "active" entries that have gone quiet (and never got rate-limited)
 # after this long.
 ACTIVE_STALE_MINUTES = ACTIVE_WINDOW_MINUTES * 2
+# Per-session "work_status" classification (running / needs_input / idle),
+# additive to the existing active/waiting `status` field (which resume logic
+# depends on and which this does NOT change). A session touched this
+# recently is "running" outright, regardless of what its last event looks
+# like — tool calls (bash commands, subagent work) can legitimately take
+# longer than this. Only once a session has been quiet for longer than this
+# do we look at the *shape* of its last event to tell "stuck waiting on a
+# permission prompt" apart from "turn finished cleanly." Empirically (see
+# classify_work_status's docstring), Claude Code's jsonl transcripts have no
+# dedicated "permission requested"/"approval" event type to key off of — the
+# reliable signal is structural: an assistant turn's last content block is a
+# tool_use with no subsequent tool_result event.
+WORK_STATUS_RUNNING_WINDOW_SECONDS = 90
+
+
+def classify_work_status(objs: list[dict], mtime: float, now: float) -> str:
+    """Classifies a CLI session's transcript as "running", "needs_input", or
+    "idle" for the widget's per-row status dot.
+
+    Evidence gathered 2026-07-19 against real transcripts in
+    ~/.claude/projects/-Users-sam-git-claude-widget/*.jsonl (including this
+    very conversation's own session while an agent was actively running in
+    it) and a broad scan across every session file under ~/.claude/projects:
+    there is no explicit "permission_request"/"approval"-style event type in
+    these logs (checked every distinct top-level "type" value that appears
+    anywhere) — Claude Code doesn't log a separate marker for "blocked on a
+    permission prompt." The reliable structural signal instead: each
+    streamed content block (thinking / text / tool_use) is appended as its
+    own top-level jsonl object (not batched into one multi-block message
+    object), so the *last* conversational (type "assistant" or "user")
+    object in the file tells you exactly how the turn currently stands:
+      - last conversational object is "assistant" whose message content's
+        last block is type "tool_use" -> that tool call has no matching
+        "user"-type tool_result event yet (there's nothing after it) ->
+        execution is blocked on something, most commonly a permission
+        prompt.
+      - last conversational object is "user" with a tool_result (or any
+        other shape), or "assistant" ending in "text" -> the turn resolved
+        cleanly (tool finished, or Claude replied and stopped).
+    A pending tool_use is only "needs_input" if the session has ALSO gone
+    quiet for a while (WORK_STATUS_RUNNING_WINDOW_SECONDS) — a fresh pending
+    tool_use just means a tool is still running (e.g. a slow Bash command or
+    a subagent mid-flight), not that a human needs to approve anything.
+    """
+    if (now - mtime) <= WORK_STATUS_RUNNING_WINDOW_SECONDS:
+        return "running"
+
+    last_conv = None
+    for obj in reversed(objs):
+        if obj.get("type") in ("assistant", "user"):
+            last_conv = obj
+            break
+
+    if last_conv is not None and last_conv.get("type") == "assistant":
+        message = last_conv.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if (
+            isinstance(content, list)
+            and content
+            and isinstance(content[-1], dict)
+            and content[-1].get("type") == "tool_use"
+        ):
+            return "needs_input"
+
+    return "idle"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 RESUME_PROMPT = os.environ.get("AUTORESUME_PROMPT", "continue")
@@ -379,6 +444,7 @@ def scan_sessions(state: dict) -> None:
                 continue
 
             session_title = find_session_title(objs)
+            work_status = classify_work_status(objs, mtime, now)
 
             if existing:
                 was_active = existing.get("status") == "active"
@@ -400,6 +466,7 @@ def scan_sessions(state: dict) -> None:
                 # what the widget shows as "<1m" / "17m" / etc for active
                 # sessions.
                 existing["last_activity_at"] = mtime
+                existing["work_status"] = work_status
                 if was_active and status == "waiting":
                     log(f"Session {session_id} in {project_dir} transitioned active -> rate-limited "
                         f"(enabled={existing.get('enabled', False)} preserved), resets at {datetime.fromtimestamp(resets_at)}")
@@ -421,6 +488,10 @@ def scan_sessions(state: dict) -> None:
                     "handled": False,
                     "handled_at": None,
                     "status": status,
+                    # Widget-owned display field, daemon-computed each scan
+                    # cycle (never user-toggled): "running" / "needs_input" /
+                    # "idle". See classify_work_status's docstring.
+                    "work_status": work_status,
                 }
 
 
@@ -542,6 +613,14 @@ def scan_cowork_sessions(state: dict) -> None:
             existing["resets_at"] = None
             existing["last_seen"] = now
             existing["last_activity_at"] = last_activity_at
+            # Cowork entries are only ever kept in state at all while
+            # is_running is True (see the `if not is_running: del` branch
+            # above) — a Cowork session whose last audit event resolves to a
+            # finished turn gets dropped from state on this very poll cycle,
+            # so by construction every surviving entry is "running". There's
+            # no local signal (yet) to distinguish "actively computing" from
+            # "blocked on a permission prompt" for Cowork specifically.
+            existing["work_status"] = "running"
         else:
             log(f"Detected active Cowork session {session_id} ({title!r}) — added to widget")
             state[session_id] = {
@@ -558,6 +637,7 @@ def scan_cowork_sessions(state: dict) -> None:
                 "handled": False,
                 "handled_at": None,
                 "status": "active",
+                "work_status": "running",
                 # Widget-owned, additive fields (Track 1: Cowork auto-resume
                 # via UI automation — see cowork_resume.py). Same pattern as
                 # enabled/force_resume above: default off, only the widget

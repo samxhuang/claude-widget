@@ -155,20 +155,14 @@ struct OverlayView: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundColor(.white.opacity(0.85))
             Spacer()
-            // Cloud sessions item: badge count includes cloud-only sessions
-            // (see CloudSessionsModel) alongside the locally-tracked ones,
-            // since both now render as rows in this section. Uses
-            // `totalCount` (pre display-cap) rather than `sessions.count` so
-            // the badge still reflects the true total even though the
-            // visible list itself is capped to the 8 most recent.
-            if !sessions.sessions.isEmpty || cloudSessions.totalCount > 0 {
-                Text("\(sessions.sessions.count + cloudSessions.totalCount)")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.white.opacity(0.18)))
-            }
+            // Status classification item: replaces the old plain total-count
+            // capsule with a compact running/needs-input/done breakdown
+            // across the combined (local + cloud, deduped) list — the
+            // needs-input count is the one thing here worth acting on, so
+            // it's bold amber rather than blending into the muted counts
+            // around it. Zero-count categories are omitted entirely rather
+            // than shown as "0 done" clutter.
+            sessionStatusCounts
             if sessions.sessionsExpanded && !sessions.sessions.isEmpty {
                 // Item 1: a column-header-style caption over the toggle
                 // column, so it's clear those switches don't just "show" a
@@ -199,16 +193,21 @@ struct OverlayView: View {
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 6) {
-                            ForEach(sessions.sessions) { entry in
-                                sessionRow(entry)
-                            }
-                            // Cloud sessions item: appended below the
-                            // locally-tracked rows, already filtered (in
-                            // CloudSessionsModel.apply) to exclude anything
-                            // whose id is also in sessions.sessions, so
-                            // nothing here can double up with a row above.
-                            ForEach(cloudSessions.sessions) { entry in
-                                cloudSessionRow(entry)
+                            // Status classification item: local and cloud
+                            // rows are merged into one list and sorted by
+                            // status (needs-input first, then running, then
+                            // idle) rather than rendered as two separate,
+                            // independently-ordered blocks — a needs-input
+                            // cloud session shouldn't be buried below a pile
+                            // of idle local ones just because of which model
+                            // it came from.
+                            ForEach(combinedSessionRows) { row in
+                                switch row {
+                                case .local(let entry):
+                                    sessionRow(entry)
+                                case .cloud(let entry):
+                                    cloudSessionRow(entry)
+                                }
                             }
                         }
                     }
@@ -218,12 +217,119 @@ struct OverlayView: View {
         }
     }
 
+    /// Status classification item: one row from either model, tagged so
+    /// they can be merged into a single sorted list. See `combinedSessionRows`.
+    private enum CombinedSessionRow: Identifiable {
+        case local(SessionEntry)
+        case cloud(CloudSessionEntry)
+
+        var id: String {
+            switch self {
+            case .local(let e): return "local-\(e.id)"
+            case .cloud(let e): return "cloud-\(e.id)"
+            }
+        }
+
+        var sortPriority: Int {
+            switch self {
+            case .local(let e): return OverlayView.priority(for: e.workStatus)
+            case .cloud(let e): return OverlayView.priority(for: e.workStatus)
+            }
+        }
+    }
+
+    /// Local rows (already de-duped/ordered by SessionsModel) plus cloud
+    /// rows (already de-duped against local ids/titles and capped by
+    /// CloudSessionsModel), merged and re-sorted needs-input-first /
+    /// running-next / idle-last. Swift's `sorted(by:)` is a stable sort, so
+    /// within each status bucket the original per-model ordering (soonest
+    /// reset first for local waiting sessions; newest-updated first for
+    /// cloud) is preserved.
+    private var combinedSessionRows: [CombinedSessionRow] {
+        let rows: [CombinedSessionRow] =
+            sessions.sessions.map { .local($0) } + cloudSessions.sessions.map { .cloud($0) }
+        return rows.sorted { $0.sortPriority < $1.sortPriority }
+    }
+
+    /// needs-input < running < idle. A local row with no `workStatus` (daemon
+    /// build predates the field) is bucketed with idle rather than given
+    /// special placement — there's no classification to sort it by.
+    private static func priority(for workStatus: SessionWorkStatus?) -> Int {
+        switch workStatus {
+        case .needsInput: return 0
+        case .running: return 1
+        case .idle, .none: return 2
+        }
+    }
+
+    private func statusColor(_ workStatus: SessionWorkStatus) -> Color {
+        switch workStatus {
+        case .running: return .green
+        case .needsInput: return .orange
+        case .idle: return .gray
+        }
+    }
+
+    /// Combined running/needs-input/done counts across the full (local +
+    /// cloud, deduped, pre-display-cap) list — see the header's doc comment
+    /// at the call site.
+    private var sessionRunningCount: Int {
+        sessions.sessions.filter { OverlayView.priority(for: $0.workStatus) == 1 }.count + cloudSessions.runningCount
+    }
+    private var sessionNeedsInputCount: Int {
+        sessions.sessions.filter { OverlayView.priority(for: $0.workStatus) == 0 }.count + cloudSessions.needsInputCount
+    }
+    private var sessionIdleCount: Int {
+        sessions.sessions.filter { OverlayView.priority(for: $0.workStatus) == 2 }.count + cloudSessions.idleCount
+    }
+
+    /// Status classification item: compact "N running · N input · N done"
+    /// breakdown replacing the old plain total-count capsule. Zero-count
+    /// categories are omitted; needs-input is bold amber since it's the one
+    /// category that actually wants the user's attention.
+    @ViewBuilder
+    private var sessionStatusCounts: some View {
+        let running = sessionRunningCount
+        let needsInput = sessionNeedsInputCount
+        let idle = sessionIdleCount
+        if running + needsInput + idle > 0 {
+            HStack(spacing: 3) {
+                if running > 0 {
+                    Text("\(running) running")
+                }
+                if needsInput > 0 {
+                    if running > 0 {
+                        Text("·").foregroundColor(.white.opacity(0.3))
+                    }
+                    Text("\(needsInput) input")
+                        .fontWeight(.bold)
+                        .foregroundColor(.orange)
+                }
+                if idle > 0 {
+                    if running > 0 || needsInput > 0 {
+                        Text("·").foregroundColor(.white.opacity(0.3))
+                    }
+                    Text("\(idle) done")
+                }
+            }
+            .font(.system(size: 9, weight: .medium))
+            .foregroundColor(.white.opacity(0.55))
+        }
+    }
+
     @ViewBuilder
     private func sessionRow(_ entry: SessionEntry) -> some View {
         HStack(spacing: 6) {
+            // Status classification item: unified running(green)/needs-input
+            // (orange)/idle(gray) dot, same language cloudSessionRow uses.
+            // Falls back to the legacy blue(active)/orange(waiting) dot when
+            // `workStatus` is nil — a daemon build from before this field
+            // existed hasn't written it into state.json yet, and there's
+            // nothing here to classify with in that case.
             Circle()
-                .fill(entry.isActive ? Color.blue : Color.orange)
+                .fill(entry.workStatus.map(statusColor) ?? (entry.isActive ? Color.blue : Color.orange))
                 .frame(width: 6, height: 6)
+                .help(entry.workStatus?.label ?? (entry.isActive ? "Active" : "Rate-limited, waiting to resume"))
 
             VStack(alignment: .leading, spacing: 1) {
                 // The session's own title (e.g. "Test session do nothing")
@@ -298,6 +404,11 @@ struct OverlayView: View {
                       ? "Armed: the daemon will attempt to auto-resume this Cowork session via UI automation (currently dry-run only — logs intent, does not click anything)"
                       : "Arm auto-resume for this Cowork session via UI automation of Claude Desktop's Resume space (currently dry-run only)")
             } else {
+                // Toggle styling item: iOS-Settings-style saturated green
+                // track when on (replacing the previous default/blue system
+                // tint) — this is now the sole visual indicator that
+                // auto-resume is armed for this row, since the row
+                // background tint below was removed.
                 Toggle("", isOn: Binding(
                     get: { entry.enabled },
                     set: { sessions.setEnabled(entry.id, $0) }
@@ -305,29 +416,23 @@ struct OverlayView: View {
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .labelsHidden()
+                .tint(.green)
                 .help(entry.isActive ? "Auto-resume if this session hits a rate limit" : "Auto-resume when the limit resets")
             }
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
-        .background(RoundedRectangle(cornerRadius: 6).fill(rowTint(entry)))
+        // Toggle styling item: the row-tint background (green/red wash for
+        // enabled/armed rows) was removed at the user's request — the
+        // saturated toggle track (plus the bolt icon on armed Cowork rows)
+        // is now the sole enabled/armed indicator, so every row shares the
+        // same neutral background regardless of toggle state.
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06)))
     }
 
     private func readyToResume(_ entry: SessionEntry) -> Bool {
         guard let resetsAt = entry.resetsAt else { return false }
         return resetsAt <= sessions.now
-    }
-
-    /// Item 2: makes the armed/unarmed state readable at a glance without
-    /// having to read switch positions. Cowork rows keep their red/bolt
-    /// identity when armed (red = the more dangerous automation, since it's
-    /// live UI automation rather than a CLI relaunch); CLI rows get a green
-    /// tint when `enabled`. Off rows fall back to the original neutral tint.
-    private func rowTint(_ entry: SessionEntry) -> Color {
-        if entry.isCowork {
-            return entry.resumeArmed ? Color.red.opacity(0.15) : Color.white.opacity(0.06)
-        }
-        return entry.enabled ? Color.green.opacity(0.15) : Color.white.opacity(0.06)
     }
 
     /// Cloud sessions item: a session running entirely on claude.ai's
@@ -344,9 +449,16 @@ struct OverlayView: View {
     private func cloudSessionRow(_ entry: CloudSessionEntry) -> some View {
         let active = cloudSessions.isActive(entry)
         HStack(spacing: 6) {
+            // Status classification item: same running(green)/needs-input
+            // (orange)/idle(gray) dot language as sessionRow — replaces the
+            // old green(recently-updated)/gray dot, which conflated "updated
+            // recently" with "Claude is actively working" (not the same
+            // thing; `active`/isActive below still separately drives the
+            // brighter-text treatment for a recently-touched row).
             Circle()
-                .fill(active ? Color.green : Color.white.opacity(0.25))
+                .fill(statusColor(entry.workStatus))
                 .frame(width: 6, height: 6)
+                .help(entry.workStatus.label)
 
             Image(systemName: "cloud.fill")
                 .font(.system(size: 9))

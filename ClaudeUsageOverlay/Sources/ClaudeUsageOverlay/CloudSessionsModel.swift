@@ -13,6 +13,15 @@ struct CloudSessionEntry: Identifiable, Equatable, Hashable {
     let id: String
     var title: String
     var updatedAt: Date?
+    /// Status classification item: unified running/needs-input/idle
+    /// classification, computed at fetch time by
+    /// CloudSessionsModel.mapWorkStatus from the raw `status`/
+    /// `worker_status` fields /recents returns (see that function's doc
+    /// comment for the values actually observed against the live,
+    /// authenticated endpoint). Always populated (never nil) since — unlike
+    /// the local daemon's state.json field — this is computed fresh on every
+    /// fetch, no stale-build fallback needed.
+    var workStatus: SessionWorkStatus
 
     /// Same "don't show a blank row" fallback as ChatEntry.displayTitle.
     var displayTitle: String {
@@ -38,6 +47,15 @@ final class CloudSessionsModel: ObservableObject {
     /// display cap — 13 rows of mostly day-old sessions was clutter, so the
     /// visible list is capped while the badge can still show how many exist.
     @Published var totalCount: Int = 0
+    /// Status classification item: per-workStatus counts across the full
+    /// (pre-display-cap) filtered list, for the Sessions section header's
+    /// combined "N running · N input · N done" breakdown — computed over
+    /// the same set `totalCount` is, not just the capped `sessions` array,
+    /// so a needs-input session doesn't silently drop out of the count just
+    /// because it scrolled past the display cap.
+    @Published var runningCount: Int = 0
+    @Published var needsInputCount: Int = 0
+    @Published var idleCount: Int = 0
     @Published var now: Date = Date()
 
     /// The fixed-height ScrollView (see OverlayView/SectionLayout) absorbs
@@ -85,7 +103,11 @@ final class CloudSessionsModel: ObservableObject {
             // age out of the list rather than lingering for days. Unparseable
             // dates are treated as stale, not shown forever.
             guard let updated = updatedAt, updated >= cutoff else { return nil }
-            return CloudSessionEntry(id: id, title: title, updatedAt: updated)
+            let workStatus = Self.mapWorkStatus(
+                status: dict["status"] as? String,
+                workerStatus: dict["worker_status"] as? String
+            )
+            return CloudSessionEntry(id: id, title: title, updatedAt: updated, workStatus: workStatus)
         }
         // Newest-first: /recents already comes back sorted this way, but
         // sort explicitly rather than depend on an undocumented endpoint's
@@ -94,7 +116,64 @@ final class CloudSessionsModel: ObservableObject {
             (a.updatedAt ?? .distantPast) > (b.updatedAt ?? .distantPast)
         }
         totalCount = sorted.count
+        runningCount = sorted.filter { $0.workStatus == .running }.count
+        needsInputCount = sorted.filter { $0.workStatus == .needsInput }.count
+        idleCount = sorted.filter { $0.workStatus == .idle }.count
         sessions = Array(sorted.prefix(Self.displayCap))
+    }
+
+    /// Maps /recents' raw `status`/`worker_status` fields to the unified
+    /// SessionWorkStatus. Verified empirically (2026-07-19) against the
+    /// live, authenticated endpoint via the widget's own webview (ran the
+    /// real app, captured its stdout across two ~2-minute refresh cycles).
+    /// Every combo actually observed across 13 raw items, both cycles:
+    ///   status=active   worker_status=idle
+    ///   status=archived worker_status=idle
+    ///   status=archived worker_status=running
+    /// i.e. `worker_status: "running"` is confirmed real (it's what an
+    /// actively-executing session reports, consistent with this account
+    /// having live Code sessions running while this was captured) — but,
+    /// surprisingly, it showed up paired with `status: "archived"`, not
+    /// `status: "active"` as originally hypothesized; "archived" here
+    /// evidently describes something else (e.g. whether the item is pinned
+    /// to a visible surface) rather than whether the underlying worker is
+    /// still going. No `status`/`worker_status` value resembling
+    /// "waiting"/"needs input"/"blocked" was observed in this data — this
+    /// account's sessions were either running or fully idle at capture
+    /// time, so the needs-input branches below are an unverified,
+    /// conservative forward guess (keyword-matched), not confirmed against
+    /// real data. `worker_status` is the more specific of the two fields
+    /// (describes the underlying Code/Cowork worker process directly), so
+    /// it takes priority over the coarser `status` field when both are
+    /// present. Falls back to `.idle` for anything not recognized (stale/
+    /// finished sessions, or a future endpoint change) rather than guessing
+    /// — a false "idle" undersells a session's activity but never wrongly
+    /// demands the user's attention, which is the safer direction to err
+    /// for a field whose full value space isn't confirmed.
+    static func mapWorkStatus(status: String?, workerStatus: String?) -> SessionWorkStatus {
+        let w = workerStatus?.trimmingCharacters(in: .whitespaces).lowercased()
+        let s = status?.trimmingCharacters(in: .whitespaces).lowercased()
+
+        if let w {
+            if w == "running" || w == "active" || w == "executing" || w == "working" {
+                return .running
+            }
+            if w.contains("wait") || w.contains("input") || w.contains("pending") || w.contains("blocked") || w == "paused" {
+                return .needsInput
+            }
+        }
+        if let s {
+            if s.contains("wait") || s.contains("input") || s.contains("blocked") || s == "needs_attention" {
+                return .needsInput
+            }
+            if s == "active" && w == nil {
+                // No worker_status to disambiguate further; a bare "active"
+                // status with nothing else is the best signal available that
+                // something is happening.
+                return .running
+            }
+        }
+        return .idle
     }
 
     /// Whether `entry` was updated recently enough to treat as "active right

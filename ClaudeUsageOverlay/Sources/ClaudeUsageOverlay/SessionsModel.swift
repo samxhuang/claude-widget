@@ -2,6 +2,35 @@ import Foundation
 import Combine
 import Darwin
 
+/// Unified per-row status classification, shared by locally-tracked (daemon,
+/// state.json's "work_status") and cloud-only (claude.ai /recents' `status`/
+/// `worker_status`, mapped by CloudSessionsModel) sessions alike — this is
+/// what lets OverlayView use one dot-color language across both kinds of
+/// rows instead of the old local-only blue/orange scheme plus a separately-
+/// colored cloud dot.
+///
+/// - `running`: Claude is actively working (local: transcript/subagent
+///   touched within the last ~90s; cloud: worker_status == "running").
+/// - `needsInput`: turn is stalled waiting on the user — most commonly a
+///   permission prompt (local: quiet >90s AND the last event is an assistant
+///   turn ending in an unresolved tool_use; see autoresume.py's
+///   classify_work_status for the transcript evidence behind that rule).
+/// - `idle`: turn finished cleanly, or anything else not covered above.
+enum SessionWorkStatus: String {
+    case running
+    case needsInput = "needs_input"
+    case idle
+
+    /// Shown in the dot's `.help` tooltip.
+    var label: String {
+        switch self {
+        case .running: return "Running"
+        case .needsInput: return "Needs input"
+        case .idle: return "Idle / done"
+        }
+    }
+}
+
 /// One Claude Code session that got cut off by a rate limit, as detected by
 /// the claude-autoresume daemon. Mirrors an entry in ~/.claude-autoresume/state.json.
 struct SessionEntry: Identifiable, Equatable, Hashable {
@@ -23,6 +52,12 @@ struct SessionEntry: Identifiable, Equatable, Hashable {
     var forceResume: Bool
     var handled: Bool
     var status: String       // "active" | "waiting"
+    /// Daemon-computed "running"/"needs_input"/"idle" classification (see
+    /// SessionWorkStatus). `nil` when the running daemon predates this field
+    /// (state.json entry has no "work_status" key yet) — callers must
+    /// degrade to the legacy blue/orange dot in that case, not treat nil as
+    /// idle.
+    var workStatus: SessionWorkStatus?
 
     /// Cowork-only: opt-in "arm" for OS-level UI automation of Claude
     /// Desktop's native Resume space, orchestrated by the daemon's
@@ -127,6 +162,7 @@ final class SessionsModel: ObservableObject {
                     forceResume: dict["force_resume"] as? Bool ?? false,
                     handled: handled,
                     status: dict["status"] as? String ?? "active",
+                    workStatus: (dict["work_status"] as? String).flatMap(SessionWorkStatus.init(rawValue:)),
                     resumeArmed: dict["resume_armed"] as? Bool ?? false,
                     needsAttention: dict["needs_attention"] as? Bool ?? false
                 ))

@@ -152,7 +152,17 @@ final class ChatsFetcher {
                   .map(item => ({
                     id: item.id || item.uuid || '',
                     title: item.title || item.name || item.summary || '',
-                    updated_at: item.updated_at || item.updatedAt || null
+                    updated_at: item.updated_at || item.updatedAt || null,
+                    // Status classification item: /recents items carry a
+                    // coarse `status` field plus a `worker_status` field
+                    // specifically describing what the underlying
+                    // Code/Cowork worker process is doing right now (e.g.
+                    // observed "running" on an actively-executing session).
+                    // Passed through raw (not interpreted here) so
+                    // CloudSessionsModel can map them — see this file's
+                    // header comment for what's been verified vs. not.
+                    status: item.status || null,
+                    worker_status: item.worker_status || item.workerStatus || null
                   }))
                   .filter(c => c.id);
                 if (cloudSessions.length === 0 && recentsList.length > 0) {
@@ -216,6 +226,18 @@ final class ChatsFetcher {
                 let cloudRaw = dict["cloudSessions"] as? [[String: Any]] ?? []
                 if let rawShape = dict["cloudSessionsRawShape"] as? String {
                     NSLog("[ChatsFetcher] cloud sessions unexpected shape: %@", rawShape)
+                }
+                // Status classification item: log the raw status/worker_status
+                // combos actually coming back so the mapping in
+                // CloudSessionsModel can be verified/tuned against real data
+                // rather than guessed — see that model's `mapWorkStatus`.
+                let statusCombos = Set(cloudRaw.map { item -> String in
+                    let s = (item["status"] as? String) ?? "nil"
+                    let w = (item["worker_status"] as? String) ?? "nil"
+                    return "status=\(s) worker_status=\(w)"
+                })
+                if !statusCombos.isEmpty {
+                    NSLog("[ChatsFetcher] cloud session status/worker_status combos observed: %@", statusCombos.sorted().joined(separator: " | "))
                 }
                 let localIds = localSessionIds()
                 let localTitles = localSessionTitles()
