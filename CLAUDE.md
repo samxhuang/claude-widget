@@ -31,9 +31,12 @@ then.
 - **Daemon is pure stdlib.** It runs under the system `python3` via launchd
   (see the plist template) — no pip dependencies in `autoresume.py` or
   anything it imports at daemon-runtime (`cowork_resume.py`,
-  `usage_collector.py`, `plan_fit.py`). `chat_history.py` and its
-  `ccl_chromium_indexeddb`/`python-snappy` deps are a standalone research
-  module, not imported by the daemon.
+  `usage_collector.py`, `plan_fit.py`, `autoresume_config.py`).
+  `chat_history.py` and its `ccl_chromium_indexeddb`/`python-snappy` deps are
+  a standalone research module, not imported by the daemon. The same
+  constraint applies to anything deployed to remote SSH hosts
+  (`remote_ctl.py`, the daemon payload) — remote boxes only get system
+  `python3`.
 - **Pricing is never hardcoded-only.** `plan_fit.py` resolves: override file
   → fetched LiteLLM cache (daily refresh) → bundled defaults. Keep that
   fallback chain if touching pricing.
@@ -42,6 +45,12 @@ then.
 - **`state.json` writes go through the flock-based lock** (`StateLock` in
   `autoresume.py`; Swift side does the equivalent before writing back
   `enabled`/`force_resume`/etc.). Respect that when adding fields.
+- **`~/.claude-autoresume/config.json` has exactly one writer: the widget's
+  Settings window** (via ConfigStore, flock on `config.json.lock`, tmp+rename,
+  unknown keys preserved). The Python side (`autoresume_config.load_config`)
+  only reads, is fully defensive, and treats a missing/malformed file as the
+  defaults (Max account, no budget, no remote hosts). Hand-editing works but
+  is never required; the daemon must never write this file.
 
 ## Build / deploy
 
