@@ -1,8 +1,10 @@
 import SwiftUI
+import AppKit
 
 struct OverlayView: View {
     @ObservedObject var model: UsageModel
     @ObservedObject var sessions: SessionsModel
+    @ObservedObject var chats: ChatsModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -33,6 +35,10 @@ struct OverlayView: View {
             Divider().background(Color.white.opacity(0.15))
 
             sessionsSection
+
+            Divider().background(Color.white.opacity(0.15))
+
+            chatsSection
         }
         .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
         .frame(width: 280)
@@ -188,6 +194,97 @@ struct OverlayView: View {
     private func readyToResume(_ entry: SessionEntry) -> Bool {
         guard let resetsAt = entry.resetsAt else { return false }
         return resetsAt <= sessions.now
+    }
+
+    // MARK: - Recent chats
+
+    @ViewBuilder
+    private var chatsSection: some View {
+        HStack {
+            Image(systemName: chats.chatsExpanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundColor(.white.opacity(0.6))
+            Text("Recent chats")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+            Spacer()
+            if chats.isLoggedOut {
+                Text("Sign in needed")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.orange)
+            } else if !chats.chats.isEmpty {
+                Text("\(chats.chats.count)")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.18)))
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            chats.toggleChatsExpanded()
+        }
+
+        if chats.chatsExpanded {
+            if chats.isLoggedOut {
+                Text("Sign in needed")
+                    .font(.system(size: 9))
+                    .foregroundColor(.orange.opacity(0.85))
+            } else if chats.lastError != nil {
+                // Undocumented endpoint — on any failure (auth aside), show
+                // one muted line rather than surfacing raw error text or an
+                // empty-looking list that reads as "you have no chats".
+                Text("chats unavailable")
+                    .font(.system(size: 9))
+                    .foregroundColor(.white.opacity(0.4))
+            } else if chats.chats.isEmpty {
+                Text("No recent chats")
+                    .font(.system(size: 9))
+                    .foregroundColor(.white.opacity(0.4))
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(chats.chats.prefix(8)) { entry in
+                            chatRow(entry)
+                        }
+                    }
+                }
+                .frame(maxHeight: 260)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func chatRow(_ entry: ChatEntry) -> some View {
+        HStack(spacing: 6) {
+            Text(entry.displayTitle)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.white.opacity(0.95))
+                .lineLimit(1)
+
+            Spacer()
+
+            Text(chats.relativeText(for: entry.updatedAt))
+                .font(.system(size: 8.5))
+                .foregroundColor(.white.opacity(0.45))
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06)))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            openChat(entry.uuid)
+        }
+    }
+
+    /// Opens the conversation in the default browser rather than trying to
+    /// deep-link into the (hidden, headless-ish) webview this widget already
+    /// owns — simple and reliable, and it's the same place the user would
+    /// end up reading/replying anyway.
+    private func openChat(_ uuid: String) {
+        guard let url = URL(string: "https://claude.ai/chat/\(uuid)") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     // MARK: - Usage rows

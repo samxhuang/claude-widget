@@ -1,63 +1,28 @@
 import Foundation
-import WebKit
 
-/// Fetches usage numbers by running fetch() calls inside a WKWebView that is
-/// never shown on screen. This is intentional: WKWebView's default (persistent)
-/// website data store is the same store the real claude.ai login uses, so once
-/// you've signed in once (in the LoginWindowController), this webview carries
-/// the same session cookie and can call claude.ai's own endpoints exactly like
-/// the web app does — no token handling, no scraping pixels.
+/// Fetches usage numbers by running fetch() calls inside the shared hidden
+/// WKWebView (see ClaudeWebSession) whose persistent website data store
+/// carries the same claude.ai login cookie as a real browser tab — no token
+/// handling, no scraping pixels.
 ///
 /// Endpoints used (discovered by inspecting claude.ai's own network traffic on
 /// Settings -> Usage; these are NOT public/documented Anthropic APIs and could
 /// change or break at any time):
 ///   GET https://claude.ai/api/organizations                      -> [{ uuid, ... }]
 ///   GET https://claude.ai/api/organizations/{uuid}/usage          -> { five_hour, seven_day, ... }
-final class UsageFetcher: NSObject, WKNavigationDelegate {
-    private let webView: WKWebView
+final class UsageFetcher {
+    private let session: ClaudeWebSession
     private let model: UsageModel
     private let onLoginNeeded: () -> Void
-    private var didLoadBase = false
-    private var pendingRefreshAfterLoad = false
 
-    init(model: UsageModel, onLoginNeeded: @escaping () -> Void) {
+    init(session: ClaudeWebSession, model: UsageModel, onLoginNeeded: @escaping () -> Void) {
+        self.session = session
         self.model = model
         self.onLoginNeeded = onLoginNeeded
-
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default() // persistent, shared with LoginWindowController
-        self.webView = WKWebView(frame: .zero, configuration: config)
-
-        super.init()
-
-        webView.navigationDelegate = self
-        loadBase()
-    }
-
-    private func loadBase() {
-        guard let url = URL(string: "https://claude.ai/new") else { return }
-        webView.load(URLRequest(url: url))
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        didLoadBase = true
-        if pendingRefreshAfterLoad {
-            pendingRefreshAfterLoad = false
-            refresh()
-        }
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        // Ignore; next timer tick will retry loadBase() indirectly via refresh().
     }
 
     /// Call periodically (e.g. every 2 minutes) from AppDelegate's timer.
     func refresh() {
-        guard didLoadBase else {
-            pendingRefreshAfterLoad = true
-            return
-        }
-
         let script = """
         try {
           const orgsRes = await fetch('https://claude.ai/api/organizations', { credentials: 'include' });
@@ -76,11 +41,8 @@ final class UsageFetcher: NSObject, WKNavigationDelegate {
         }
         """
 
-        webView.callAsyncJavaScript(script, arguments: [:], in: nil, in: .page) { [weak self] result in
-            guard let self = self else { return }
-            DispatchQueue.main.async {
-                self.handle(result: result)
-            }
+        session.run(script: script) { [weak self] result in
+            self?.handle(result: result)
         }
     }
 
@@ -113,16 +75,6 @@ final class UsageFetcher: NSObject, WKNavigationDelegate {
 
     /// Forces a full cookie/session reset (used by "Sign Out" in the menu).
     func signOut(completion: @escaping () -> Void) {
-        let store = WKWebsiteDataStore.default()
-        store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
-            let claudeRecords = records.filter { $0.displayName.contains("claude.ai") || $0.displayName.contains("anthropic") }
-            store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: claudeRecords) {
-                DispatchQueue.main.async {
-                    self.didLoadBase = false
-                    self.loadBase()
-                    completion()
-                }
-            }
-        }
+        session.resetSession(completion: completion)
     }
 }

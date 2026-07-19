@@ -7,7 +7,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlayPanel: NSPanel!
     private let model = UsageModel()
     private let sessionsModel = SessionsModel()
+    private let chatsModel = ChatsModel()
+    // One hidden, authenticated WKWebView shared by both fetchers — see
+    // ClaudeWebSession's header comment for why this isn't two webviews.
+    private let webSession = ClaudeWebSession()
     private var fetcher: UsageFetcher!
+    private var chatsFetcher: ChatsFetcher!
     private var loginWindowController: LoginWindowController?
 
     private var dataTimer: Timer?
@@ -15,12 +20,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sessionsTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
-    // Panel sizing: fixed width, two heights depending on whether the
-    // Sessions section is expanded. Anchored to the top-right corner of the
-    // screen — resizing only moves the bottom edge, never the top-right one.
+    // Panel sizing: fixed width, height computed from which of the two
+    // collapsible sections (Sessions, Recent chats) are expanded. Anchored
+    // to the top-right corner of the screen — resizing only moves the
+    // bottom edge, never the top-right one.
     private let panelWidth: CGFloat = 280
-    private let collapsedPanelHeight: CGFloat = 190
-    private let expandedPanelHeight: CGFloat = 480
+    private let collapsedPanelHeight: CGFloat = 214
+    private let sessionsExpandedExtra: CGFloat = 290
+    private let chatsExpandedExtra: CGFloat = 280
     private var panelTopY: CGFloat = 0
     private var panelRightX: CGFloat = 0
 
@@ -35,21 +42,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         setupOverlayPanel()
 
-        fetcher = UsageFetcher(model: model, onLoginNeeded: { [weak self] in
+        fetcher = UsageFetcher(session: webSession, model: model, onLoginNeeded: { [weak self] in
+            self?.presentLoginWindow()
+        })
+        chatsFetcher = ChatsFetcher(session: webSession, model: chatsModel, onLoginNeeded: { [weak self] in
             self?.presentLoginWindow()
         })
 
         // Give the hidden webview a moment to finish its first navigation.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.fetcher.refresh()
+            self?.chatsFetcher.refresh()
         }
 
         dataTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.fetcher.refresh()
+            self?.chatsFetcher.refresh()
         }
         uiTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.model.tick()
             self?.sessionsModel.tick()
+            self?.chatsModel.tick()
         }
 
         sessionsModel.refresh()
@@ -61,8 +74,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .removeDuplicates()
             .receive(on: DispatchQueue.main) // @Published emits on willSet; hop a beat so the resize runs after the value has actually changed
             .sink { [weak self] expanded in
-                self?.resizePanel(expanded: expanded)
+                self?.updatePanelSize()
                 self?.statusItem.menu?.item(withTitle: "Show Sessions")?.state = expanded ? .on : .off
+            }
+            .store(in: &cancellables)
+
+        chatsModel.$chatsExpanded
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] expanded in
+                self?.updatePanelSize()
+                self?.statusItem.menu?.item(withTitle: "Show Chats")?.state = expanded ? .on : .off
             }
             .store(in: &cancellables)
     }
@@ -90,6 +112,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionsToggleItem.state = sessionsModel.sessionsExpanded ? .on : .off
         menu.addItem(sessionsToggleItem)
 
+        let chatsToggleItem = NSMenuItem(title: "Show Chats", action: #selector(toggleChatsSection), keyEquivalent: "")
+        chatsToggleItem.target = self
+        chatsToggleItem.state = chatsModel.chatsExpanded ? .on : .off
+        menu.addItem(chatsToggleItem)
+
         menu.addItem(.separator())
         menu.addItem(withTitle: "Sign In…", action: #selector(presentLoginWindow), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Sign Out", action: #selector(signOut), keyEquivalent: "").target = self
@@ -101,10 +128,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func refreshNow() {
         fetcher.refresh()
+        chatsFetcher.refresh()
     }
 
     @objc private func toggleSessionsSection() {
         sessionsModel.sessionsExpanded.toggle()
+    }
+
+    @objc private func toggleChatsSection() {
+        chatsModel.chatsExpanded.toggle()
     }
 
     @objc private func toggleOverlay() {
@@ -130,6 +162,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.model.isLoggedOut = true
             self?.model.sessionPercent = nil
             self?.model.weeklyPercent = nil
+            self?.chatsModel.isLoggedOut = true
+            self?.chatsModel.chats = []
         }
     }
 
@@ -140,9 +174,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Overlay panel
 
     private func setupOverlayPanel() {
-        let initialHeight = sessionsModel.sessionsExpanded ? expandedPanelHeight : collapsedPanelHeight
+        let initialHeight = currentPanelHeight()
 
-        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel))
+        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel))
         // Without this, NSHostingView installs Auto Layout min/max-size
         // constraints on itself (macOS 13+ default: .standardBounds) that
         // reflect the SwiftUI content's intrinsic size — and since it's the
@@ -191,12 +225,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSRect(x: panelRightX - panelWidth, y: panelTopY - height, width: panelWidth, height: height)
     }
 
-    private func resizePanel(expanded: Bool) {
+    /// Sessions and Recent chats are independently collapsible, so the
+    /// panel's height is the collapsed base plus whichever of the two
+    /// sections' extra heights currently apply.
+    private func currentPanelHeight() -> CGFloat {
+        var height = collapsedPanelHeight
+        if sessionsModel.sessionsExpanded { height += sessionsExpandedExtra }
+        if chatsModel.chatsExpanded { height += chatsExpandedExtra }
+        return height
+    }
+
+    private func updatePanelSize() {
         guard let panel = overlayPanel else { return }
-        let newHeight = expanded ? expandedPanelHeight : collapsedPanelHeight
         // No animation: keeps this a plain, immediate resize with no
         // in-flight state that could interact oddly with the click that
         // triggered it.
-        panel.setFrame(frameForCurrentAnchor(height: newHeight), display: true, animate: false)
+        panel.setFrame(frameForCurrentAnchor(height: currentPanelHeight()), display: true, animate: false)
     }
 }
