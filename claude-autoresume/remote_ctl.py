@@ -229,7 +229,9 @@ def cmd_apply_toggles() -> int:
             touched = False
             for key in TOGGLE_KEYS:
                 if key in updates:
-                    entry[key] = updates[key]
+                    # Hardening: coerce to bool so a malformed payload can't
+                    # write arbitrary JSON into widget-owned toggle fields.
+                    entry[key] = bool(updates[key])
                     touched = True
             if touched:
                 applied += 1

@@ -1465,6 +1465,15 @@ def _usage_analytics_worker() -> None:
             # into plan_fit.json on the very next poll (~10s), not an hour later.
             last_config_mtime, last_plan_inputs = _maybe_write_plan_fit_on_config_change(
                 STATE_DIR, last_config_mtime, remote_mode, last_plan_inputs)
+            # Round-3 m1: a plan change needs a SECOND compute to confirm
+            # (two-consecutive-sighting rule in plan_fit._update_plan_history)
+            # — force it on the next poll tick instead of the next hourly
+            # pass, or the Plan-fit tab shows pre-change utilization rebased
+            # against the new plan for up to an hour. Self-limiting: the
+            # confirming compute clears the pending entry.
+            if not remote_mode and plan_fit.has_pending_plan_change(STATE_DIR):
+                plan_fit.write_plan_fit(STATE_DIR, datetime.now().astimezone())
+                log("usage analytics: pending plan change — confirming compute run")
         except Exception as e:
             log(f"ERROR in usage analytics cycle: {e!r}")
         time.sleep(POLL_INTERVAL_SECONDS)

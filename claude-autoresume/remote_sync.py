@@ -587,6 +587,11 @@ class _RemoteSyncLoop:
         for sched in (self.next_poll, self.next_usage):
             for name in [n for n in sched if n not in host_names]:
                 del sched[name]
+        # Round-3 m3: retention-push failure memos likewise — a removed host's
+        # memo must not suppress the first push to a later re-added host of
+        # the same name.
+        for name in [n for n in _RETENTION_PUSH_FAILED if n not in host_names]:
+            del _RETENTION_PUSH_FAILED[name]
 
         # Finding 1: idle early-out. Nothing configured and nothing believed
         # present ⇒ skip the whole tick without ever taking StateLock.

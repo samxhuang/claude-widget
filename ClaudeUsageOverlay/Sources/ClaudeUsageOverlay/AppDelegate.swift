@@ -228,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setupOverlayPanel()
 
         fetcher = UsageFetcher(session: webSession, model: model, onLoginNeeded: { [weak self] in
-            self?.presentLoginWindow()
+            self?.showLoginWindow(userInitiated: false)
         })
         chatsFetcher = ChatsFetcher(session: webSession, model: chatsModel, cloudSessions: cloudSessionsModel, localSessionIds: { [weak self] in
             Set(self?.sessionsModel.sessions.map { $0.id } ?? [])
@@ -254,7 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // CloudSessionsModel.apply and SessionsModel.cliStartDates.
             self?.sessionsModel.cliStartDates ?? []
         }, onLoginNeeded: { [weak self] in
-            self?.presentLoginWindow()
+            self?.showLoginWindow(userInitiated: false)
         })
 
         // Give the hidden webview a moment to finish its first navigation.
@@ -537,7 +537,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.menu?.item(withTitle: "Show Overlay")?.state = .off
     }
 
+    /// R-1 (release gate): the fetch lanes 401 every 30s while logged out,
+    /// and each used to re-present the login window — an app that steals
+    /// focus every 30 seconds forever for anyone who closes it without
+    /// signing in. Auto-presentation now happens at most ONCE per launch;
+    /// afterwards the panel's "Sign in needed" state and the menu's explicit
+    /// "Sign In…" item are the affordances.
+    private var autoPresentedLogin = false
+
     @objc private func presentLoginWindow() {
+        showLoginWindow(userInitiated: true)
+    }
+
+    private func showLoginWindow(userInitiated: Bool) {
+        if !userInitiated {
+            guard !autoPresentedLogin else { return }
+            autoPresentedLogin = true
+        }
         if loginWindowController == nil {
             loginWindowController = LoginWindowController()
         }

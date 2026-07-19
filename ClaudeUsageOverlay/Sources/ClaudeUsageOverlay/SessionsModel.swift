@@ -301,23 +301,30 @@ final class SessionsModel: ObservableObject {
             // app's lifetime, permanently blacking out each session's
             // creation window for genuine cloud rows).
             let scanNow = Date()
-            for entry in entries where entry.kind != "cowork" && entry.host == nil {
-                self.cliStartLastSeenInState[entry.id] = scanNow
-                if self.cliStartCache[entry.id] != nil { continue }
+            // SM-1 (round-3 audit): stamp from the RAW state dict, not the
+            // filtered `entries` — handled rows and crash-continuation-
+            // collapsed rows are absent from `entries` but their ids are
+            // still in state.json, and un-stamped ids evict after 60 min
+            // while their /recents echo can still be live, letting the
+            // phantom reappear.
+            for (sid, dict) in json where (dict["kind"] as? String) != "cowork" && dict["host"] == nil {
+                self.cliStartLastSeenInState[sid] = scanNow
+                if self.cliStartCache[sid] != nil { continue }
                 // R2-5: negative-result cache — a session whose transcript
                 // can't be found (deleted file) must not trigger the fallback
                 // ~/.claude/projects listing on every 5s refresh while this
                 // block holds the state flock. Retry after a cooldown in case
                 // the transcript appears late.
-                if let missedAt = self.cliStartMissAt[entry.id],
+                if let missedAt = self.cliStartMissAt[sid],
                    scanNow.timeIntervalSince(missedAt) < Self.transcriptMissRetryInterval {
                     continue
                 }
-                if let date = Self.transcriptCreationDate(projectDir: entry.projectDir, id: entry.id) {
-                    self.cliStartCache[entry.id] = date
-                    self.cliStartMissAt[entry.id] = nil
+                let projectDir = dict["project_dir"] as? String ?? ""
+                if let date = Self.transcriptCreationDate(projectDir: projectDir, id: sid) {
+                    self.cliStartCache[sid] = date
+                    self.cliStartMissAt[sid] = nil
                 } else {
-                    self.cliStartMissAt[entry.id] = scanNow
+                    self.cliStartMissAt[sid] = scanNow
                 }
             }
             // Eviction: once an id has been out of state.json for longer than

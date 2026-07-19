@@ -256,8 +256,10 @@ final class ChatsFetcher {
             }
             if let err = dict["error"] as? String {
                 model.lastError = err
-                let sample = (dict["bodySample"] as? String) ?? ""
-                NSLog("[ChatsFetcher] error=%@ bodySample=%@", err, sample)
+                // Release hygiene: log only the error code, not the response
+                // body sample — API responses are the user's own account data
+                // and don't belong in the unified log.
+                NSLog("[ChatsFetcher] error=%@", err)
                 return
             }
             if let ok = dict["ok"] as? Bool, ok, let chats = dict["chats"] as? [[String: Any]] {

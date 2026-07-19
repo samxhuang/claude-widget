@@ -22,6 +22,13 @@ if [ -z "$PYTHON3_BIN" ]; then
   echo "ERROR: could not find 'python3' on your PATH."
   exit 1
 fi
+# Same floor deploy_remote.sh enforces for remotes: the daemon uses 3.9+
+# syntax/stdlib behavior, and an older exotic PATH python3 would pass install
+# then crash-loop under launchd with no useful message.
+if ! "$PYTHON3_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)'; then
+  echo "ERROR: python3 at $PYTHON3_BIN is older than 3.9."
+  exit 1
+fi
 
 echo "    claude:  $CLAUDE_BIN"
 echo "    python3: $PYTHON3_BIN"

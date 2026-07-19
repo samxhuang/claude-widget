@@ -339,9 +339,17 @@ final class ConfigStore: ObservableObject {
 
     // MARK: - Encode / decode
 
+    /// CS-1 (round-3 audit): budgets are stored rounded to CENTS. The
+    /// Settings fields display via formatBudget (2 decimals), so storing
+    /// "12.345" verbatim made the displayed text never round-trip back to the
+    /// stored value — editedSnapshot != seeded forever, Apply/Cancel stuck
+    /// enabled and the field permanently read as "touched". Cent precision
+    /// makes stored == parsed(displayed) by construction; sub-cent budget
+    /// limits have no meaning anyway.
     private static func sanitizedBudget(_ value: Double?) -> Double? {
         guard let v = value, v.isFinite, v > 0 else { return nil }
-        return v
+        let cents = (v * 100).rounded() / 100
+        return cents > 0 ? cents : nil
     }
 
     private static func hostDict(_ host: RemoteHostConfig) -> [String: Any] {
@@ -367,8 +375,11 @@ final class ConfigStore: ObservableObject {
             if let plan = account["plan"] as? String { c.accountPlan = plan }
         }
         if let budget = root["budget"] as? [String: Any] {
-            c.weeklyUsd = (budget["weekly_usd"] as? NSNumber)?.doubleValue
-            c.monthlyUsd = (budget["monthly_usd"] as? NSNumber)?.doubleValue
+            // CS-1: decode through the same cent-rounding as writes, so a
+            // hand-edited 3-decimal value can't re-open the display/stored
+            // round-trip mismatch (see sanitizedBudget).
+            c.weeklyUsd = sanitizedBudget((budget["weekly_usd"] as? NSNumber)?.doubleValue)
+            c.monthlyUsd = sanitizedBudget((budget["monthly_usd"] as? NSNumber)?.doubleValue)
             if let ws = budget["week_start"] as? String { c.weekStart = ws }
             if let tz = budget["timezone"] as? String { c.timezone = tz }
         }

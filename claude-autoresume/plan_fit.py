@@ -971,6 +971,15 @@ def _append_plan_history(usage_dir: Path, ts: datetime, plan: str,
 _PENDING_PLAN_CHANGE: dict = {}
 
 
+def has_pending_plan_change(state_dir: Path) -> bool:
+    """True while a plan change has been sighted once but not yet confirmed
+    by a second compute. The analytics worker uses this to schedule the
+    confirming compute on its next poll tick instead of waiting for the
+    hourly pass — without it, the widget could show pre-change utilization
+    rebased against the new plan for up to an hour."""
+    return str(Path(state_dir) / "usage") in _PENDING_PLAN_CHANGE
+
+
 def _update_plan_history(usage_dir: Path, current_plan: str, now: datetime,
                          earliest_data: datetime | None,
                          plan_defaulted: bool = False) -> tuple[datetime, bool]:
