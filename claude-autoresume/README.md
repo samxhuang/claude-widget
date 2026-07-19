@@ -82,6 +82,77 @@ cd claude-autoresume
 ./uninstall.sh
 ```
 
+## Remote hosts (SSH)
+
+Claude Code running over a plain ssh terminal or VS Code Remote-SSH writes its
+transcripts to the **remote** machine's `~/.claude/projects`, where the Mac
+daemon can't see them. The fix is to run this same stdlib daemon on each remote
+host and have the Mac fetch its state over ssh and merge it in — full
+classification fidelity, and auto-resume fires natively on the remote instead of
+over fragile ssh-exec.
+
+- The remote runs the identical `autoresume.py`, launched with
+  `AUTORESUME_REMOTE=1` so it does the session classification but skips the
+  Mac-only usage/pricing writes.
+- The Mac's sync worker talks to the remote through `remote_ctl.py` (a tiny
+  stdlib bridge deployed alongside the daemon): `dump` reads the remote
+  `state.json` under the same flock the daemon uses, `apply-toggles` pushes your
+  widget toggles back (whitelisted keys only, never creating entries).
+- Remote sessions show up in the widget merged with local ones; their entries
+  are keyed `"<host>::<remote_session_id>"`.
+
+### The normal path — add a host in Settings
+
+You don't run any of this by hand. Open **Settings** from the menu-bar icon,
+go to **Remote Hosts → Add Host**, give it a name and an ssh target
+(`sam@devbox` or an `~/.ssh/config` alias), and the widget auto-deploys the
+daemon to that host and starts syncing. Remote sessions default to
+`enabled: false` exactly like local ones — nothing auto-resumes until you flip
+its toggle.
+
+### Manual deploy / uninstall
+
+The Settings **Add Host** flow just runs the deploy script for you; you can also
+run it directly (both from the repo checkout and from the installed
+`~/.claude-autoresume/bin/` copy — it finds its payload beside itself):
+
+```bash
+# deploy (or redeploy) to a host
+~/.claude-autoresume/bin/deploy_remote.sh sam@devbox
+
+# stop the remote daemon and remove ~/.claude-autoresume/bin on the host
+# (remote state.json, usage/, and transcripts are left untouched)
+~/.claude-autoresume/bin/deploy_remote.sh sam@devbox --uninstall
+```
+
+The script is fully non-interactive (every ssh/scp uses `BatchMode=yes` and
+never prompts) and prints machine-readable markers the widget parses to drive
+its progress checklist — `@@STEP:<connect|python|copy|service|start|verify>` at
+each stage, then `@@OK version=<hash>` or `@@FAIL:<reason>`; exit code mirrors
+the last marker. It installs a `systemctl --user` unit where available (with
+`loginctl enable-linger` so it survives logout) and falls back to
+`nohup` + a pidfile otherwise.
+
+### Troubleshooting remote deploy
+
+- **`@@FAIL:connect …`** — ssh couldn't reach the host without prompting.
+  Remote deploy requires **key-based ssh auth**; `BatchMode` never types a
+  password. Make sure `ssh <target>` works from a terminal with no password
+  prompt (add your key to the host's `~/.ssh/authorized_keys`, and for a brand
+  new host accept its host key once by connecting manually first).
+- **`@@FAIL:python …`** — the remote's `python3` is missing or older than 3.9.
+  The daemon is pure stdlib but needs 3.9+. Install/point PATH at a newer
+  `python3`.
+- **`claude` not found on remote** — deploy still succeeds (you get a warning),
+  but auto-resume can't launch sessions there until `claude` is on the remote's
+  PATH. Install Claude Code on the host.
+- **Daemon stops after you log out** — `loginctl enable-linger` didn't take (you
+  saw a warning). Have an admin run `loginctl enable-linger <user>` on the host,
+  or the systemd `--user` manager will exit when your last session ends.
+- **No `systemctl --user`** — the script uses the `nohup` + pidfile fallback;
+  the daemon runs but won't restart automatically on remote reboot. Re-running
+  the deploy relaunches it (it kills the old pid first).
+
 ## Known rough edges
 
 - **`--permission-mode bypassPermissions`** is the flag/value most likely to

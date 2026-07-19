@@ -35,6 +35,21 @@ cp usage_collector.py "$INSTALL_DIR/usage_collector.py"
 cp plan_fit.py "$INSTALL_DIR/plan_fit.py"
 cp autoresume_config.py "$INSTALL_DIR/autoresume_config.py"
 
+echo "==> Staging remote-deploy payload into $INSTALL_DIR ..."
+# The widget invokes deploy_remote.sh at runtime (Add Host in Settings), so the
+# script, the service-unit template, and remote_ctl.py must all live beside the
+# daemon payload it ships.
+cp remote_ctl.py "$INSTALL_DIR/remote_ctl.py"
+chmod +x "$INSTALL_DIR/remote_ctl.py"
+cp deploy_remote.sh "$INSTALL_DIR/deploy_remote.sh"
+chmod +x "$INSTALL_DIR/deploy_remote.sh"
+cp autoresume.service.template "$INSTALL_DIR/autoresume.service.template"
+# remote_sync.py is authored by a parallel workstream (WS-4). Guard its copy so
+# install.sh still succeeds if run before that file lands; every other cp above
+# hard-fails as before.
+cp -f remote_sync.py "$INSTALL_DIR/remote_sync.py" 2>/dev/null || \
+  echo "    (remote_sync.py not present yet — skipping; Mac-side sync arrives with WS-4)"
+
 echo "==> Writing LaunchAgent plist to $PLIST_PATH ..."
 mkdir -p "$LAUNCH_AGENTS_DIR"
 sed \

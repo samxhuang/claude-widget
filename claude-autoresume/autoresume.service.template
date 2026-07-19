@@ -1,0 +1,22 @@
+[Unit]
+Description=claude-autoresume daemon (remote host)
+After=default.target
+
+[Service]
+Type=simple
+# Rendered by deploy_remote.sh (sed, mirroring install.sh's plist template):
+#   __PYTHON3__     -> remote python3 path (python3 >= 3.9)
+#   __SCRIPT_PATH__ -> remote ~/.claude-autoresume/bin/autoresume.py
+#   __CLAUDE_BIN__  -> remote `command -v claude` (may be empty)
+#   __STATE_DIR__   -> remote ~/.claude-autoresume
+ExecStart=__PYTHON3__ __SCRIPT_PATH__
+Environment=AUTORESUME_REMOTE=1
+Environment=CLAUDE_BIN=__CLAUDE_BIN__
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
+Restart=always
+RestartSec=5
+StandardOutput=append:__STATE_DIR__/launchd.out.log
+StandardError=append:__STATE_DIR__/launchd.err.log
+
+[Install]
+WantedBy=default.target
