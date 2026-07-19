@@ -436,5 +436,58 @@ class TestPlanFitOnConfigChange(TempEnvMixin, unittest.TestCase):
         self.assertEqual(new, 500.0, "last_mtime unchanged in remote mode")
 
 
+# ---------------------------------------------------------------------------
+# Idle retention: sessions must drop AT the retention edge, not ~3x later
+# ---------------------------------------------------------------------------
+
+class TestIdleRetentionDrop(TempEnvMixin, unittest.TestCase):
+    """Regression tests for the equal-windows bug: with scan == active window
+    the quiet->None->delete band was empty, so idle sessions lingered until
+    the old 2x-last_seen safety net (~90 min at a 30m setting) instead of
+    dropping at the retention edge."""
+
+    def test_idle_just_past_retention_gets_none_record(self):
+        now = ar.time.time()
+        # 32 min idle with a 30m retention: inside the scan buffer band,
+        # outside the active window -> must yield an explicit None record so
+        # merge deletes the entry, not silence.
+        mtime = now - 32 * 60
+        self.write_cli_transcript("sess_band", [human_user(cwd=str(self.tmp))], mtime=mtime)
+        records = ar.compute_cli_records(now, {}, {}, 30)
+        self.assertIn("sess_band", records)
+        self.assertIsNone(records["sess_band"]["status"])
+
+    def test_idle_inside_retention_stays_active(self):
+        now = ar.time.time()
+        mtime = now - 20 * 60
+        self.write_cli_transcript("sess_live", [human_user(cwd=str(self.tmp))], mtime=mtime)
+        records = ar.compute_cli_records(now, {}, {}, 30)
+        self.assertEqual(records["sess_live"]["status"], "active")
+
+    def test_prune_keys_on_real_activity_not_last_seen(self):
+        # A fresh last_seen (e.g. re-stamped by a transient window widening)
+        # must not keep a long-idle session alive: prune uses
+        # last_activity_at + grace.
+        now = ar.time.time()
+        state = {
+            "idle_old": {"kind": "cli", "status": "active", "handled": False,
+                          "last_seen": now,  # fresh bookkeeping
+                          "last_activity_at": now - 60 * 60},  # 1h idle
+            "idle_recent": {"kind": "cli", "status": "active", "handled": False,
+                             "last_seen": now,
+                             "last_activity_at": now - 20 * 60},
+        }
+        ar.prune_old_entries(state, 30)
+        self.assertNotIn("idle_old", state)
+        self.assertIn("idle_recent", state)
+
+    def test_prune_falls_back_to_last_seen_without_activity_field(self):
+        now = ar.time.time()
+        state = {"legacy": {"kind": "cli", "status": "active", "handled": False,
+                             "last_seen": now - 60 * 60}}
+        ar.prune_old_entries(state, 30)
+        self.assertNotIn("legacy", state)
+
+
 if __name__ == "__main__":
     unittest.main()

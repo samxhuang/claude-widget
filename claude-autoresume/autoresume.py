@@ -128,6 +128,11 @@ PRUNE_AFTER_HOURS = 48
 # Drop "active" entries that have gone quiet (and never got rate-limited)
 # after this long.
 ACTIVE_STALE_MINUTES = ACTIVE_WINDOW_MINUTES * 2
+# The scan window extends this far past the active window so the
+# "in-scan-but-idle -> None record -> deleted" band always exists (see the
+# comment at compute_cli_records' scan_cutoff), and the pruner grants idle
+# entries this much grace past the retention edge before force-dropping.
+SCAN_BUFFER_MINUTES = 5
 # Per-session "work_status" classification (running / needs_input / idle),
 # additive to the existing active/waiting `status` field (which resume logic
 # depends on and which this does NOT change).
@@ -791,10 +796,16 @@ def compute_cli_records(now: float, runtime: dict, cache: dict,
 
     # Configurable idle retention (config.json sessions.idle_retention_minutes)
     # replaces the hardcoded ACTIVE_WINDOW_MINUTES as the "how long does an
-    # idle session stay listed" knob. The scan window stretches with it (it
-    # must stay >= the active window — see the lockstep comment on
-    # SCAN_WINDOW_MINUTES) but never shrinks below the historical 30m floor.
-    scan_cutoff = now - max(SCAN_WINDOW_MINUTES, retention_minutes) * 60
+    # idle session stay listed" knob. The scan window must be STRICTLY wider
+    # than the active window (not merely >=): the "gone quiet -> status None ->
+    # merge deletes the entry" band is (active, scan], and with equal windows
+    # (the historical 30/30) that band is empty — a file exits the scan the
+    # same instant it exits the active window, no None record is ever emitted,
+    # and idle sessions lingered until the 2x safety-net pruner (~90 min at a
+    # 30m setting) instead of dropping at the retention edge. SCAN_BUFFER
+    # keeps the band real; the 30m floor is retained for scan efficiency.
+    scan_cutoff = now - (max(SCAN_WINDOW_MINUTES, retention_minutes)
+                         + SCAN_BUFFER_MINUTES) * 60
     active_window_seconds = retention_minutes * 60
     in_window_paths = set()
 
@@ -991,8 +1002,11 @@ def compute_cowork_records(now: float,
         return records
 
     # Same configurable retention as the CLI scan: the scan window stretches
-    # with it (floor 30m), and "gone quiet" is judged at the retention edge.
-    scan_cutoff_ms = (now - max(SCAN_WINDOW_MINUTES, retention_minutes) * 60) * 1000
+    # with it (floor 30m) plus the same strictly-wider SCAN_BUFFER (see
+    # compute_cli_records — the quiet->drop band must be non-empty), and
+    # "gone quiet" is judged at the retention edge.
+    scan_cutoff_ms = (now - (max(SCAN_WINDOW_MINUTES, retention_minutes)
+                             + SCAN_BUFFER_MINUTES) * 60) * 1000
     quiet_cutoff_ms = (now - retention_minutes * 60) * 1000
 
     for meta_path in COWORK_SESSIONS_DIR.rglob("local_*.json"):
@@ -1252,9 +1266,14 @@ def prune_old_entries(state: dict,
                       retention_minutes: float = ACTIVE_WINDOW_MINUTES) -> None:
     now = time.time()
     handled_cutoff = now - PRUNE_AFTER_HOURS * 3600
-    # Safety-net stale cutoff scales with the configured retention (same 2x
-    # ratio ACTIVE_STALE_MINUTES always had over the active window).
-    active_cutoff = now - retention_minutes * 2 * 60
+    # The user-visible rule is "idle sessions drop at the retention edge", so
+    # the pruner keys on REAL activity age (last_activity_at) with a small
+    # grace, not on last_seen with a 2x multiplier. last_seen is poll
+    # bookkeeping — any transient window widening (e.g. the retention setting
+    # being briefly raised, capturing old sessions) re-stamps it and would
+    # keep a long-idle session visible for another 2x cycle. last_seen
+    # remains only the fallback for entries predating last_activity_at.
+    idle_cutoff = now - (retention_minutes + SCAN_BUFFER_MINUTES) * 60
 
     stale = []
     for sid, e in state.items():
@@ -1268,8 +1287,8 @@ def prune_old_entries(state: dict,
             stale.append(sid)
             continue
         if e.get("status") == "active" and not e.get("handled"):
-            last_seen = e.get("last_seen", e.get("detected_at", 0))
-            if last_seen < active_cutoff:
+            last_activity = e.get("last_activity_at") or e.get("last_seen", e.get("detected_at", 0))
+            if last_activity < idle_cutoff:
                 stale.append(sid)  # went quiet and never got rate-limited
 
     for sid in stale:
