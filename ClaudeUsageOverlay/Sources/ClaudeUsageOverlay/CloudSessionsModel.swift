@@ -44,6 +44,10 @@ final class CloudSessionsModel: ObservableObject {
     /// overflow fine for a handful of rows, but 13 mostly-day-old sessions
     /// was clutter — cap the visible list and let the badge show the rest.
     private static let displayCap = 8
+    /// Cloud sessions idle longer than this are dropped entirely, mirroring
+    /// the daemon's ACTIVE_WINDOW_MINUTES lookback for local sessions so
+    /// both halves of the Sessions list age out on the same clock.
+    private static let lookbackWindow: TimeInterval = 30 * 60
     /// A cloud session updated within this window is considered
     /// actively-running "right now" (vs. an old/idle one) for the
     /// brighter-text/dot treatment in OverlayView.
@@ -70,13 +74,18 @@ final class CloudSessionsModel: ObservableObject {
     /// /recents item under yet another id that matches neither the old nor
     /// the new local id, so id-based filtering alone can't catch it.
     func apply(raw: [[String: Any]], localIds: Set<String>, localTitles: Set<String>) {
+        let cutoff = Date().addingTimeInterval(-Self.lookbackWindow)
         let parsed: [CloudSessionEntry] = raw.compactMap { dict in
             guard let id = dict["id"] as? String, !id.isEmpty, !localIds.contains(id) else { return nil }
             let title = dict["title"] as? String ?? ""
             let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard !localTitles.contains(normalizedTitle) else { return nil }
             let updatedAt = Self.parseDate(dict["updated_at"] as? String)
-            return CloudSessionEntry(id: id, title: title, updatedAt: updatedAt)
+            // Same 30-minute lookback as local sessions: idle cloud sessions
+            // age out of the list rather than lingering for days. Unparseable
+            // dates are treated as stale, not shown forever.
+            guard let updated = updatedAt, updated >= cutoff else { return nil }
+            return CloudSessionEntry(id: id, title: title, updatedAt: updated)
         }
         // Newest-first: /recents already comes back sorted this way, but
         // sort explicitly rather than depend on an undocumented endpoint's
