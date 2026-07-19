@@ -217,8 +217,30 @@ final class GraphModel: ObservableObject {
         costBuckets = period == .threeMonth
             ? Self.dailyCostBuckets(start: start, end: end, daily: dailyCost)
             : Self.hourlyCostBuckets(start: start, end: end, hourly: hourlyCost)
+        // Total measured cost comes from the RAW series, not the plotted
+        // buckets: multi-hour buckets hold a per-hour average (the chart is a
+        // rate), so summing bucket.usd undercounts any period whose step is
+        // wider than an hour — 1mo's 3h steps read as a third of the truth.
+        let measuredCost: Double
+        if period == .threeMonth {
+            // Daily tier: include days from the UTC start-of-day containing
+            // `start` (boundary day counted whole — the daily series has no
+            // finer resolution; today the data starts long after the window
+            // boundary so nothing is actually clipped or double-counted).
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyy-MM-dd"
+            fmt.timeZone = TimeZone(identifier: "UTC")
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = TimeZone(identifier: "UTC") ?? .current
+            let firstKey = fmt.string(from: cal.startOfDay(for: start))
+            measuredCost = dailyCost.filter { $0.key >= firstKey }.values.reduce(0, +)
+        } else {
+            measuredCost = hourlyCost
+                .filter { $0.key >= start && $0.key < end }
+                .values.reduce(0, +)
+        }
         costSummary = Self.costSummaryText(
-            buckets: costBuckets, start: start, end: end,
+            measured: measuredCost, start: start, end: end,
             earliest: costDataEarliest(), duration: period.durationSeconds)
 
         if let last = rawSnapshots.last {
@@ -272,10 +294,9 @@ final class GraphModel: ObservableObject {
     /// periods (1mo/3mo) where collection-started-Jul-18 coverage is thinnest
     /// and the estimate is most wanted. nil when nothing is measured and
     /// nothing can be estimated.
-    static func costSummaryText(buckets: [CostBucket], start: Date, end: Date,
+    static func costSummaryText(measured: Double, start: Date, end: Date,
                                 earliest: Date?, duration: TimeInterval) -> String? {
         guard let earliest = earliest, earliest < end, duration > 0 else { return nil }
-        let measured = buckets.reduce(0) { $0 + $1.usd }
         let text = "$" + Self.compactDollars(measured)
         let covered = end.timeIntervalSince(max(earliest, start))
         let coverage = covered / duration
