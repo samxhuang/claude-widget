@@ -106,16 +106,6 @@ private enum AccountChoice: String, CaseIterable, Identifiable {
         }
     }
 
-    /// (type, plan) written back to config. For API, `preservingPlan` keeps
-    /// whatever Max plan the user last had so switching back restores it.
-    func typeAndPlan(preservingPlan plan: String) -> (String, String) {
-        switch self {
-        case .maxPro: return ("max", "pro")
-        case .max5x:  return ("max", "max_5x")
-        case .max20x: return ("max", "max_20x")
-        case .api:    return ("api", plan)
-        }
-    }
 }
 
 // Finding 2: the Python config validator (contract C1) only accepts "monday"
@@ -135,8 +125,11 @@ struct SessionsSection: View {
     @ObservedObject var configStore: ConfigStore
 
     /// (minutes, label). 30 is the historical default; the daemon clamps
-    /// anything outside 5–1440.
+    /// anything outside 5–1440. R2-3: 5 is offered so the picker's smallest
+    /// option matches the daemon's floor — a clamped-to-5 value now displays
+    /// as the 5 it actually runs at, not snapped up to 15.
     private static let options: [(Int, String)] = [
+        (5, "5 minutes"),
         (15, "15 minutes"),
         (30, "30 minutes (default)"),
         (60, "1 hour"),
@@ -353,50 +346,50 @@ struct AccountBudgetSection: View {
         lastSyncedSnapshot = snapshot(of: c)
     }
 
-    /// Apply: write all buffered edits to config in one atomic mutation
-    /// (setAccountAndBudget — two sequential setters used to publish an
-    /// intermediate mixed state and write the file twice). Only reachable
-    /// with valid input (the button disables on hasInvalidInput).
+    /// Apply: write all buffered edits to config in one atomic mutation.
+    /// Only reachable with valid input (the button disables on
+    /// hasInvalidInput).
     ///
-    /// Per-field staleness guard: the buffers were seeded from
-    /// lastSyncedSnapshot, and an external config edit can land mid-edit
-    /// (onChange above deliberately leaves the user's typing alone). At Apply
-    /// time a field the user did NOT touch still holds the stale seeded
-    /// value — blindly committing it would silently revert the concurrent
-    /// external change. So each field commits the user's buffer only when it
-    /// differs from what was seeded; an untouched field commits the LIVE
-    /// config's current value instead.
+    /// R2-2 — per-field staleness guard, now resolved INSIDE ConfigStore's
+    /// locked mutate against the freshly-read on-disk config: the buffers
+    /// were seeded from lastSyncedSnapshot, and an external config edit can
+    /// land mid-edit (onChange above deliberately leaves the user's typing
+    /// alone). A field the user did NOT touch (edited == seeded) is not
+    /// rewritten at all, so it can't revert a concurrent external edit — the
+    /// previous fix resolved untouched fields against the PUBLISHED config
+    /// here, which can lag disk by up to the periodic-reload interval and so
+    /// could still clobber a just-landed hand-edit.
     private func applyEdits() {
-        let live = configStore.config
-        let liveSnap = snapshot(of: live)
         let edited = editedSnapshot
-        let seeded = lastSyncedSnapshot ?? liveSnap
+        let seeded = lastSyncedSnapshot ?? snapshot(of: configStore.config)
+        configStore.applyAccountAndBudget(
+            edited: Self.fields(from: edited),
+            seeded: Self.fields(from: seeded))
 
-        func pick<T: Equatable>(_ editedVal: T, _ seededVal: T, _ liveVal: T) -> T {
-            editedVal == seededVal ? liveVal : editedVal
+        // Mark the buffers as in-sync with what was just requested: when the
+        // store's single post-write publish lands, onChange above sees no
+        // pending edits (editedSnapshot == lastSyncedSnapshot) and re-seeds
+        // every field from the actually-committed config — including on-disk
+        // values that untouched fields left alone.
+        lastSyncedSnapshot = edited
+    }
+
+    /// SectionSnapshot → the ConfigStore-facing field bundle. The account
+    /// picker's single choice maps to (type, plan); .api carries plan = nil,
+    /// meaning "keep the on-disk plan" so switching back to Max restores it
+    /// (resolved inside the locked mutate, not against the published config).
+    private static func fields(from s: SectionSnapshot) -> ConfigStore.AccountBudgetFields {
+        let (type, plan): (String, String?)
+        switch s.choice {
+        case .maxPro: (type, plan) = ("max", "pro")
+        case .max5x:  (type, plan) = ("max", "max_5x")
+        case .max20x: (type, plan) = ("max", "max_20x")
+        case .api:    (type, plan) = ("api", nil)
         }
-        let resolved = SectionSnapshot(
-            choice: pick(edited.choice, seeded.choice, liveSnap.choice),
-            weeklyUsd: pick(edited.weeklyUsd, seeded.weeklyUsd, liveSnap.weeklyUsd),
-            monthlyUsd: pick(edited.monthlyUsd, seeded.monthlyUsd, liveSnap.monthlyUsd),
-            weekStart: pick(edited.weekStart, seeded.weekStart, liveSnap.weekStart)
-        )
-
-        let (type, plan) = resolved.choice.typeAndPlan(preservingPlan: live.accountPlan)
-        configStore.setAccountAndBudget(
-            type: type, plan: plan,
-            weeklyUsd: resolved.weeklyUsd, monthlyUsd: resolved.monthlyUsd,
-            weekStart: resolved.weekStart, timezone: live.timezone)
-
-        // Re-seed the fields to what was actually committed (an untouched
-        // field may have resolved to the live value, not its buffer) and
-        // record the snapshot so the resulting config publish isn't mistaken
-        // for an external edit.
-        accountChoice = resolved.choice
-        weeklyText = resolved.weeklyUsd.map { Self.formatBudget($0) } ?? ""
-        monthlyText = resolved.monthlyUsd.map { Self.formatBudget($0) } ?? ""
-        weekStart = resolved.weekStart
-        lastSyncedSnapshot = resolved
+        return ConfigStore.AccountBudgetFields(
+            accountType: type, accountPlan: plan,
+            weeklyUsd: s.weeklyUsd, monthlyUsd: s.monthlyUsd,
+            weekStart: s.weekStart)
     }
 
     /// Budget-field text → Double, tolerant of whitespace and the user's

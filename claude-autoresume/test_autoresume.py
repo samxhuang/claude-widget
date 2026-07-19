@@ -615,6 +615,68 @@ class TestQuietDropPendingTool(TempEnvMixin, unittest.TestCase):
         ], mtime=now - 2 * 60)
         records = ar.compute_cli_records(now, {}, {}, 5)
         self.assertEqual(records["sess_fresh"]["status"], "active")
+        self.assertFalse(records["sess_fresh"]["pending_tool"],
+                         "inside retention the guard isn't what keeps it active")
+
+    def test_pending_tool_survives_prune_across_cycles(self):
+        # Round-2 audit MAJOR: the guard kept the record "active" but with a
+        # stale last_activity_at, and prune_old_entries keyed on exactly that
+        # at retention+5m — deleting the entry the same cycle merge added it,
+        # then re-adding it next cycle with enabled=False (a 10s
+        # add/drop/re-add flap that reset the auto-resume arm). retention=5,
+        # quiet=12min sits squarely in the failure band (prune cutoff 10m <
+        # scan-window floor 35m).
+        now = ar.time.time()
+        self.write_cli_transcript("sess_flap", [
+            human_user(cwd=str(self.tmp)),
+            assistant_tool_use(),
+        ], mtime=now - 12 * 60)
+        state = {"sess_flap": {"kind": "cli", "status": "active",
+                               "handled": False, "enabled": True,
+                               "last_activity_at": now - 12 * 60,
+                               "last_seen": now - 10}}
+        cache: dict = {}
+        for cycle_now in (now, now + 10):
+            records = ar.compute_cli_records(cycle_now, {}, cache, 5)
+            self.assertEqual(records["sess_flap"]["status"], "active")
+            self.assertTrue(records["sess_flap"]["pending_tool"])
+            ar.merge_cli_records(state, records, cycle_now)
+            ar.prune_old_entries(state, 5)
+            self.assertIn("sess_flap", state,
+                          "guard-kept entry must survive prune in the same cycle")
+            self.assertTrue(state["sess_flap"]["enabled"],
+                            "widget-owned enabled=True must survive both cycles")
+            self.assertTrue(state["sess_flap"]["pending_tool"])
+
+    def test_pending_tool_out_of_scan_window_eventually_drops(self):
+        # Bounding: once the transcript leaves the scan window no record is
+        # emitted, last_seen freezes, and the retention+grace cutoff drops
+        # the abandoned pending-tool entry.
+        now = ar.time.time()
+        state = {"sess_gone": {"kind": "cli", "status": "active",
+                               "handled": False, "enabled": True,
+                               "pending_tool": True,
+                               "last_activity_at": now - 50 * 60,
+                               "last_seen": now - 11 * 60}}  # frozen at scan exit
+        ar.prune_old_entries(state, 5)  # cutoff: last_seen older than 10m ago
+        self.assertNotIn("sess_gone", state,
+                         "abandoned pending-tool session must still drop")
+
+    def test_pending_tool_flag_cleared_when_tool_completes(self):
+        # merge must stamp pending_tool every cycle, including back to False,
+        # so a stale True can't keep switching prune onto last_seen forever.
+        now = ar.time.time()
+        self.write_cli_transcript("sess_clear", [
+            human_user(cwd=str(self.tmp)),
+            assistant_tool_use(),
+            tool_result_user(),
+        ], mtime=now - 2 * 60)
+        records = ar.compute_cli_records(now, {}, {}, 5)
+        state = {"sess_clear": {"kind": "cli", "status": "active",
+                                "handled": False, "enabled": True,
+                                "pending_tool": True}}
+        ar.merge_cli_records(state, records, now)
+        self.assertFalse(state["sess_clear"]["pending_tool"])
 
 
 # ---------------------------------------------------------------------------

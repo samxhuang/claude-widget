@@ -56,6 +56,12 @@ then.
   `sessions.idle_retention_minutes`, pushed by `remote_sync`'s retention
   relay), same lock + atomic-write discipline, never touching any other
   key. The daemon itself never writes config.json on any host.
+  Note: retention convergence is ONE-WAY by design — on an enabled remote
+  the Mac's Settings value always wins (the relay re-pushes whenever the
+  remote's dump reports a differing value), so a remote operator cannot
+  keep a locally-set retention while the host is enabled; disable the host
+  in Settings if a remote needs to own its own value. Flagged for explicit
+  sign-off if two-way (or per-host) retention is ever wanted.
 
 ## Build / deploy
 

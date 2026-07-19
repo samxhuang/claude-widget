@@ -55,7 +55,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from autoresume_config import load_config  # stdlib-only sibling; account/budget config (C1)
+from autoresume_config import load_config, load_config_with_meta  # stdlib-only sibling; account/budget config (C1)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -879,6 +879,27 @@ def _utilization_observed(points: list[dict]) -> dict:
 # version has no record of it, and the old rebasing behavior applies to that
 # pre-history once.
 #
+# Seed rows (round-2 audit): the seed timestamp is FLOORED to the hour
+# boundary and the row is tagged {"seed": true}. Rationale: usage_collector's
+# compaction re-floors raw snapshot rows into 15m/1h buckets whose ts_start
+# can precede the earliest raw timestamp (10:07 raw -> 10:00 bucket); an
+# unfloored seed cutoff then excluded the first bucket whole, forever, with a
+# permanent spurious "Plan changed" warning. Migration: a history file
+# written before the tag existed carries an untagged first row that IS the
+# seed (a file is only ever created by the seed append), so _load_plan_history
+# treats the first valid row as the seed and the cutoff is re-floored on
+# read — no file rewrite needed.
+#
+# Degraded config reads (round-2 audit): load_config silently defaults
+# account.plan on an unreadable/malformed config, and recording that default
+# as a real plan change permanently truncated history on a transient glitch.
+# _update_plan_history therefore never appends when the plan value came from
+# a degraded read (load_config_with_meta's plan_from_file=False), and a
+# genuine change must be seen on TWO consecutive computes before it is
+# recorded (_PENDING_PLAN_CHANGE). Accepted trade-off: a genuine plan change
+# takes effect one compute late (the on-config-change trigger fires the
+# first, the next scheduled compute confirms).
+#
 # plan_fit MAY write this one sidecar; it must still NEVER write config.json.
 
 def _point_ts(point: dict) -> datetime:
@@ -886,55 +907,112 @@ def _point_ts(point: dict) -> datetime:
     return point["ts"] if point["kind"] == "raw" else point["ts_start"]
 
 
-def _load_plan_history(usage_dir: Path) -> list[tuple[datetime, str]]:
-    """Valid (ts, plan) rows of plan_history.jsonl in file (append) order.
-    Missing/malformed file or rows -> skipped, never raises."""
-    entries: list[tuple[datetime, str]] = []
+def _floor_hour(ts: datetime) -> datetime:
+    """Floor to the hour boundary — the coarsest compaction bucket size, so a
+    seed cutoff can never exclude a bucket that contains the seed's data."""
+    return ts.replace(minute=0, second=0, microsecond=0)
+
+
+def _load_plan_history(usage_dir: Path) -> list[tuple[datetime, str, bool]]:
+    """Valid (ts, plan, is_seed) rows of plan_history.jsonl in file (append)
+    order. Missing/malformed file or rows -> skipped, never raises.
+
+    Migration shim: the first valid row always counts as the seed even
+    without a {"seed": true} tag — files predate the tag, and a history file
+    is only ever created by the seed append, so the first row IS the seed by
+    construction."""
+    entries: list[tuple[datetime, str, bool]] = []
     for row in load_jsonl(usage_dir / PLAN_HISTORY_FILENAME):
         ts = _parse_iso(row.get("ts"))
         plan = row.get("plan")
         if ts is not None and isinstance(plan, str) and plan:
-            entries.append((ts, plan))
+            entries.append((ts, plan, bool(row.get("seed"))))
+    if entries:
+        ts0, plan0, _ = entries[0]
+        entries[0] = (ts0, plan0, True)
     return entries
 
 
-def _append_plan_history(usage_dir: Path, ts: datetime, plan: str) -> None:
-    """Append one {"ts","plan"} line. Write failures are swallowed — the
-    caller already holds the correct cutoff in memory for this run, and the
-    next run simply retries the append."""
+def _append_plan_history(usage_dir: Path, ts: datetime, plan: str,
+                         seed: bool = False) -> None:
+    """Append one {"ts","plan"[,"seed"]} line. Write failures are swallowed —
+    the caller already holds the correct cutoff in memory for this run, and
+    the next run simply retries the append.
+
+    Torn-tail guard: if a crash mid-append left the file without a trailing
+    newline, a naive append would merge with the torn line and corrupt BOTH
+    rows. Check the last byte and prefix a newline when needed (the torn
+    fragment stays as one unparseable line that _load_plan_history skips)."""
     try:
         usage_dir.mkdir(parents=True, exist_ok=True)
-        with open(usage_dir / PLAN_HISTORY_FILENAME, "a") as f:
-            f.write(json.dumps({"ts": ts.isoformat(), "plan": plan}) + "\n")
+        path = usage_dir / PLAN_HISTORY_FILENAME
+        prefix = ""
+        try:
+            with open(path, "rb") as f:
+                f.seek(-1, 2)  # last byte (whence=2: from end)
+                if f.read(1) != b"\n":
+                    prefix = "\n"
+        except (OSError, ValueError):
+            pass  # missing or empty file: nothing to guard against
+        row: dict = {"ts": ts.isoformat(), "plan": plan}
+        if seed:
+            row["seed"] = True
+        with open(path, "a") as f:
+            f.write(prefix + json.dumps(row) + "\n")
     except OSError:
         pass
 
 
-def _update_plan_history(usage_dir: Path, current_plan: str, now: datetime,
-                         earliest_data: datetime | None) -> datetime:
-    """Maintain the plan-history sidecar and return the cutoff: the UTC
-    instant since which snapshot rows are known to have been measured against
-    `current_plan` (the most recent recorded plan change).
+# Two-compute confirmation for genuine plan changes (round-2 audit): maps
+# str(usage_dir) -> the not-yet-recorded new plan seen on the previous
+# compute. Only recorded once the SAME new plan is seen twice in a row, so a
+# one-cycle glitch (or a mid-edit read) can't truncate history. In-process
+# only — a daemon restart just adds one more compute of lag.
+_PENDING_PLAN_CHANGE: dict = {}
 
-    - No usable history yet: seed with the current plan stamped at the epoch
-      of the earliest snapshot data (or `now` if there is none) — see the
-      first-run assumption in the block comment above. Cutoff = that seed,
-      so nothing is truncated.
-    - Last recorded plan != current plan: the plan just changed; record it at
-      `now`. Cutoff = now (no existing snapshot row was measured under the
-      new plan).
-    - Otherwise: cutoff = the last recorded entry's ts, unchanged file.
+
+def _update_plan_history(usage_dir: Path, current_plan: str, now: datetime,
+                         earliest_data: datetime | None,
+                         plan_defaulted: bool = False) -> tuple[datetime, bool]:
+    """Maintain the plan-history sidecar and return (cutoff, cutoff_is_seed):
+    the UTC instant since which snapshot rows are known to have been measured
+    against `current_plan`, and whether that cutoff is the first-run seed
+    (callers suppress the "Plan changed" truncation warning for seeds — a
+    seed is an assumption marker, not a recorded change).
+
+    `plan_defaulted` means account.plan came from a degraded config read
+    (missing/unreadable file, non-canonical value) — never append anything on
+    such a read; report the cutoff from the existing file as-is.
+
+    - No usable history yet: seed with the current plan, tagged and stamped
+      at the HOUR FLOOR of the earliest snapshot data (or `now` if none) —
+      see the seed rationale in the block comment above. Cutoff = that seed.
+    - Last recorded plan != current (genuinely read) plan: record the change
+      at `now` only after the same new plan is seen on two consecutive
+      computes; until confirmed, cutoff stays at the last recorded entry.
+    - Otherwise: cutoff = the last recorded entry's ts (re-floored when that
+      entry is the seed, covering pre-tag files with unfloored seeds).
     """
     entries = _load_plan_history(usage_dir)
+    key = str(usage_dir)
     if not entries:
-        seed_ts = earliest_data if earliest_data is not None else now
-        _append_plan_history(usage_dir, seed_ts, current_plan)
-        return seed_ts
-    last_ts, last_plan = entries[-1]
-    if last_plan != current_plan:
-        _append_plan_history(usage_dir, now, current_plan)
-        return now
-    return last_ts
+        seed_ts = _floor_hour(earliest_data if earliest_data is not None else now)
+        if not plan_defaulted:
+            _append_plan_history(usage_dir, seed_ts, current_plan, seed=True)
+        return seed_ts, True
+    last_ts, last_plan, last_is_seed = entries[-1]
+    if last_plan != current_plan and not plan_defaulted:
+        if _PENDING_PLAN_CHANGE.get(key) == current_plan:
+            del _PENDING_PLAN_CHANGE[key]
+            _append_plan_history(usage_dir, now, current_plan)
+            return now, False
+        _PENDING_PLAN_CHANGE[key] = current_plan
+        # Unconfirmed first sighting: fall through to the recorded cutoff.
+    elif last_plan == current_plan:
+        _PENDING_PLAN_CHANGE.pop(key, None)  # settled back — cancel pending
+    if last_is_seed:
+        return _floor_hour(last_ts), True
+    return last_ts, False
 
 
 # ---------------------------------------------------------------------------
@@ -979,7 +1057,8 @@ def _tier_projection(observed: dict, current_plan: str = CURRENT_PLAN) -> dict:
 
 
 def _verdict(tier_projection: dict, run_rate: dict, days_covered_widest: int, widest_window: int,
-             current_plan: str = CURRENT_PLAN) -> dict:
+             current_plan: str = CURRENT_PLAN,
+             truncated_by_plan_change: bool = False) -> dict:
     plans = {}
     run_rate_value = run_rate.get("value_usd_per_month")
     for tier in TIER_ORDER:
@@ -1017,10 +1096,22 @@ def _verdict(tier_projection: dict, run_rate: dict, days_covered_widest: int, wi
     tier_label = {"pro": "Pro ($20/mo)", "max_5x": "Max 5x ($100/mo)", "max_20x": "Max 20x ($200/mo)"}
 
     if not any_peak_data:
-        recommendation = (
-            "No utilization history yet, so this can't recommend a plan — "
-            "check back once usage_collector has run for a few days."
-        )
+        if truncated_by_plan_change:
+            # There IS utilization history, but it all predates the recorded
+            # plan change, so none of it was measured against the current
+            # plan. (Snapshots are written by the widget, not usage_collector
+            # — don't send the user to the wrong component.)
+            recommendation = (
+                f"Utilization history exists but predates the plan change to "
+                f"{tier_label.get(current_plan, current_plan)}, so it can't ground a "
+                "recommendation — projections resume as the widget collects new "
+                "snapshots under the current plan."
+            )
+        else:
+            recommendation = (
+                "No utilization history yet, so this can't recommend a plan — "
+                "check back once usage_collector has run for a few days."
+            )
     elif viable_tiers:
         cheapest = viable_tiers[0]
         qualifier = " (based on limited, preliminary data — recheck once more history is collected)" if preliminary else ""
@@ -1170,8 +1261,12 @@ def compute(state_dir: Path, now: datetime) -> dict:
 
     # Account/budget config (C1) — re-read each compute(); missing/malformed
     # yields full defaults (Max, plan max_20x, no budget) = pre-config behavior.
-    config = load_config(state_dir)
+    # The meta flag distinguishes a plan actually read from config.json from a
+    # degraded-read default, so a transient config glitch is never recorded as
+    # a real plan change (see _update_plan_history).
+    config, config_meta = load_config_with_meta(state_dir)
     current_plan = config["account"]["plan"]
+    plan_defaulted = not config_meta.get("plan_from_file", False)
 
     warnings: list[str] = []
     assumptions: list[str] = [
@@ -1262,10 +1357,15 @@ def compute(state_dir: Path, now: datetime) -> dict:
     # plan change). A bucket point straddling the change is excluded whole
     # (its ts_start predates the change), which is the conservative side.
     earliest_point = min((_point_ts(p) for p in merged_points), default=None)
-    plan_since = _update_plan_history(usage_dir, current_plan, now, earliest_point)
+    plan_since, cutoff_is_seed = _update_plan_history(
+        usage_dir, current_plan, now, earliest_point, plan_defaulted)
     observed_points = [p for p in merged_points if _point_ts(p) >= plan_since]
     truncated = len(merged_points) - len(observed_points)
-    if truncated > 0:
+    truncated_by_plan_change = truncated > 0 and not cutoff_is_seed
+    if truncated_by_plan_change:
+        # Suppressed for seed cutoffs: a seed is a first-run assumption
+        # marker, not a plan change — warning there was the round-2 audit's
+        # false "Plan changed" after compaction re-floored the seed's data.
         warnings.append(
             f"Plan changed to {current_plan!r}: peak/avg utilization only uses snapshots "
             f"since {plan_since.isoformat()} ({truncated} earlier snapshot row(s) were "
@@ -1278,7 +1378,8 @@ def compute(state_dir: Path, now: datetime) -> dict:
 
     widest_window = MA_WINDOWS_DAYS[-1]
     days_covered_widest = moving_averages[f"{widest_window}d"]["days_covered"]
-    verdict = _verdict(tier_projection, run_rate, days_covered_widest, widest_window, current_plan)
+    verdict = _verdict(tier_projection, run_rate, days_covered_widest, widest_window,
+                       current_plan, truncated_by_plan_change=truncated_by_plan_change)
 
     # Graph-ready cost series for the widget's usage-over-time view. Hourly
     # covers the widget's 24h/7d/1mo ranges; daily keeps the 3mo view compact.

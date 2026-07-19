@@ -129,17 +129,24 @@ final class CloudSessionsModel: ObservableObject {
             // can catch them. The one joinable signal is created_at — the
             // cloud record is created within ~1s of the local transcript file
             // (verified: 09:44:39.0Z vs 09:44:39.9Z) — so any row created
-            // within a ±3min window of a known local CLI session's transcript
-            // birth is treated as that session's echo. SessionsModel keeps
-            // its start-date cache append-only, so echoes of sessions the
-            // daemon has since dropped for idleness stay hidden too. Residual
-            // risk: a genuine cloud session started within 3 minutes of a
-            // local one is hidden until the local session's echo ages out of
-            // the lookback — accepted; the alternative was a phantom copy of
-            // every live local session at the top of the list.
+            // within a ±30s window of a known local CLI session's transcript
+            // birth is treated as that session's echo (R2-1: was ±3min, which
+            // over-suppressed; 30s is still 30x the verified ~1s skew).
+            // SessionsModel retains a dropped session's start date past its
+            // local drop for the echo lookback (then evicts it — see
+            // cliStartCache there), so echoes of sessions the daemon has since
+            // dropped for idleness stay hidden too. That cache is in-memory:
+            // after a widget relaunch, an echo of a since-dropped session can
+            // reappear for up to the 30-min lookback — accepted; it self-heals
+            // as the echo ages out, and eviction makes persistence not worth
+            // the plumbing. Residual risk: a genuine cloud session started
+            // within 30 seconds of a local one is hidden until the local
+            // session's echo ages out of the lookback — accepted; the
+            // alternative was a phantom copy of every live local session at
+            // the top of the list.
             if let createdStr = dict["created_at"] as? String,
                let created = Self.parseDate(createdStr),
-               localStartDates.contains(where: { abs($0.timeIntervalSince(created)) < 180 }) {
+               localStartDates.contains(where: { abs($0.timeIntervalSince(created)) < 30 }) {
                 return nil
             }
             let title = dict["title"] as? String ?? ""

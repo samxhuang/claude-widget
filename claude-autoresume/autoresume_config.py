@@ -148,13 +148,29 @@ def load_config(state_dir: Path) -> dict:
     Every field is validated independently; anything missing or malformed
     falls back to its default rather than poisoning the rest of the file.
     """
+    return load_config_with_meta(state_dir)[0]
+
+
+def load_config_with_meta(state_dir: Path) -> tuple:
+    """load_config plus a provenance dict: (cfg, meta). Never raises.
+
+    meta["plan_from_file"] is True only when account.plan was actually read
+    from config.json as a canonical value. False means the returned plan is
+    DEFAULT_PLAN by *degradation* — file missing/unreadable/malformed, or the
+    plan key absent/non-canonical — not by user choice. plan_fit's
+    plan-history containment keys off this so a transient config glitch
+    (fat-fingered edit, torn write) is never recorded as a real plan change
+    (which would permanently truncate utilization history). The cfg element
+    is byte-identical to load_config's return — same defaulting rules.
+    """
     cfg = _default_config()
+    meta = {"plan_from_file": False}
     try:
         raw = json.loads(config_path(state_dir).read_text())
     except (OSError, ValueError):
-        return cfg
+        return cfg, meta
     if not isinstance(raw, dict):
-        return cfg
+        return cfg, meta
 
     account = raw.get("account")
     if isinstance(account, dict):
@@ -164,7 +180,9 @@ def load_config(state_dir: Path) -> dict:
         plan = account.get("plan")
         if isinstance(plan, str) and plan.strip() in VALID_PLANS:
             cfg["account"]["plan"] = plan.strip()
-        # invalid/unknown plan string -> keep DEFAULT_PLAN (canonical keys only)
+            meta["plan_from_file"] = True
+        # invalid/unknown plan string -> keep DEFAULT_PLAN (canonical keys
+        # only) and leave plan_from_file False (degraded read)
 
     budget = raw.get("budget")
     if isinstance(budget, dict):
@@ -190,4 +208,4 @@ def load_config(state_dir: Path) -> dict:
                 min(MAX_IDLE_RETENTION_MINUTES,
                     max(MIN_IDLE_RETENTION_MINUTES, retention)))
 
-    return cfg
+    return cfg, meta

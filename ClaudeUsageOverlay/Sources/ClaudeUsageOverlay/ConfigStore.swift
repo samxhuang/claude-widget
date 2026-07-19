@@ -143,34 +143,67 @@ final class ConfigStore: ObservableObject {
 
     // MARK: - Mutations (typed setters, each a locked read-modify-write)
 
-    /// Account type + plan AND budget block, written in ONE locked
-    /// read-modify-write. The Settings Apply button sets both; doing it as
-    /// two sequential mutations published an intermediate config (account
-    /// updated, budget still old) — a one-frame re-seed of observing views to
-    /// a mixed state — and hit the disk twice per Apply. Replaces the former
-    /// separate setAccount/setBudget, whose only caller was that Apply.
+    /// The Account & Budget fields as the Settings section edits them —
+    /// passed in pairs (edited + seeded) to applyAccountAndBudget so the
+    /// per-field touched/untouched resolution can happen inside the locked
+    /// mutate closure, against the freshly-read on-disk config.
+    struct AccountBudgetFields: Equatable {
+        /// "max" | "api" — with `accountPlan`, one logical field (the UI's
+        /// single Account picker).
+        var accountType: String
+        /// nil (the "api" choice): keep whatever plan is on disk, so
+        /// switching back to Max restores it. plan_fit.py still uses the
+        /// stored plan for its tier-comparison ratio on API accounts.
+        var accountPlan: String?
+        var weeklyUsd: Double?
+        var monthlyUsd: Double?
+        var weekStart: String
+    }
+
+    /// Account type/plan AND budget block, written in ONE locked
+    /// read-modify-write (one disk write, one publish — two sequential
+    /// setters used to publish an intermediate mixed state and hit the disk
+    /// twice per Apply).
     ///
-    /// Account: for "api" the plan is still stored (plan_fit.py uses it for
-    /// the tier-comparison ratio even on API accounts).
+    /// R2-2 (per-field staleness, done under the lock): the Settings buffers
+    /// were seeded from `seeded`, and an external config edit can land while
+    /// the user edits (the section deliberately leaves their typing alone).
+    /// A field the user did NOT touch (edited == seeded) must not overwrite
+    /// whatever is on disk NOW. The published `config` snapshot can lag disk
+    /// by up to the reload interval, so resolving against it (as the previous
+    /// caller-side fix did) could still revert a concurrent external edit —
+    /// hence the resolution happens here, inside the mutate closure, against
+    /// the freshly-read on-disk root: untouched fields are simply not
+    /// rewritten at all.
+    ///
     /// Budget: `nil` clears a period's limit (stored as JSON null so the
     /// daemon distinguishes "unconfigured" from "0"). Non-positive values are
     /// treated as nil (validator: budgets numeric > 0 else null, matching
-    /// WS-0's config module).
-    func setAccountAndBudget(type: String, plan: String,
-                             weeklyUsd: Double?, monthlyUsd: Double?,
-                             weekStart: String, timezone: String) {
+    /// WS-0's config module). `timezone` is not edited by the UI and is never
+    /// touched here.
+    func applyAccountAndBudget(edited: AccountBudgetFields, seeded: AccountBudgetFields) {
         mutate { root in
-            var account = (root["account"] as? [String: Any]) ?? [:]
-            account["type"] = type
-            account["plan"] = plan
-            root["account"] = account
-
+            if (edited.accountType, edited.accountPlan) != (seeded.accountType, seeded.accountPlan) {
+                var account = (root["account"] as? [String: Any]) ?? [:]
+                account["type"] = edited.accountType
+                if let plan = edited.accountPlan { account["plan"] = plan }
+                root["account"] = account
+            }
             var budget = (root["budget"] as? [String: Any]) ?? [:]
-            budget["weekly_usd"] = Self.sanitizedBudget(weeklyUsd) ?? NSNull()
-            budget["monthly_usd"] = Self.sanitizedBudget(monthlyUsd) ?? NSNull()
-            budget["week_start"] = weekStart
-            budget["timezone"] = timezone
-            root["budget"] = budget
+            var budgetTouched = false
+            if edited.weeklyUsd != seeded.weeklyUsd {
+                budget["weekly_usd"] = Self.sanitizedBudget(edited.weeklyUsd) ?? NSNull()
+                budgetTouched = true
+            }
+            if edited.monthlyUsd != seeded.monthlyUsd {
+                budget["monthly_usd"] = Self.sanitizedBudget(edited.monthlyUsd) ?? NSNull()
+                budgetTouched = true
+            }
+            if edited.weekStart != seeded.weekStart {
+                budget["week_start"] = edited.weekStart
+                budgetTouched = true
+            }
+            if budgetTouched { root["budget"] = budget }
         }
     }
 
@@ -343,8 +376,10 @@ final class ConfigStore: ObservableObject {
            let retention = (sessions["idle_retention_minutes"] as? NSNumber)?.intValue {
             // Clamp to the daemon's accepted range (Python validator clamps
             // 5–1440) so a hand-edited out-of-range value displays as what
-            // actually takes effect — e.g. a raw 3 used to snap the Sessions
-            // picker to "15 minutes" while the daemon ran with 5.
+            // actually takes effect — e.g. a raw 3 runs as 5 in the daemon,
+            // and clamping here makes the Sessions picker (whose smallest
+            // option is 5, matching the daemon floor — R2-3) show
+            // "5 minutes" instead of the raw value's nearest option.
             c.idleRetentionMinutes = min(1440, max(5, retention))
         }
         if let hosts = root["remote_hosts"] as? [[String: Any]] {

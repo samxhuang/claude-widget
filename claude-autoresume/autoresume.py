@@ -864,16 +864,32 @@ def compute_cli_records(now: float, runtime: dict, cache: dict,
             # entry INCLUDING widget-owned enabled=True, and the session came
             # back later as enabled=False. Consult the already-cached parse
             # (derived["objs_tail"] — no extra I/O) and keep the session
-            # "active" while a tool call is pending. Truly-abandoned
-            # pending-tool sessions are still bounded: once they leave the
-            # scan window entirely, prune_old_entries' last_activity_at
-            # retention+grace backstop drops them (acceptable, unchanged).
+            # "active" while a tool call is pending.
+            #
+            # The record is stamped pending_tool=True whenever the guard is
+            # what's keeping the session active, so prune_old_entries judges
+            # it by last_seen (bumped by merge every cycle while the file is
+            # in the scan window) instead of last_activity_at — which is
+            # stale BY DEFINITION here: the running tool writes nothing.
+            # Round-2 audit: the prune cutoff (retention + 5m grace) sits
+            # INSIDE the >=35m scan window whenever retention <
+            # SCAN_WINDOW_MINUTES, so keying the prune on last_activity_at
+            # deleted the guard-kept entry the same cycle merge added it — a
+            # 10s add/drop/re-add flap that still reset the widget's
+            # enabled=True. Truly-abandoned pending-tool sessions remain
+            # bounded: once the file exits the scan window no record is
+            # emitted, last_seen stops advancing, and the retention+grace
+            # cutoff drops the entry.
+            pending_tool = False
             if derived["waiting_resets_at"] is not None:
                 status = "waiting"
                 resets_at = derived["waiting_resets_at"]
-            elif derived["has_human_message"] and (
-                    (now - activity_mtime) <= active_window_seconds
-                    or _scan_current_turn(derived["objs_tail"])[0]):
+            elif derived["has_human_message"]:
+                if (now - activity_mtime) > active_window_seconds:
+                    pending_tool = bool(_scan_current_turn(derived["objs_tail"])[0])
+                    if not pending_tool:
+                        records[session_id] = {"status": None}
+                        continue
                 status = "active"
                 resets_at = None
             else:
@@ -897,6 +913,10 @@ def compute_cli_records(now: float, runtime: dict, cache: dict,
                 "prompt_preview": derived["prompt_preview"],
                 "last_activity_at": activity_mtime,
                 "work_status": work_status,
+                # True only while the quiet-drop guard is the reason this
+                # record is "active" (pending tool call past the retention
+                # edge) — prune_old_entries keys off it (see above).
+                "pending_tool": pending_tool,
             }
 
     # Bound memory: forget any cached file that has left the scan window.
@@ -942,6 +962,10 @@ def merge_cli_records(state: dict, records: dict, now: float) -> None:
             # real last-write time the widget shows as "<1m" / "17m" / etc.
             existing["last_activity_at"] = rec["last_activity_at"]
             existing["work_status"] = rec["work_status"]
+            # Stamped (and cleared) every cycle: True only while the
+            # quiet-drop guard holds the session active on a pending tool
+            # call. prune_old_entries switches to last_seen for these.
+            existing["pending_tool"] = rec.get("pending_tool", False)
             if was_active and rec["status"] == "waiting":
                 log(f"Session {session_id} in {rec['project_dir']} transitioned active -> rate-limited "
                     f"(enabled={existing.get('enabled', False)} preserved), "
@@ -969,6 +993,9 @@ def merge_cli_records(state: dict, records: dict, now: float) -> None:
                 # user-toggled): "running" / "needs_input" / "idle". See
                 # classify_work_status's docstring.
                 "work_status": rec["work_status"],
+                # Quiet-drop-guard marker (see compute_cli_records): drives
+                # prune_old_entries' last_seen-based judgement.
+                "pending_tool": rec.get("pending_tool", False),
             }
 
 
@@ -1315,7 +1342,20 @@ def prune_old_entries(state: dict,
             stale.append(sid)
             continue
         if e.get("status") == "active" and not e.get("handled"):
-            last_activity = e.get("last_activity_at") or e.get("last_seen", e.get("detected_at", 0))
+            if e.get("pending_tool"):
+                # Quiet-drop-guard entries (pending tool call, see
+                # compute_cli_records): last_activity_at is stale BY DESIGN —
+                # the running tool writes nothing to the transcript — so
+                # judging it against the retention cutoff would delete the
+                # very entry the guard just kept (round-2 audit: an add/drop/
+                # re-add flap every cycle that reset enabled=True). Judge by
+                # last_seen instead: merge bumps it every ~10s while the file
+                # is inside the scan window and it freezes on scan exit, so
+                # the entry lives exactly while in-window and an abandoned
+                # session still drops retention+grace after leaving it.
+                last_activity = e.get("last_seen") or e.get("last_activity_at", e.get("detected_at", 0))
+            else:
+                last_activity = e.get("last_activity_at") or e.get("last_seen", e.get("detected_at", 0))
             if last_activity < idle_cutoff:
                 stale.append(sid)  # went quiet and never got rate-limited
 

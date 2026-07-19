@@ -382,15 +382,19 @@ final class PlanFitModel: ObservableObject {
     /// budget that is. nil when there's no projection or it's within budget,
     /// so callers can append it only in the overrun case. Whole dollars — a
     /// projection is an estimate, cents would be false precision.
-    /// The overrun must be at least $0.50 (i.e. round to a nonzero whole
-    /// dollar): a raw `projected > limit` guard let projected $1000.40 vs a
-    /// $1000 limit render as "proj $1000 (+$0)" — an overrun caption whose
-    /// displayed numbers say there's no overrun.
+    /// R2-4: the guard and the display round the overrun ONCE, together, and
+    /// require the rounded value to be a nonzero whole dollar. The previous
+    /// `>= 0.5` threshold admitted exactly $0.50, which "%.0f" (banker's
+    /// rounding, half-to-even) rendered as "+$0" — an overrun caption whose
+    /// displayed numbers say there's no overrun. Rendering the pre-rounded
+    /// `overDollars` keeps the guard and the shown figure agreeing by
+    /// construction, whatever rounding mode either uses.
     func budgetOverrunText(_ w: BudgetWindow) -> String? {
-        guard let projected = w.projectedUsd, let limit = w.limitUsd,
-              projected - limit >= 0.5 else { return nil }
+        guard let projected = w.projectedUsd, let limit = w.limitUsd else { return nil }
+        let overDollars = (projected - limit).rounded()
+        guard overDollars >= 1 else { return nil }
         let proj = String(format: "$%.0f", projected)
-        let over = String(format: "$%.0f", projected - limit)
+        let over = String(format: "$%.0f", overDollars)
         return "proj \(proj) (+\(over))"
     }
 

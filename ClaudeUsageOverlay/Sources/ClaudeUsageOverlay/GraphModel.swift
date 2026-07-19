@@ -227,9 +227,12 @@ final class GraphModel: ObservableObject {
             // `start` (boundary day counted whole — the daily series has no
             // finer resolution; today the data starts long after the window
             // boundary so nothing is actually clipped or double-counted).
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyy-MM-dd"
-            fmt.timeZone = TimeZone(identifier: "UTC")
+            // R2-6: fixed-format "yyyy-MM-dd" needs en_US_POSIX + an explicit
+            // Gregorian calendar — under a non-Gregorian system calendar
+            // (Buddhist/Japanese) "yyyy" goes era-relative (e.g. 2569),
+            // firstKey would match no daemon-written key, and the 3mo cost
+            // would read $0.
+            let fmt = Self.utcDailyKeyFormatter()
             var cal = Calendar(identifier: .gregorian)
             cal.timeZone = TimeZone(identifier: "UTC") ?? .current
             let firstKey = fmt.string(from: cal.startOfDay(for: start))
@@ -309,10 +312,23 @@ final class GraphModel: ObservableObject {
     /// "YYYY-MM-DD" daily-series key → UTC midnight of that day (nil in, nil out).
     private static func dailyKeyDate(_ key: String?) -> Date? {
         guard let key = key else { return nil }
+        return utcDailyKeyFormatter().date(from: key)
+    }
+
+    /// R2-6: the one way "yyyy-MM-dd" daemon-key formatters are built —
+    /// en_US_POSIX locale + explicit Gregorian calendar + UTC, so keys
+    /// parse/format identically to plan_fit.py's regardless of the system
+    /// locale/calendar (a bare DateFormatter inherits both, and a
+    /// non-Gregorian calendar makes "yyyy" era-relative).
+    private static func utcDailyKeyFormatter() -> DateFormatter {
         let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC") ?? .current
+        f.calendar = cal
         f.timeZone = TimeZone(identifier: "UTC")
-        return f.date(from: key)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
     }
 
     /// "$18.42" when the cost data spans the whole period, "$18.42 · est $210"
@@ -525,9 +541,10 @@ final class GraphModel: ObservableObject {
         guard end > start else { return [] }
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC") ?? .current
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd"
-        fmt.timeZone = TimeZone(identifier: "UTC")
+        // R2-6: same daemon-key formatter as the 3mo sum/dailyKeyDate — a
+        // bare formatter's keys wouldn't match daily[...] under a
+        // non-Gregorian system calendar and every bar would read $0.
+        let fmt = utcDailyKeyFormatter()
 
         var t = cal.startOfDay(for: start)
         var out: [CostBucket] = []

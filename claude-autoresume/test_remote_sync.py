@@ -790,6 +790,48 @@ class TestRetentionRelay(TempEnvMixin, unittest.TestCase):
         rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1030.0)
         self.assertEqual(len([c for c in ft.calls if c[0] == "apply_config"]), 2)
 
+    def test_redeploy_clears_no_field_memo_and_pushes(self):
+        # Round-2 audit MINOR: the memo keyed on the Mac value alone, so after
+        # the redeploy its own hint requested, nothing pushed until the value
+        # changed or the daemon restarted. A dump that DOES carry
+        # retention_minutes must clear the "no_field" memo and push same-cycle.
+        self._write_mac_config(10)
+        ft = FakeTransport(dump=dump_payload(1000.0, {"s1": remote_entry()}))  # old remote_ctl
+        rs.sync_host(HOST, self.state_dir, ft, now_fn=lambda: 1000.0)
+        self.assertEqual([c for c in ft.calls if c[0] == "apply_config"], [])
+        self.assertEqual(self._daemon_log().count("old remote_ctl"), 1)
+        # user redeploys; the new remote_ctl reports its local default 30
+        ft2 = FakeTransport(dump=dump_payload(1030.0, {"s1": remote_entry()}, retention=30))
+        rs.sync_host(HOST, self.state_dir, ft2, now_fn=lambda: 1030.0)
+        self.assertEqual(len([c for c in ft2.calls if c[0] == "apply_config"]), 1,
+                         "redeployed remote must converge without a config change")
+        self.assertEqual(json.loads([c for c in ft2.calls
+                                     if c[0] == "apply_config"][0][2]),
+                         {"sessions": {"idle_retention_minutes": 10}})
+
+    def test_failed_push_retries_after_an_hour(self):
+        # Round-2 audit MINOR: a transient apply-config failure blocked all
+        # retries while the Mac value was unchanged. Failure memos now age:
+        # retry after RETENTION_PUSH_RETRY_SECONDS (~1h).
+        self._write_mac_config(10)
+        dump = {"s1": remote_entry()}
+        ft_fail = FakeTransport(dump=dump_payload(1000.0, dump, retention=30),
+                                apply_config_ok=(255, "", "ssh: connection reset"))
+        rs.sync_host(HOST, self.state_dir, ft_fail, now_fn=lambda: 1000.0)
+        self.assertEqual(len([c for c in ft_fail.calls if c[0] == "apply_config"]), 1)
+        # 30s later: memo young, same value -> no retry (no per-cycle spam)
+        ft_soon = FakeTransport(dump=dump_payload(1030.0, dump, retention=30))
+        rs.sync_host(HOST, self.state_dir, ft_soon, now_fn=lambda: 1030.0)
+        self.assertEqual([c for c in ft_soon.calls if c[0] == "apply_config"], [])
+        # >1h later: memo aged out -> one fresh attempt, which converges
+        later = 1000.0 + rs.RETENTION_PUSH_RETRY_SECONDS + 1
+        ft_late = FakeTransport(dump=dump_payload(later, dump, retention=30))
+        rs.sync_host(HOST, self.state_dir, ft_late, now_fn=lambda: later)
+        self.assertEqual(len([c for c in ft_late.calls if c[0] == "apply_config"]), 1,
+                         "aged failure memo must allow a retry")
+        self.assertNotIn(HOST["name"], rs._RETENTION_PUSH_FAILED,
+                         "successful retry clears the memo")
+
     def test_push_happens_even_with_no_toggle_delta(self):
         # The relay must not be starved by the `if not payload: return True`
         # toggle early-out: no toggle divergence, retention differs -> push.

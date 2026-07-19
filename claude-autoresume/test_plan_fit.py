@@ -354,6 +354,8 @@ class PlanHistoryTests(TempStateDirTestCase):
         # under the currently-configured plan at first run (matches reality
         # here — the owner has been on max_20x throughout).
         self._write_snapshots()
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "max_20x"}))
         now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
         result = plan_fit.compute(self.state_dir, now)
 
@@ -365,7 +367,21 @@ class PlanHistoryTests(TempStateDirTestCase):
         self.assertEqual(lines[0]["plan"], "max_20x")
         self.assertEqual(plan_fit._parse_iso(lines[0]["ts"]),
                          datetime(2026, 7, 1, 0, 0, tzinfo=timezone.utc),
-                         "seed stamped at the epoch of the earliest snapshot data")
+                         "seed stamped at the (hour-floored) epoch of the earliest snapshot data")
+        self.assertTrue(lines[0].get("seed"), "seed row must be tagged")
+
+    def test_no_config_degraded_read_never_seeds(self):
+        # Round-2 audit: a defaulted plan (no/unreadable config) must not be
+        # recorded as if it were configured — no seed, no change rows. Full
+        # history is still used (cutoff = earliest data, nothing truncated).
+        self._write_snapshots()  # deliberately NO config.json
+        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        result = plan_fit.compute(self.state_dir, now)
+        self.assertAlmostEqual(result["utilization_observed"]["five_hour"]["peak_pct"],
+                               90.0, places=1)
+        self.assertFalse(any("Plan changed" in w for w in result["warnings"]))
+        self.assertEqual(self._history_lines(), [],
+                         "degraded config read: nothing appended")
 
     def test_recorded_plan_change_truncates_observation_and_warns(self):
         self._write_snapshots()
@@ -389,16 +405,27 @@ class PlanHistoryTests(TempStateDirTestCase):
 
     def test_live_plan_change_appends_entry_and_resets_observation(self):
         # The downgrade scenario itself: history says max_20x, Settings now
-        # says pro -> compute records the change at `now`; NO existing row was
+        # says pro -> compute records the change; NO existing row was
         # measured under pro, so observation resets instead of rebasing the
-        # old 90%-of-Max20x peak as 90%-of-Pro.
+        # old 90%-of-Max20x peak as 90%-of-Pro. Round-2 audit: the change is
+        # only recorded once the SAME new plan is seen on two consecutive
+        # computes (glitch protection) — the documented, accepted cost is a
+        # one-compute lag during which the old cutoff (and rebased peak)
+        # still applies.
         self._write_snapshots()
         _write_jsonl(self.usage_dir / "plan_history.jsonl", [
             {"ts": "2026-07-01T00:00:00+00:00", "plan": "max_20x"},
         ])
         _write_json(self.state_dir / "config.json",
                     _config(account={"type": "max", "plan": "pro"}))
-        now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+        first = plan_fit.compute(self.state_dir, t1)
+        self.assertEqual([l["plan"] for l in self._history_lines()], ["max_20x"],
+                         "first sighting: pending, not yet recorded")
+        self.assertAlmostEqual(first["utilization_observed"]["five_hour"]["peak_pct"],
+                               90.0, places=1, msg="documented one-compute lag")
+
+        now = datetime(2026, 7, 18, 13, 0, tzinfo=timezone.utc)
         result = plan_fit.compute(self.state_dir, now)
 
         self.assertIsNone(result["utilization_observed"]["five_hour"]["peak_pct"],
@@ -411,12 +438,164 @@ class PlanHistoryTests(TempStateDirTestCase):
 
     def test_no_change_keeps_history_file_stable_across_computes(self):
         self._write_snapshots()
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "max_20x"}))
         now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
         plan_fit.compute(self.state_dir, now)
         first = self._history_lines()
+        self.assertEqual(len(first), 1, "seeded")
         plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 13, 0, tzinfo=timezone.utc))
         self.assertEqual(self._history_lines(), first,
                          "no plan change: no new lines appended")
+
+    # -- round-2 audit additions -------------------------------------------
+
+    def _write_raw_snapshots_at_1007(self):
+        # Raw rows at 10:07/10:09 — earliest RAW ts is 10:07, but compaction
+        # will later floor this data into a bucket whose ts_start is 10:00.
+        _write_jsonl(self.usage_dir / "snapshots.jsonl", [
+            {"ts": "2026-07-19T10:07:00+00:00", "five_hour": {"utilization": 41.0},
+             "seven_day": {"utilization": 12.0}},
+            {"ts": "2026-07-19T10:09:00+00:00", "five_hour": {"utilization": 88.0},
+             "seven_day": {"utilization": 13.0}},
+        ])
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+
+    def test_seed_survives_snapshot_compaction_no_spurious_warning(self):
+        # Round-2 audit MAJOR: an unfloored seed (10:07) excluded the whole
+        # first 15m bucket (ts_start 10:00) forever after compaction, with a
+        # permanent false "Plan changed" warning. The seed is now floored to
+        # the hour, so the bucket stays included.
+        self._write_raw_snapshots_at_1007()
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "max_20x"}))
+        now = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+        r1 = plan_fit.compute(self.state_dir, now)
+        self.assertAlmostEqual(r1["utilization_observed"]["five_hour"]["peak_pct"], 88.0, places=1)
+        lines = self._history_lines()
+        self.assertEqual(plan_fit._parse_iso(lines[0]["ts"]),
+                         datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc),
+                         "seed floored to the hour boundary")
+
+        # Simulate usage_collector compaction: raw rows age into a 15m bucket
+        # whose ts_start (10:00) precedes the earliest raw ts (10:07).
+        (self.usage_dir / "snapshots.jsonl").unlink()
+        _write_jsonl(self.usage_dir / "snapshots_15m.jsonl", [
+            {"ts_start": "2026-07-19T10:00:00+00:00", "n": 2,
+             "five_hour": {"max": 88.0, "avg": 64.5},
+             "seven_day": {"max": 13.0, "avg": 12.5}},
+        ])
+        r2 = plan_fit.compute(self.state_dir,
+                              datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc))
+        self.assertAlmostEqual(r2["utilization_observed"]["five_hour"]["peak_pct"], 88.0,
+                               places=1, msg="first bucket must survive compaction")
+        self.assertFalse(any("Plan changed" in w for w in r2["warnings"]),
+                         "no spurious plan-change warning from the seed")
+
+    def test_legacy_unfloored_seed_treated_as_seed_and_refloored_on_read(self):
+        # Migration: a pre-existing history whose first row is an UNFLOORED,
+        # untagged seed (written by the old code) must still behave as a
+        # seed — cutoff re-floored on read, truncation warning suppressed.
+        _write_jsonl(self.usage_dir / "snapshots_15m.jsonl", [
+            {"ts_start": "2026-07-19T10:00:00+00:00", "n": 2,
+             "five_hour": {"max": 88.0, "avg": 64.5},
+             "seven_day": {"max": 13.0, "avg": 12.5}},
+        ])
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+        _write_jsonl(self.usage_dir / "plan_history.jsonl", [
+            {"ts": "2026-07-19T10:07:00+00:00", "plan": "max_20x"},  # old-style seed
+        ])
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "max_20x"}))
+        r = plan_fit.compute(self.state_dir,
+                             datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc))
+        self.assertAlmostEqual(r["utilization_observed"]["five_hour"]["peak_pct"], 88.0,
+                               places=1, msg="legacy seed re-floored: bucket included")
+        self.assertFalse(any("Plan changed" in w for w in r["warnings"]))
+        self.assertEqual(len(self._history_lines()), 1, "no rewrite, no new rows")
+
+    def test_transient_config_glitch_leaves_history_untouched(self):
+        # Round-2 audit MAJOR: pro -> garbage config file -> pro used to leave
+        # history [pro, max_20x, pro] and a permanently-truncated (None) peak.
+        self._write_raw_snapshots_at_1007()
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+        t = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+        plan_fit.compute(self.state_dir, t)  # seeds pro
+        (self.state_dir / "config.json").write_text("{ this is not json")
+        plan_fit.compute(self.state_dir, datetime(2026, 7, 19, 12, 10, tzinfo=timezone.utc))
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+        r = plan_fit.compute(self.state_dir, datetime(2026, 7, 19, 12, 20, tzinfo=timezone.utc))
+        self.assertEqual([l["plan"] for l in self._history_lines()], ["pro"],
+                         "glitch cycle appended nothing")
+        self.assertAlmostEqual(r["utilization_observed"]["five_hour"]["peak_pct"], 88.0,
+                               places=1, msg="history not truncated by the glitch")
+
+    def test_genuine_change_requires_two_consecutive_computes(self):
+        # A single compute seeing a new plan is treated as unconfirmed (could
+        # be a mid-edit read); the same value on the next compute records it.
+        # A one-compute flip (pro -> max_5x -> pro) records nothing.
+        self._write_raw_snapshots_at_1007()
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+        t = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+        plan_fit.compute(self.state_dir, t)  # seeds pro
+        # one-compute flip: not recorded
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "max_5x"}))
+        plan_fit.compute(self.state_dir, datetime(2026, 7, 19, 12, 10, tzinfo=timezone.utc))
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+        plan_fit.compute(self.state_dir, datetime(2026, 7, 19, 12, 20, tzinfo=timezone.utc))
+        self.assertEqual([l["plan"] for l in self._history_lines()], ["pro"])
+        # sustained change: recorded on the second consecutive compute
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "max_5x"}))
+        plan_fit.compute(self.state_dir, datetime(2026, 7, 19, 12, 30, tzinfo=timezone.utc))
+        self.assertEqual([l["plan"] for l in self._history_lines()], ["pro"],
+                         "first sighting: still pending")
+        plan_fit.compute(self.state_dir, datetime(2026, 7, 19, 12, 40, tzinfo=timezone.utc))
+        self.assertEqual([l["plan"] for l in self._history_lines()], ["pro", "max_5x"],
+                         "second consecutive sighting: recorded")
+
+    def test_append_plan_history_torn_tail_gets_newline(self):
+        # A crash mid-append can leave the file without a trailing newline;
+        # the next append must not merge with the torn fragment.
+        path = self.usage_dir / "plan_history.jsonl"
+        path.write_text('{"ts": "2026-')  # torn, no newline
+        plan_fit._append_plan_history(
+            self.usage_dir, datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc),
+            "max_20x", seed=True)
+        lines = path.read_text().splitlines()
+        self.assertEqual(len(lines), 2, "torn fragment and new row on separate lines")
+        row = json.loads(lines[1])
+        self.assertEqual(row["plan"], "max_20x")
+        self.assertTrue(row["seed"])
+        # And the loader sees exactly one valid entry (the seed).
+        entries = plan_fit._load_plan_history(self.usage_dir)
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0][2], "seed flag survives the round-trip")
+
+    def test_zero_rows_after_plan_change_verdict_says_predates_change(self):
+        # Round-2 audit MINOR: with ALL rows truncated by a (confirmed) plan
+        # change, the verdict used to claim "No utilization history yet ...
+        # usage_collector" — wrong on both counts (history exists; snapshots
+        # come from the widget).
+        self._write_raw_snapshots_at_1007()
+        _write_jsonl(self.usage_dir / "plan_history.jsonl", [
+            {"ts": "2026-07-19T10:00:00+00:00", "plan": "max_20x", "seed": True},
+            {"ts": "2026-07-19T11:00:00+00:00", "plan": "pro"},  # confirmed change
+        ])
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+        r = plan_fit.compute(self.state_dir,
+                             datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc))
+        self.assertIsNone(r["utilization_observed"]["five_hour"]["peak_pct"])
+        rec = r["verdict"]["recommendation"]
+        self.assertIn("predates the plan change", rec)
+        self.assertNotIn("usage_collector", rec)
+        self.assertNotIn("No utilization history", rec)
 
 
 # ---------------------------------------------------------------------------

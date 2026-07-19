@@ -291,19 +291,46 @@ final class SessionsModel: ObservableObject {
             // Desktop-attached sessions carry an opaque cse_* id and no
             // linking fields, but their created_at lands within ~1s of the
             // local transcript's birth — so CloudSessionsModel hides cloud
-            // rows created at the same moment as a known local session. The
-            // cache is append-only for the app's lifetime ON PURPOSE: a local
-            // session dropped for idleness still has a live-looking /recents
+            // rows created at the same moment as a known local session.
+            // Entries are retained past their session's local drop (a
+            // dropped-for-idleness session still has a live-looking /recents
             // echo for a while, and forgetting its start time would let the
-            // echo pop back in as a phantom.
-            let newStarts = entries
-                .filter { $0.kind != "cowork" && $0.host == nil }
-                .compactMap { entry -> (String, Date)? in
-                    if let cached = self.cliStartCache[entry.id] { return (entry.id, cached) }
-                    guard let date = Self.transcriptCreationDate(projectDir: entry.projectDir, id: entry.id) else { return nil }
-                    return (entry.id, date)
+            // echo pop back in as a phantom), then evicted once the id has
+            // been absent from state.json longer than the echo could possibly
+            // still show (R2-1: the cache used to be append-only for the
+            // app's lifetime, permanently blacking out each session's
+            // creation window for genuine cloud rows).
+            let scanNow = Date()
+            for entry in entries where entry.kind != "cowork" && entry.host == nil {
+                self.cliStartLastSeenInState[entry.id] = scanNow
+                if self.cliStartCache[entry.id] != nil { continue }
+                // R2-5: negative-result cache — a session whose transcript
+                // can't be found (deleted file) must not trigger the fallback
+                // ~/.claude/projects listing on every 5s refresh while this
+                // block holds the state flock. Retry after a cooldown in case
+                // the transcript appears late.
+                if let missedAt = self.cliStartMissAt[entry.id],
+                   scanNow.timeIntervalSince(missedAt) < Self.transcriptMissRetryInterval {
+                    continue
                 }
-            for (id, date) in newStarts { self.cliStartCache[id] = date }
+                if let date = Self.transcriptCreationDate(projectDir: entry.projectDir, id: entry.id) {
+                    self.cliStartCache[entry.id] = date
+                    self.cliStartMissAt[entry.id] = nil
+                } else {
+                    self.cliStartMissAt[entry.id] = scanNow
+                }
+            }
+            // Eviction: once an id has been out of state.json for longer than
+            // CloudSessionsModel's 30-min lookback plus slack, any /recents
+            // echo of it has already aged out of the cloud list — keeping the
+            // start date would only keep hiding genuine cloud sessions born
+            // near it.
+            for (id, lastSeen) in self.cliStartLastSeenInState
+            where scanNow.timeIntervalSince(lastSeen) > Self.cliStartEvictionInterval {
+                self.cliStartLastSeenInState[id] = nil
+                self.cliStartCache[id] = nil
+                self.cliStartMissAt[id] = nil
+            }
             let startDates = Array(self.cliStartCache.values)
             DispatchQueue.main.async {
                 // Only reassign (and thus only trigger a SwiftUI/hosting-view
@@ -323,32 +350,55 @@ final class SessionsModel: ObservableObject {
     /// See the dedupe comment in refresh(): known local CLI sessions' transcript
     /// creation times, published for CloudSessionsModel's created_at matching.
     @Published var cliStartDates: [Date] = []
-    /// id -> transcript creation date; append-only for the app's lifetime,
-    /// touched only on the refresh queue.
+    /// id -> transcript creation date; retained past the session's local drop
+    /// for the cloud-echo lookback, then evicted (see the eviction loop in
+    /// refresh()). In-memory only — a widget relaunch forgets recently-dropped
+    /// sessions, so their cloud echo can reappear for up to the 30-min
+    /// lookback (accepted, self-healing). Touched only on the refresh queue.
     private var cliStartCache: [String: Date] = [:]
+    /// id -> the last refresh() at which the id was present in state.json;
+    /// drives eviction of cliStartCache/cliStartMissAt. Refresh-queue only.
+    private var cliStartLastSeenInState: [String: Date] = [:]
+    /// R2-5: id -> when transcriptCreationDate last came up empty, so a
+    /// deleted transcript isn't re-hunted (with a full ~/.claude/projects
+    /// listing) every 5s refresh under the state flock. Refresh-queue only.
+    private var cliStartMissAt: [String: Date] = [:]
+    /// Evict a cache entry once its session has been absent from state.json
+    /// for CloudSessionsModel.lookbackWindow (30 min — how long an echo can
+    /// stay visible) plus 30 min slack.
+    private static let cliStartEvictionInterval: TimeInterval = 60 * 60
+    /// How long a transcript-not-found result is trusted before retrying.
+    private static let transcriptMissRetryInterval: TimeInterval = 60
 
     /// The transcript file's creation date for a CLI session. Tries the
     /// project-dir encoding Claude Code uses for folder names ("/" and "." →
-    /// "-"), then falls back to a shallow scan of ~/.claude/projects for
-    /// <id>.jsonl (encoding rules could drift; the scan is one-time per
-    /// session thanks to the cache above).
+    /// "-") FIRST and, only on a miss, falls back to a shallow scan of
+    /// ~/.claude/projects for <id>.jsonl (encoding rules could drift). R2-5:
+    /// the directory listing used to be built unconditionally even when the
+    /// primary candidate would hit; now a hit skips it entirely, and misses
+    /// are rate-limited by cliStartMissAt at the call site — this runs under
+    /// the state flock on every refresh.
     private static func transcriptCreationDate(projectDir: String, id: String) -> Date? {
         let base = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude").appendingPathComponent("projects")
         let encoded = projectDir
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ".", with: "-")
-        var candidates = [base.appendingPathComponent(encoded).appendingPathComponent("\(id).jsonl")]
-        if let subdirs = try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil) {
-            candidates += subdirs.map { $0.appendingPathComponent("\(id).jsonl") }
+        let primary = base.appendingPathComponent(encoded).appendingPathComponent("\(id).jsonl")
+        if let created = fileCreationDate(primary) { return created }
+        guard let subdirs = try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil) else {
+            return nil
         }
-        for url in candidates {
-            if let values = try? url.resourceValues(forKeys: [.creationDateKey]),
-               let created = values.creationDate {
+        for dir in subdirs {
+            if let created = fileCreationDate(dir.appendingPathComponent("\(id).jsonl")) {
                 return created
             }
         }
         return nil
+    }
+
+    private static func fileCreationDate(_ url: URL) -> Date? {
+        (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate
     }
 
     func setEnabled(_ sessionId: String, _ enabled: Bool) {

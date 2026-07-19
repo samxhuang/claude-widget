@@ -199,13 +199,22 @@ def fetch_dump(host, transport, usage=False):
     return data
 
 
-# Retention relay (config push): once-per-(host, config-change) failure memo.
-# Maps host name -> the Mac-side retention value whose push last failed (or
-# couldn't be attempted because the remote's remote_ctl predates apply-config).
-# While the Mac's configured value is unchanged, that host is not retried —
-# no per-cycle spam; a new value (config change) clears the way for one fresh
-# attempt + one fresh log line. Single sync thread, so no locking needed.
+# Retention relay (config push): per-host failure memo. Maps host name ->
+# {"reason": "no_field" | "push_failed", "value": <Mac retention at failure>,
+#  "at": <now_fn timestamp>}. The reason matters (round-2 audit): a memo that
+# only remembered the value blocked convergence after the very redeploy its
+# own hint requested — nothing pushed until the value changed or the daemon
+# restarted. Now:
+#   - "no_field" (dump lacks retention_minutes, old remote_ctl): cleared the
+#     moment a dump DOES carry the field (i.e. the redeploy happened); the
+#     hint is still logged once per (host, value), not per cycle.
+#   - "push_failed": skipped only while the value is unchanged AND the memo
+#     is younger than RETENTION_PUSH_RETRY_SECONDS, so a transient ssh blip
+#     retries after ~1h instead of never.
+# Single sync thread, so no locking needed.
 _RETENTION_PUSH_FAILED: dict = {}
+# Age after which a failed push is retried even with an unchanged Mac value.
+RETENTION_PUSH_RETRY_SECONDS = 3600
 
 
 def push_config(host, retention_minutes, transport):
@@ -234,7 +243,7 @@ def push_config(host, retention_minutes, transport):
     return bool(isinstance(resp, dict) and resp.get("ok"))
 
 
-def _maybe_push_retention(host, state_dir, dump, transport):
+def _maybe_push_retention(host, state_dir, dump, transport, now_fn=time.time):
     """Retention relay (WS config push): after a successful dump, converge the
     remote's effective sessions.idle_retention_minutes onto the Mac's
     configured value. Idempotent convergence, exactly like the toggle relay:
@@ -245,39 +254,54 @@ def _maybe_push_retention(host, state_dir, dump, transport):
     Old-remote handling: a remote_ctl predating this feature neither reports
     "retention_minutes" in its dump nor understands apply-config. Either way
     we log ONE "redeploy to update" hint per host per Mac-side config change
-    (via _RETENTION_PUSH_FAILED) instead of retry-spamming every cycle."""
+    (via _RETENTION_PUSH_FAILED) instead of retry-spamming every cycle — but
+    the memo remembers WHY it's set (see its comment): a redeploy clears the
+    no-field memo immediately, and failed pushes retry after ~1h."""
     name = host["name"]
     local = int(autoresume_config.load_config(Path(state_dir))
                 ["sessions"]["idle_retention_minutes"])
 
     remote = dump.get("retention_minutes")
+    memo = _RETENTION_PUSH_FAILED.get(name)
     if isinstance(remote, bool) or not isinstance(remote, (int, float)):
         # Old remote_ctl: no retention_minutes field in the dump.
-        if _RETENTION_PUSH_FAILED.get(name) != local:
-            _RETENTION_PUSH_FAILED[name] = local
+        if not (memo and memo.get("reason") == "no_field"
+                and memo.get("value") == local):
+            _RETENTION_PUSH_FAILED[name] = {
+                "reason": "no_field", "value": local, "at": now_fn()}
             autoresume.log(
                 f"remote-sync: {name} dump has no retention_minutes (old remote_ctl) — "
                 f"can't relay idle retention ({local}m); redeploy to update "
                 "(deploy_remote.sh). Will retry after the next retention change.")
         return
 
+    # The dump carries the field, so the remote_ctl is current: any "old
+    # remote_ctl" memo is moot — the redeploy its hint asked for happened.
+    # (Round-2 audit: keying the memo on the value alone blocked exactly
+    # this convergence until the next Settings edit or daemon restart.)
+    if memo and memo.get("reason") == "no_field":
+        _RETENTION_PUSH_FAILED.pop(name, None)
+        memo = None
+
     if int(remote) == local:
         _RETENTION_PUSH_FAILED.pop(name, None)  # converged — allow future pushes
         return
 
-    if _RETENTION_PUSH_FAILED.get(name) == local:
-        return  # this exact value already failed once for this host — no spam
+    if (memo and memo.get("value") == local
+            and now_fn() - memo.get("at", 0) < RETENTION_PUSH_RETRY_SECONDS):
+        return  # this exact value failed recently — no per-cycle spam
 
     if push_config(host, local, transport):
         _RETENTION_PUSH_FAILED.pop(name, None)
         autoresume.log(f"remote-sync: {name} idle retention pushed "
                        f"({int(remote)}m -> {local}m)")
     else:
-        _RETENTION_PUSH_FAILED[name] = local
+        _RETENTION_PUSH_FAILED[name] = {
+            "reason": "push_failed", "value": local, "at": now_fn()}
         autoresume.log(
             f"remote-sync: {name} apply-config push of idle retention ({local}m) failed — "
             "if the host runs an older remote_ctl, redeploy to update (deploy_remote.sh). "
-            "Will retry after the next retention change.")
+            "Will retry within the hour, or sooner after the next retention change.")
 
 
 def push_toggles(host, payload, transport):
@@ -468,7 +492,7 @@ def sync_host(host, state_dir, transport, now_fn=time.time):
 
     # Retention relay: outside the StateLock (it never touches state.json),
     # after a successful dump+merge, before/independent of the toggle push.
-    _maybe_push_retention(host, state_dir, dump, transport)
+    _maybe_push_retention(host, state_dir, dump, transport, now_fn)
 
     if not payload:
         return True
