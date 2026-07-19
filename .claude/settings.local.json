@@ -8,7 +8,14 @@
       "Bash(mkdir -p diagnostics && mv diag* dump_* daemon_dump* daemon_status.txt crash_dump.txt *.jsonl state_dump*.json diagnostics/ 2>/dev/null; ls)",
       "Bash(git init *)",
       "Bash(git add *)",
-      "Bash(git commit -m 'Initial commit: ClaudeUsageOverlay widget + claude-autoresume daemon *)"
+      "Bash(git commit -m 'Initial commit: ClaudeUsageOverlay widget + claude-autoresume daemon *)",
+      "Bash(ls -la \"$HOME/Library/Application Support/Claude/IndexedDB/\" 2>&1)",
+      "Bash(brew install *)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python --version)",
+      "Bash(brew --prefix snappy)",
+      "Bash(ls -la /Users/sam/git/claude-widget/.venv/bin/python 2>&1)"
     ]
   }
 }
