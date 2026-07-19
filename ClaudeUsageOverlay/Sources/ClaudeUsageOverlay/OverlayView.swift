@@ -33,6 +33,9 @@ struct OverlayView: View {
     @ObservedObject var model: UsageModel
     @ObservedObject var sessions: SessionsModel
     @ObservedObject var chats: ChatsModel
+    /// Item 4: cloud-only Cowork/Code sessions, shown appended to the
+    /// Sessions section — see CloudSessionsModel's header comment.
+    @ObservedObject var cloudSessions: CloudSessionsModel
     @ObservedObject var planFit: PlanFitModel
     @ObservedObject var graph: GraphModel
     /// Opens the larger, resizable graph window (item 3) — forwarded down to
@@ -41,6 +44,10 @@ struct OverlayView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            // Item 1: the Main/Graph/Plan fit tab pills used to occupy their
+            // own row under the title; folded onto the title row itself
+            // (right-aligned, title left) to reclaim that row's height for
+            // an always-on-top panel where vertical economy is the point.
             HStack {
                 Text("Claude Usage")
                     .font(.system(size: 11, weight: .semibold))
@@ -56,14 +63,15 @@ struct OverlayView: View {
                         .foregroundColor(.red.opacity(0.85))
                         .lineLimit(1)
                 }
+                tabSwitch
             }
-
-            tabSwitch
 
             if graph.selectedTab == .main {
                 mainTabContent
-            } else {
+            } else if graph.selectedTab == .graph {
                 GraphView(model: graph, onExpand: onExpandGraph)
+            } else {
+                planFitTabContent
             }
         }
         .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
@@ -86,31 +94,33 @@ struct OverlayView: View {
 
     // MARK: - Tab switch
 
-    /// Small pill-style tab switch between the existing main view (usage
-    /// bars + sessions + chats + plan fit) and the new Graph view. Styled to
-    /// match the panel's existing dark, compact controls rather than a
-    /// native segmented control, which would look out of place here.
+    /// Small pill-style tab switch between the main view (usage bars +
+    /// sessions + chats), the Graph view, and the Plan fit view (item 3).
+    /// Styled to match the panel's existing dark, compact controls rather
+    /// than a native segmented control, which would look out of place here.
+    /// Lives on the title row now (item 1), so it's tightened up (smaller
+    /// pill padding/spacing than the old standalone row needed) to keep
+    /// three tabs plus the title fitting the panel width without truncation.
     private var tabSwitch: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 3) {
             tabButton(title: "Main", tab: .main)
             tabButton(title: "Graph", tab: .graph)
-            Spacer()
+            tabButton(title: "Plan fit", tab: .planFit)
         }
     }
 
     private func tabButton(title: String, tab: PanelTab) -> some View {
         Text(title)
-            .font(.system(size: 9.5, weight: graph.selectedTab == tab ? .bold : .medium))
+            .font(.system(size: 9, weight: graph.selectedTab == tab ? .bold : .medium))
             .foregroundColor(graph.selectedTab == tab ? .white : .white.opacity(0.5))
-            .padding(.horizontal, 9)
+            .padding(.horizontal, 6)
             .padding(.vertical, 3)
             .background(
                 Capsule().fill(graph.selectedTab == tab ? Color.white.opacity(0.18) : Color.clear)
             )
             .contentShape(Rectangle())
             .onTapGesture {
-                guard graph.selectedTab != tab else { return }
-                graph.toggleTab()
+                graph.selectTab(tab)
             }
     }
 
@@ -119,11 +129,10 @@ struct OverlayView: View {
     @ViewBuilder
     private var mainTabContent: some View {
         row(label: "Session (5h)", percent: model.sessionPercent, resetText: model.resetText(for: model.sessionResetsAt))
-        row(label: "Weekly", percent: model.weeklyPercent, resetText: model.resetText(for: model.weeklyResetsAt))
-
-        Text(model.lastUpdatedText)
-            .font(.system(size: 8.5))
-            .foregroundColor(.white.opacity(0.4))
+        // Item 2: the standalone "updated Xm" line is gone — folded onto the
+        // Weekly row's reset caption line instead (right-aligned, italic),
+        // saving the row entirely.
+        row(label: "Weekly", percent: model.weeklyPercent, resetText: model.resetText(for: model.weeklyResetsAt), trailingCaption: model.lastUpdatedText)
 
         Divider().background(Color.white.opacity(0.15))
 
@@ -132,10 +141,6 @@ struct OverlayView: View {
         Divider().background(Color.white.opacity(0.15))
 
         chatsSection
-
-        Divider().background(Color.white.opacity(0.15))
-
-        planFitSection
     }
 
     // MARK: - Interrupted sessions
@@ -150,8 +155,14 @@ struct OverlayView: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundColor(.white.opacity(0.85))
             Spacer()
-            if !sessions.sessions.isEmpty {
-                Text("\(sessions.sessions.count)")
+            // Cloud sessions item: badge count includes cloud-only sessions
+            // (see CloudSessionsModel) alongside the locally-tracked ones,
+            // since both now render as rows in this section. Uses
+            // `totalCount` (pre display-cap) rather than `sessions.count` so
+            // the badge still reflects the true total even though the
+            // visible list itself is capped to the 8 most recent.
+            if !sessions.sessions.isEmpty || cloudSessions.totalCount > 0 {
+                Text("\(sessions.sessions.count + cloudSessions.totalCount)")
                     .font(.system(size: 9, weight: .bold))
                     .foregroundColor(.white)
                     .padding(.horizontal, 5)
@@ -181,7 +192,7 @@ struct OverlayView: View {
             // of the old `.frame(maxHeight: 300)`, so this block's rendered
             // height never depends on whether Recent chats is expanded.
             Group {
-                if sessions.sessions.isEmpty {
+                if sessions.sessions.isEmpty && cloudSessions.sessions.isEmpty {
                     Text("No sessions")
                         .font(.system(size: 9))
                         .foregroundColor(.white.opacity(0.4))
@@ -190,6 +201,14 @@ struct OverlayView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             ForEach(sessions.sessions) { entry in
                                 sessionRow(entry)
+                            }
+                            // Cloud sessions item: appended below the
+                            // locally-tracked rows, already filtered (in
+                            // CloudSessionsModel.apply) to exclude anything
+                            // whose id is also in sessions.sessions, so
+                            // nothing here can double up with a row above.
+                            ForEach(cloudSessions.sessions) { entry in
+                                cloudSessionRow(entry)
                             }
                         }
                     }
@@ -311,6 +330,49 @@ struct OverlayView: View {
         return entry.enabled ? Color.green.opacity(0.15) : Color.white.opacity(0.06)
     }
 
+    /// Cloud sessions item: a session running entirely on claude.ai's
+    /// servers, with nothing local for the daemon to resume — so unlike
+    /// sessionRow above, this has no enabled/resume-armed toggle or Resume
+    /// button, only a small cloud badge marking it apart from the
+    /// locally-tracked rows. A leading dot + brighter text mark sessions
+    /// updated within the last ~10 minutes (CloudSessionsModel.isActive) as
+    /// actively-running right now, vs. the dimmer treatment for older ones —
+    /// this is what makes an active session like "Pittsburgh medical team
+    /// search" (root cause of it going missing entirely: see ChatsFetcher's
+    /// header comment) visually stand out once it IS being shown.
+    @ViewBuilder
+    private func cloudSessionRow(_ entry: CloudSessionEntry) -> some View {
+        let active = cloudSessions.isActive(entry)
+        HStack(spacing: 6) {
+            Circle()
+                .fill(active ? Color.green : Color.white.opacity(0.25))
+                .frame(width: 6, height: 6)
+
+            Image(systemName: "cloud.fill")
+                .font(.system(size: 9))
+                .foregroundColor(.cyan.opacity(active ? 0.95 : 0.5))
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.displayTitle)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(active ? 0.95 : 0.55))
+                    .lineLimit(1)
+                Text("cloud session")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundColor(.cyan.opacity(active ? 0.6 : 0.35))
+            }
+
+            Spacer()
+
+            Text(cloudSessions.relativeText(for: entry.updatedAt))
+                .font(.system(size: 8.5))
+                .foregroundColor(active ? .green.opacity(0.85) : .white.opacity(0.4))
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.cyan.opacity(active ? 0.14 : 0.06)))
+    }
+
     // MARK: - Recent chats
 
     @ViewBuilder
@@ -407,76 +469,65 @@ struct OverlayView: View {
         NSWorkspace.shared.open(url)
     }
 
-    // MARK: - Plan fit
+    // MARK: - Plan fit (item 3: its own tab, not a Main-tab collapsible
+    // section anymore — always shows full content when selected, no
+    // expand/collapse chevron needed since the tab selection itself is the
+    // show/hide control.)
 
     @ViewBuilder
-    private var planFitSection: some View {
-        HStack {
-            Image(systemName: planFit.planFitExpanded ? "chevron.down" : "chevron.right")
-                .font(.system(size: 8, weight: .bold))
-                .foregroundColor(.white.opacity(0.6))
-            Text("Plan fit")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(.white.opacity(0.85))
-            Spacer()
-            if let plan = planFit.data?.currentPlan {
-                Text(planFit.displayName(forPlanKey: plan))
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.white.opacity(0.18)))
-            }
-        }
-        .contentShape(Rectangle())
-        // Collapsed, this header row is the last thing in the card — without
-        // a little breathing room here the text sits flush against the
-        // panel's bottom edge. Only needed while collapsed; expanded state
-        // already has plenty of trailing content below it.
-        .padding(.bottom, planFit.planFitExpanded ? 0 : 3)
-        .onTapGesture {
-            planFit.toggleExpanded()
-        }
-
-        if planFit.planFitExpanded {
-            if let data = planFit.data {
-                VStack(alignment: .leading, spacing: 6) {
-                    // Moving averages — one line per window, coverage
-                    // annotation only shown while the window is still
-                    // filling up. Missing windows are simply omitted.
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(["1d", "7d", "30d", "90d"], id: \.self) { key in
-                            if let w = data.movingAverages[key] {
-                                Text(planFit.movingAverageLine(key: key, window: w))
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.white.opacity(0.8))
-                            }
-                        }
-                    }
-
-                    if let apiEquiv = planFit.apiEquivalentText(data) {
-                        Text(apiEquiv)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(.white.opacity(0.9))
-                    }
-
-                    // Item 6: was a single Text(peaksText) trying to cram
-                    // four values onto one line — with all four present it
-                    // overflowed the panel width and the last value (peak 7d
-                    // util) got clipped by SwiftUI's default truncation.
-                    // Split into two label-prefixed rows (cost, then
-                    // utilization) so nothing ever truncates.
-                    peaksGrid(data)
-
-                    if !data.tiers.isEmpty {
-                        tierGrid(data.tiers)
+    private var planFitTabContent: some View {
+        if let data = planFit.data {
+            VStack(alignment: .leading, spacing: 9) {
+                // Current-plan identity used to live in the section header's
+                // trailing badge; kept here (rather than dropped) since the
+                // tab pill alone doesn't say which plan the numbers below
+                // are being judged against.
+                if let plan = data.currentPlan {
+                    HStack {
+                        Text("Current plan")
+                            .font(.system(size: 9.5))
+                            .foregroundColor(.white.opacity(0.5))
+                        Spacer()
+                        Text(planFit.displayName(forPlanKey: plan))
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(Color.white.opacity(0.18)))
                     }
                 }
-            } else {
-                Text("collecting data…")
-                    .font(.system(size: 9))
-                    .foregroundColor(.white.opacity(0.4))
+
+                // Moving averages — one line per window, coverage annotation
+                // only shown while the window is still filling up. Missing
+                // windows are simply omitted.
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(["1d", "7d", "30d", "90d"], id: \.self) { key in
+                        if let w = data.movingAverages[key] {
+                            Text(planFit.movingAverageLine(key: key, window: w))
+                                .font(.system(size: 9.5))
+                                .foregroundColor(.white.opacity(0.8))
+                        }
+                    }
+                }
+
+                if let apiEquiv = planFit.apiEquivalentText(data) {
+                    Text(apiEquiv)
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(.white.opacity(0.9))
+                }
+
+                // Item 6: two label-prefixed rows (cost, then utilization)
+                // rather than one line, so nothing truncates.
+                peaksGrid(data)
+
+                if !data.tiers.isEmpty {
+                    tierGrid(data.tiers)
+                }
             }
+        } else {
+            Text("collecting data…")
+                .font(.system(size: 9))
+                .foregroundColor(.white.opacity(0.4))
         }
     }
 
@@ -562,8 +613,12 @@ struct OverlayView: View {
 
     // MARK: - Usage rows
 
+    /// Item 2: `trailingCaption`, when supplied (the Weekly row passes
+    /// `model.lastUpdatedText`), renders right-aligned and italicized on the
+    /// same line as `resetText` — this is what let the old standalone
+    /// "updated Xm" line under the usage rows be deleted entirely.
     @ViewBuilder
-    private func row(label: String, percent: Int?, resetText: String) -> some View {
+    private func row(label: String, percent: Int?, resetText: String, trailingCaption: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(label)
@@ -584,9 +639,18 @@ struct OverlayView: View {
                 }
             }
             .frame(height: 5)
-            Text(resetText)
-                .font(.system(size: 8.5))
-                .foregroundColor(.white.opacity(0.45))
+            HStack {
+                Text(resetText)
+                    .font(.system(size: 8.5))
+                    .foregroundColor(.white.opacity(0.45))
+                if let trailingCaption {
+                    Spacer()
+                    Text(trailingCaption)
+                        .italic()
+                        .font(.system(size: 8.5))
+                        .foregroundColor(.white.opacity(0.45))
+                }
+            }
         }
     }
 

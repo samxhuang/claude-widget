@@ -58,15 +58,7 @@ struct PlanFitData {
 final class PlanFitModel: ObservableObject {
     @Published var data: PlanFitData?
 
-    private static let expandedDefaultsKey = "planFitExpanded"
-    /// Persisted across launches, same pattern as SessionsModel/ChatsModel.
-    /// Starts collapsed.
-    @Published var planFitExpanded: Bool {
-        didSet { UserDefaults.standard.set(planFitExpanded, forKey: Self.expandedDefaultsKey) }
-    }
-
     private let fileURL: URL
-    private var lastToggleAt: Date = .distantPast
 
     static let planDisplayNames: [String: String] = [
         "pro": "Pro",
@@ -75,21 +67,10 @@ final class PlanFitModel: ObservableObject {
     ]
 
     init() {
-        self.planFitExpanded = UserDefaults.standard.object(forKey: Self.expandedDefaultsKey) as? Bool ?? false
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-autoresume")
             .appendingPathComponent("usage")
         self.fileURL = dir.appendingPathComponent("plan_fit.json")
-    }
-
-    /// Debounced the same way Sessions/Chats' toggles are — a click delivered
-    /// twice in quick succession inside a non-activating panel would
-    /// otherwise expand and immediately re-collapse in one frame.
-    func toggleExpanded() {
-        let now = Date()
-        guard now.timeIntervalSince(lastToggleAt) > 0.35 else { return }
-        lastToggleAt = now
-        planFitExpanded.toggle()
     }
 
     /// Re-reads plan_fit.json. Safe to call on a timer even though the

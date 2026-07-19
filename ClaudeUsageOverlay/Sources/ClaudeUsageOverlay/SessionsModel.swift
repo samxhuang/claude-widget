@@ -131,6 +131,39 @@ final class SessionsModel: ObservableObject {
                     needsAttention: dict["needs_attention"] as? Bool ?? false
                 ))
             }
+            // Crash-continuation dedupe (local-local rule): if a Claude Code
+            // process crashes mid-conversation and continues, the daemon
+            // writes a NEW session id while the old one is still within its
+            // 30-minute window — same title, same project, both "active" —
+            // so without this the widget shows both as if they were two
+            // separate live sessions. Only collapse pairs that are BOTH
+            // "active"; "waiting" (rate-limited) rows are distinct resumable
+            // states and must never be hidden this way. Self-heals once the
+            // old id ages out of the daemon's window, so this only needs to
+            // cover the overlap — keep the one with the most recent activity.
+            var dedupedEntries: [SessionEntry] = []
+            var bestActiveByKey: [String: SessionEntry] = [:]
+            var activeKeyOrder: [String] = []
+            for entry in entries {
+                guard entry.isActive else {
+                    dedupedEntries.append(entry)
+                    continue
+                }
+                let key = entry.projectName + "\u{0}" + (entry.sessionTitle ?? "")
+                if let existing = bestActiveByKey[key] {
+                    let existingActivity = existing.lastActivityAt ?? .distantPast
+                    let newActivity = entry.lastActivityAt ?? .distantPast
+                    if newActivity > existingActivity {
+                        bestActiveByKey[key] = entry
+                    }
+                } else {
+                    bestActiveByKey[key] = entry
+                    activeKeyOrder.append(key)
+                }
+            }
+            dedupedEntries.append(contentsOf: activeKeyOrder.compactMap { bestActiveByKey[$0] })
+            entries = dedupedEntries
+
             // Rate-limited (waiting) sessions first, soonest reset first; active ones after.
             entries.sort { a, b in
                 switch (a.resetsAt, b.resetsAt) {

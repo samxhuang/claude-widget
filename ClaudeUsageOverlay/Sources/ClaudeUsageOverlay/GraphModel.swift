@@ -5,6 +5,7 @@ import Combine
 enum PanelTab: String {
     case main
     case graph
+    case planFit
 }
 
 /// Segmented period picker inside the Graph tab. Each case owns the target
@@ -148,12 +149,16 @@ final class GraphModel: ObservableObject {
 
     /// Debounced the same way Sessions/Chats/PlanFit's toggles are — a click
     /// delivered twice in quick succession inside a non-activating panel
-    /// would otherwise flip the tab twice in one frame.
-    func toggleTab() {
+    /// would otherwise re-select the tab twice in one frame. Now a direct
+    /// three-way select (Main / Graph / Plan fit) rather than a two-way
+    /// toggle, since the Plan fit tab (item 3) added a third case to
+    /// PanelTab.
+    func selectTab(_ tab: PanelTab) {
+        guard selectedTab != tab else { return }
         let now = Date()
         guard now.timeIntervalSince(lastToggleAt) > 0.35 else { return }
         lastToggleAt = now
-        selectedTab = (selectedTab == .main) ? .graph : .main
+        selectedTab = tab
     }
 
     /// Re-reads all four source files off the main thread and republishes

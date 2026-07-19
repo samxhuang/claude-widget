@@ -40,14 +40,41 @@ import Foundation
 /// format for non-code-session entries (bare uuid vs. some other prefix
 /// like code_session's `cse_...`) was never observed, so it's NOT safe to
 /// assume `https://claude.ai/chat/{id}` deep-links correctly for those.
+///
+/// Item 4 ("cloud sessions are invisible"): the JS below now also fetches
+/// `GET .../recents` in the same round-trip (same org/credentials, no extra
+/// navigation) and keeps only its `code_session`-typed items — these are
+/// Cowork/Code sessions running entirely server-side, which write no local
+/// file and so never appear in SessionsModel/state.json. Results are handed
+/// to CloudSessionsModel, which filters out anything whose id is already
+/// tracked locally (see `localSessionIds`) before OverlayView shows them.
 final class ChatsFetcher {
     private let session: ClaudeWebSession
     private let model: ChatsModel
+    /// Item 4: cloud-only Cowork/Code sessions ("cloud sessions are
+    /// invisible" — a session running entirely on claude.ai's servers writes
+    /// no local file, so SessionsModel/the daemon never see it). Fetched via
+    /// the same JS round-trip as chat_conversations below, then filtered
+    /// against `localSessionIds()` so a session already shown by
+    /// SessionsModel isn't duplicated here.
+    private let cloudSessions: CloudSessionsModel
+    private let localSessionIds: () -> Set<String>
+    /// Crash-continuation dedupe (cloud-local rule): a Claude Code process
+    /// that crashes mid-conversation gets a new local session id when it
+    /// continues, but the SAME conversation still shows up as a cloud
+    /// /recents item under yet another id (neither matches the other) —
+    /// title-based, since id-based filtering alone can't catch this case.
+    /// Titles are of the currently-DISPLAYED local sessions (i.e. after
+    /// SessionsModel's own local-local dedupe), not the raw state.json set.
+    private let localSessionTitles: () -> Set<String>
     private let onLoginNeeded: () -> Void
 
-    init(session: ClaudeWebSession, model: ChatsModel, onLoginNeeded: @escaping () -> Void) {
+    init(session: ClaudeWebSession, model: ChatsModel, cloudSessions: CloudSessionsModel, localSessionIds: @escaping () -> Set<String>, localSessionTitles: @escaping () -> Set<String>, onLoginNeeded: @escaping () -> Void) {
         self.session = session
         self.model = model
+        self.cloudSessions = cloudSessions
+        self.localSessionIds = localSessionIds
+        self.localSessionTitles = localSessionTitles
         self.onLoginNeeded = onLoginNeeded
     }
 
@@ -88,7 +115,60 @@ final class ChatsFetcher {
             name: item.name || item.title || item.summary || '',
             updated_at: item.updated_at || item.updatedAt || null
           })).filter(c => c.uuid);
-          return { ok: true, chats: chats };
+
+          // Item 4: cloud-only sessions. /recents aggregates the
+          // "chat"/"code"/"cowork" surfaces. Root-caused 2026-07-18 via a
+          // temporary full-payload dump (removed after diagnosis): items
+          // come back with type "code_session" (Claude Code sessions) AND
+          // "cowork_session" (Cowork sessions) — the original filter only
+          // kept "code_session", which is why an actively-running Cowork
+          // session ("Pittsburgh medical team search", type:
+          // "cowork_session", status: "active") never showed up even though
+          // it was right there in the response, sorted first (this endpoint
+          // returns newest-updated-first already). Both types are Cowork/
+          // Code sessions running server-side with no local file, so both
+          // belong in the cloud-sessions list. Fetched in this same
+          // round-trip since it's the same org/credentials call as
+          // chat_conversations above. Defensive: this is a second,
+          // less-verified endpoint — a failure or shape change here must
+          // never fail the whole refresh, since chats are the primary
+          // payload.
+          let cloudSessions = [];
+          let cloudSessionsRawShape = null;
+          try {
+            const recentsRes = await fetch('https://claude.ai/api/organizations/' + orgId + '/recents', { credentials: 'include' });
+            if (recentsRes.ok) {
+              const recentsBody = await recentsRes.text();
+              let recentsParsed;
+              try { recentsParsed = JSON.parse(recentsBody); } catch (e) { recentsParsed = null; }
+              const recentsList = Array.isArray(recentsParsed)
+                ? recentsParsed
+                : (recentsParsed && Array.isArray(recentsParsed.data) ? recentsParsed.data
+                   : (recentsParsed && Array.isArray(recentsParsed.items) ? recentsParsed.items
+                      : (recentsParsed && Array.isArray(recentsParsed.recents) ? recentsParsed.recents : null)));
+              if (recentsList) {
+                cloudSessions = recentsList
+                  .filter(item => item && (item.type === 'code_session' || item.type === 'cowork_session'))
+                  .map(item => ({
+                    id: item.id || item.uuid || '',
+                    title: item.title || item.name || item.summary || '',
+                    updated_at: item.updated_at || item.updatedAt || null
+                  }))
+                  .filter(c => c.id);
+                if (cloudSessions.length === 0 && recentsList.length > 0) {
+                  cloudSessionsRawShape = 'recents_no_session_items:' + JSON.stringify(recentsList[0]).slice(0, 300);
+                }
+              } else {
+                cloudSessionsRawShape = 'recents_unexpected_shape:' + JSON.stringify(recentsParsed).slice(0, 300);
+              }
+            } else {
+              cloudSessionsRawShape = 'recents_http_' + recentsRes.status;
+            }
+          } catch (e) {
+            cloudSessionsRawShape = 'recents_exception:' + String(e);
+          }
+
+          return { ok: true, chats: chats, cloudSessions: cloudSessions, cloudSessionsRawShape: cloudSessionsRawShape };
         } catch (e) {
           return { error: String(e) };
         }
@@ -128,6 +208,19 @@ final class ChatsFetcher {
                 model.lastError = nil
                 model.apply(chats: chats)
                 NSLog("[ChatsFetcher] fetched %d conversations", chats.count)
+
+                // Item 4: apply cloud sessions regardless of shape success —
+                // apply(raw:localIds:localTitles:) degrades to an empty list
+                // on its own if `raw` is empty, and a shape mismatch here
+                // (logged below) must never affect the chats path above.
+                let cloudRaw = dict["cloudSessions"] as? [[String: Any]] ?? []
+                if let rawShape = dict["cloudSessionsRawShape"] as? String {
+                    NSLog("[ChatsFetcher] cloud sessions unexpected shape: %@", rawShape)
+                }
+                let localIds = localSessionIds()
+                let localTitles = localSessionTitles()
+                cloudSessions.apply(raw: cloudRaw, localIds: localIds, localTitles: localTitles)
+                NSLog("[ChatsFetcher] cloud sessions: %d raw, %d after local-id/title filter+cap (%d local ids, %d local titles known)", cloudRaw.count, cloudSessions.sessions.count, localIds.count, localTitles.count)
                 return
             }
             model.lastError = "Unexpected response shape"

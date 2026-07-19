@@ -8,6 +8,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = UsageModel()
     private let sessionsModel = SessionsModel()
     private let chatsModel = ChatsModel()
+    // Item 4: cloud-only Cowork/Code sessions (fetched via ChatsFetcher,
+    // see its header comment) — separate from sessionsModel, which is
+    // file-backed (state.json) and refreshes on its own 5s timer, whereas
+    // this refreshes on the same 120s API cadence as chatsModel/planFit/graph.
+    private let cloudSessionsModel = CloudSessionsModel()
     private let planFitModel = PlanFitModel()
     private let graphModel = GraphModel()
     // One hidden, authenticated WKWebView shared by both fetchers — see
@@ -38,15 +43,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // own ground-truth fitting size (NSHostingView.intrinsicContentSize for
     // OverlayView at panelWidth), captured via a temporary probe during
     // development rather than eyeballed — see the commit that introduced
-    // this comment for the raw log output. The collapsed Main tab's real
-    // content height is 255pt (header row + the tab switch row added later
-    // + 2 usage rows + last-updated line + 3 dividers + 3 section headers,
-    // at 8pt VStack spacing + 20pt outer padding); the previous constant of
-    // 217 predated the tab switch row and was never bumped for it, which is
-    // exactly why the collapsed "Plan fit" header was clipped at the
-    // panel's bottom edge. +3pt breathing room below that, same rationale
-    // as before (pairs with planFitSection's .padding(.bottom, 3)).
-    private let collapsedPanelHeight: CGFloat = 258
+    // this comment for the raw log output.
+    //
+    // Compactness redesign audit: re-measured after (a) folding the
+    // Main/Graph/Plan fit tab pills onto the title row instead of their own
+    // row, (b) folding the "updated Xm" caption onto the Weekly row's reset
+    // line instead of its own line, and (c) removing the Plan fit section
+    // (header + divider) from the Main tab entirely — it's a tab now, not a
+    // collapsible section. Collapsed Main tab content (header/tab row + 2
+    // usage rows + 2 dividers + 2 section headers, at 8pt VStack spacing +
+    // 20pt outer padding) measured 181pt via the temporary probe
+    // (NSHostingView.intrinsicContentSize({280, 181})), down from the
+    // previous 255pt real-content figure now that the tab-switch row and the
+    // standalone "updated" line are both gone and Plan fit's header/divider
+    // no longer live on this tab. +3pt breathing room below that, same
+    // rationale as before.
+    private let collapsedPanelHeight: CGFloat = 184
     // Both sections are wrapped in a ScrollView, so these only need to cover
     // a handful of visible rows — the ScrollView absorbs any overflow rather
     // than the panel growing to fit every entry. Halved from their original
@@ -65,16 +77,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // expanded content block. Evaluates to the same 145 / 140 as before.
     private let sessionsExpandedExtra: CGFloat = SectionLayout.sessionsContentHeight + SectionLayout.siblingSpacing
     private let chatsExpandedExtra: CGFloat = SectionLayout.chatsContentHeight + SectionLayout.siblingSpacing
-    // Plan fit isn't wrapped in a ScrollView (unlike Sessions/Chats) since
-    // its content is a fixed handful of lines, so this needs to cover the
-    // full expanded height: up to 4 moving-average lines, the API-equivalent
-    // line, the two-row peaks grid (item 6), and up to 3 tier rows (item 4's
-    // Grid). Audited (item 1) against real (worst-case, all-fields-present)
-    // data: expanded content measured 156pt beyond the collapsed base, down
-    // from the old 260pt now that items 4/5/6 replaced the maturity +
-    // recommendation prose (removed entirely) and the loose tier HStacks
-    // with a tighter column-aligned Grid. +4pt buffer.
-    private let planFitExpandedExtra: CGFloat = 160
+    // Plan fit item 3: no longer a Main-tab collapsible section — it's its
+    // own tab now, with a fixed panel height (same pattern as
+    // graphPanelHeight below) rather than a collapsed-base-plus-extra. Full
+    // content (current-plan badge, all 4 moving-average lines, the
+    // API-equivalent line, the two-row peaks grid, and all 3 tier rows)
+    // measured 238pt via the temporary probe
+    // (NSHostingView.intrinsicContentSize({280, 238})) against real,
+    // fully-populated plan_fit.json data (all moving-average windows, both
+    // cost peaks, both utilization peaks, and all three tiers present —
+    // genuinely the worst case, not a synthetic one). +4pt buffer.
+    private let planFitPanelHeight: CGFloat = 242
     // The Graph tab replaces the collapsible-sections layout entirely with a
     // period picker plus two stacked mini-charts, so it gets its own fixed
     // height rather than participating in the collapsed/expanded-extras math
@@ -109,7 +122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fetcher = UsageFetcher(session: webSession, model: model, onLoginNeeded: { [weak self] in
             self?.presentLoginWindow()
         })
-        chatsFetcher = ChatsFetcher(session: webSession, model: chatsModel, onLoginNeeded: { [weak self] in
+        chatsFetcher = ChatsFetcher(session: webSession, model: chatsModel, cloudSessions: cloudSessionsModel, localSessionIds: { [weak self] in
+            Set(self?.sessionsModel.sessions.map { $0.id } ?? [])
+        }, localSessionTitles: { [weak self] in
+            Set((self?.sessionsModel.sessions ?? []).map { $0.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        }, onLoginNeeded: { [weak self] in
             self?.presentLoginWindow()
         })
 
@@ -135,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.model.tick()
             self?.sessionsModel.tick()
             self?.chatsModel.tick()
+            self?.cloudSessionsModel.tick()
         }
 
         sessionsModel.refresh()
@@ -160,19 +178,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        planFitModel.$planFitExpanded
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] expanded in
-                self?.updatePanelSize()
-                self?.statusItem.menu?.item(withTitle: "Show Plan Fit")?.state = expanded ? .on : .off
-            }
-            .store(in: &cancellables)
-
-        // The Graph tab uses a fixed panel height distinct from the
-        // collapsed/expanded-extras math the Main tab uses, so switching
-        // tabs needs the same resize-on-change treatment as the collapsible
-        // sections above.
+        // The Graph and Plan fit tabs each use their own fixed panel height
+        // distinct from the collapsed/expanded-extras math the Main tab
+        // uses, so switching tabs needs the same resize-on-change treatment
+        // as the collapsible sections above. (Plan fit item 3: it's no
+        // longer a collapsible Main-tab section, so there's no separate
+        // planFitExpanded publisher to watch here anymore — tab selection
+        // alone now drives its visibility.)
         graphModel.$selectedTab
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
@@ -210,11 +222,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chatsToggleItem.state = chatsModel.chatsExpanded ? .on : .off
         menu.addItem(chatsToggleItem)
 
-        let planFitToggleItem = NSMenuItem(title: "Show Plan Fit", action: #selector(togglePlanFitSection), keyEquivalent: "")
-        planFitToggleItem.target = self
-        planFitToggleItem.state = planFitModel.planFitExpanded ? .on : .off
-        menu.addItem(planFitToggleItem)
-
         menu.addItem(.separator())
 
         // Pairs naturally with Lock Position below: snap flush into the
@@ -248,10 +255,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleChatsSection() {
         chatsModel.chatsExpanded.toggle()
-    }
-
-    @objc private func togglePlanFitSection() {
-        planFitModel.planFitExpanded.toggle()
     }
 
     @objc private func toggleLockPosition() {
@@ -306,7 +309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupOverlayPanel() {
         let initialHeight = currentPanelHeight()
 
-        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, planFit: planFitModel, graph: graphModel, onExpandGraph: { [weak self] in
+        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, cloudSessions: cloudSessionsModel, planFit: planFitModel, graph: graphModel, onExpandGraph: { [weak self] in
             self?.presentGraphWindow()
         }))
         // Without this, NSHostingView installs Auto Layout min/max-size
@@ -371,19 +374,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSRect(x: x, y: y, width: panelWidth, height: height)
     }
 
-    /// On the Main tab, Sessions, Recent chats, and Plan fit are
-    /// independently collapsible, so the panel's height is the collapsed
-    /// base plus whichever of the three sections' extra heights currently
-    /// apply. The Graph tab replaces all of that with its own fixed height.
+    /// On the Main tab, Sessions and Recent chats are independently
+    /// collapsible, so the panel's height is the collapsed base plus
+    /// whichever of the two sections' extra heights currently apply. The
+    /// Graph and Plan fit tabs (item 3: Plan fit is no longer a Main-tab
+    /// collapsible section) each replace all of that with their own fixed
+    /// height.
     private func currentPanelHeight() -> CGFloat {
-        if graphModel.selectedTab == .graph {
+        switch graphModel.selectedTab {
+        case .graph:
             return graphPanelHeight
+        case .planFit:
+            return planFitPanelHeight
+        case .main:
+            var height = collapsedPanelHeight
+            if sessionsModel.sessionsExpanded { height += sessionsExpandedExtra }
+            if chatsModel.chatsExpanded { height += chatsExpandedExtra }
+            return height
         }
-        var height = collapsedPanelHeight
-        if sessionsModel.sessionsExpanded { height += sessionsExpandedExtra }
-        if chatsModel.chatsExpanded { height += chatsExpandedExtra }
-        if planFitModel.planFitExpanded { height += planFitExpandedExtra }
-        return height
     }
 
     /// Item 1 fix: resizes the panel while preserving its TOP-RIGHT corner,
