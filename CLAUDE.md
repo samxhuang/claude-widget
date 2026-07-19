@@ -63,9 +63,35 @@ then.
   bounces launchd (`bootout` + `bootstrap`). Tail
   `~/.claude-autoresume/daemon.log` to confirm a clean restart.
 - Neither has an automated test runner wired to CI (no CI configured).
-  `claude-autoresume/test_autoresume.py`, `test_plan_fit.py` and
-  `test_usage_collector.py` can be run directly with `python3`.
+  `claude-autoresume/test_autoresume.py`, `test_plan_fit.py`,
+  `test_usage_collector.py` and `test_remote_sync.py` can be run directly
+  with `python3`.
 - Remote: `origin` → github.com/samxhuang/claude-widget.
+- Remote SSH hosts: `claude-autoresume/deploy_remote.sh <user@host>` (also
+  staged into `~/.claude-autoresume/bin/` and invoked automatically by the
+  widget's Settings → Add Host). Non-interactive; emits `@@STEP/@@OK/@@FAIL`
+  markers the widget parses. See README's "Remote hosts (SSH)" section.
+
+## API-budget + remote-SSH phase (2026-07-19, second session)
+
+Landed da82606..88c640e: `config.json` (account type + weekly/monthly dollar
+budgets + remote hosts; widget's Settings window is the ONLY writer, Python
+only reads via `autoresume_config.load_config`), budget bars replacing the
+Max % bars for `account.type == "api"` (spend from the existing plan_fit
+cost pipeline, remote hosts' tokens folded in as `code_cli@<host>`
+surfaces), and Shape-C remote sessions: the same daemon runs on each remote
+host (`AUTORESUME_REMOTE=1`, systemd user unit or nohup), `remote_sync.py`
+on the Mac merges its state over ssh (`remote_ctl.py dump`/`apply-toggles`,
+`host::<sid>` keys, clock-skew-adjusted, one-shot `force_resume` handoff),
+and remote resumes fire natively on the remote — opt-in toggles relayed
+from the widget. Two adversarial audit/fix rounds followed the initial
+5-agent build; notable traps documented in the code: the sync thread always
+starts (idle, lock-free tick) so the first host added at runtime works; the
+deploy payload MUST include `remote_sync.py` (top-level import — regression
+tests parse `PAYLOAD_FILES` out of deploy_remote.sh); the deploy verify
+stage checks real daemon liveness, not just `remote_ctl.py`. Not yet done:
+live end-to-end test against a real remote host (no test host was
+reachable this session).
 
 ## Session/status data flow
 
