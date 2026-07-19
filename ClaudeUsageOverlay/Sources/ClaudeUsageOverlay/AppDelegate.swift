@@ -10,8 +10,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let chatsModel = ChatsModel()
     // Item 4: cloud-only Cowork/Code sessions (fetched via ChatsFetcher,
     // see its header comment) — separate from sessionsModel, which is
-    // file-backed (state.json) and refreshes on its own 5s timer, whereas
-    // this refreshes on the same 120s API cadence as chatsModel/planFit/graph.
+    // file-backed (state.json) and refreshes on its own 10s timer. Item 3
+    // amendment: this used to ride along with chat_conversations on the
+    // 120s API timer, but that read as sluggish for something meant to
+    // reflect "is Claude working right now" — it now has its own 30s timer
+    // (ChatsFetcher.refreshRecentsOnly(), a dedicated /recents-only JS
+    // round-trip) — see cloudSessionsTimer below. 30s (not the 10s local
+    // sessions get) is the architect's chosen ceiling against an
+    // authenticated claude.ai internal endpoint: faster risks
+    // rate-limiting/abuse flags on the user's session cookie.
     private let cloudSessionsModel = CloudSessionsModel()
     private let planFitModel = PlanFitModel()
     private let graphModel = GraphModel()
@@ -26,6 +33,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var dataTimer: Timer?
     private var uiTimer: Timer?
     private var sessionsTimer: Timer?
+    /// Item 3 amendment: cloud sessions' own 30s cadence — see
+    /// cloudSessionsModel's doc comment above.
+    private var cloudSessionsTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
     // Panel sizing: fixed width, height computed from which of the three
@@ -108,10 +118,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // How often we hit claude.ai's usage endpoint. Kept conservative on
-    // purpose — this is an unofficial, undocumented endpoint and there's no
-    // reason to hammer it for a number that only needs to feel "roughly live".
+    // How often we hit claude.ai's usage/chat_conversations endpoints. Kept
+    // conservative on purpose — these are unofficial, undocumented endpoints
+    // and there's no reason to hammer them for numbers that only need to
+    // feel "roughly live". Item 3: split refresh cadences — this 120s lane
+    // now covers only UsageFetcher/ChatsFetcher's chat_conversations/
+    // PlanFitModel/GraphModel. Local sessions (state.json) refresh every
+    // 10s (sessionsTimer below) and cloud sessions (/recents) refresh every
+    // 30s (cloudSessionsTimer below) — both cheaper/more time-sensitive than
+    // this lane, so they don't need to wait a full 2 minutes to reflect a
+    // session that just started or finished.
     private let refreshInterval: TimeInterval = 120
+    /// Item 3: local (state.json-backed) sessions refresh cadence — fast
+    /// enough that a session's status dot/age label feels responsive
+    /// without meaningfully increasing local disk I/O (state.json is small
+    /// and this is a plain file read, not a network call).
+    private let sessionsRefreshInterval: TimeInterval = 10
+    /// Item 3 amendment: cloud sessions (/recents) refresh cadence — see
+    /// cloudSessionsModel's doc comment for why this is 30s rather than the
+    /// 10s local sessions get.
+    private let cloudSessionsRefreshInterval: TimeInterval = 30
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // no Dock icon, no app switcher entry
@@ -134,6 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.fetcher.refresh()
             self?.chatsFetcher.refresh()
+            self?.chatsFetcher.refreshRecentsOnly()
         }
 
         // Plan fit and the graph data both read local files (no webview
@@ -142,6 +169,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         planFitModel.refresh()
         graphModel.refresh()
 
+        // Item 3: this 120s lane no longer touches cloud sessions — see
+        // cloudSessionsTimer below for that lane's own, faster cadence.
         dataTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.fetcher.refresh()
             self?.chatsFetcher.refresh()
@@ -150,14 +179,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         uiTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.model.tick()
-            self?.sessionsModel.tick()
             self?.chatsModel.tick()
             self?.cloudSessionsModel.tick()
         }
 
+        // Item 3: split out of the old shared 5s cadence into its own fast
+        // lane — this is ONLY the cheap local-file work (state.json read +
+        // the `now` tick that drives session age labels/status dots),
+        // nothing here ever touches the network. `tick()` runs right before
+        // `refresh()` each cycle so `now` and the freshly-read state agree
+        // with each other on the same beat.
+        sessionsModel.tick()
         sessionsModel.refresh()
-        sessionsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        sessionsTimer = Timer.scheduledTimer(withTimeInterval: sessionsRefreshInterval, repeats: true) { [weak self] _ in
+            self?.sessionsModel.tick()
             self?.sessionsModel.refresh()
+        }
+
+        // Item 3 amendment: cloud sessions' own 30s lane — a dedicated
+        // /recents-only JS round-trip (ChatsFetcher.refreshRecentsOnly(),
+        // which guards against overlapping in-flight fetches internally),
+        // distinct from chat_conversations/usage's 120s lane above.
+        cloudSessionsTimer = Timer.scheduledTimer(withTimeInterval: cloudSessionsRefreshInterval, repeats: true) { [weak self] _ in
+            self?.chatsFetcher.refreshRecentsOnly()
         }
 
         sessionsModel.$sessionsExpanded
@@ -247,6 +291,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func refreshNow() {
         fetcher.refresh()
         chatsFetcher.refresh()
+        chatsFetcher.refreshRecentsOnly()
+        sessionsModel.tick()
+        sessionsModel.refresh()
     }
 
     @objc private func toggleSessionsSection() {

@@ -41,13 +41,24 @@ import Foundation
 /// like code_session's `cse_...`) was never observed, so it's NOT safe to
 /// assume `https://claude.ai/chat/{id}` deep-links correctly for those.
 ///
-/// Item 4 ("cloud sessions are invisible"): the JS below now also fetches
-/// `GET .../recents` in the same round-trip (same org/credentials, no extra
-/// navigation) and keeps only its `code_session`-typed items — these are
+/// Item 4 ("cloud sessions are invisible"): fetches `GET .../recents` and
+/// keeps only its `code_session`/`cowork_session`-typed items — these are
 /// Cowork/Code sessions running entirely server-side, which write no local
 /// file and so never appear in SessionsModel/state.json. Results are handed
 /// to CloudSessionsModel, which filters out anything whose id is already
 /// tracked locally (see `localSessionIds`) before OverlayView shows them.
+///
+/// Item 3 amendment: this used to ride along with chat_conversations in
+/// `refresh()`'s single round-trip, both on the same 120s timer. Cloud
+/// sessions needed a much faster cadence to feel "live" (they're the only
+/// signal a Cowork/Code session running purely server-side is even
+/// working), but chat_conversations/usage don't — so `refreshRecentsOnly()`
+/// below is now a separate, dedicated `/recents`-only JS round-trip driven
+/// by its own 30s timer in AppDelegate, while `refresh()` sticks to
+/// chat_conversations on the original 120s cadence. 30s (not the local
+/// sessions' 10s) is the ceiling here: this is an authenticated claude.ai
+/// internal endpoint, and polling it faster risks rate-limiting/abuse flags
+/// on the user's session cookie.
 final class ChatsFetcher {
     private let session: ClaudeWebSession
     private let model: ChatsModel
@@ -78,7 +89,9 @@ final class ChatsFetcher {
         self.onLoginNeeded = onLoginNeeded
     }
 
-    /// Call periodically (shares AppDelegate's usage refresh cadence).
+    /// Call periodically (shares AppDelegate's usage refresh cadence, 120s).
+    /// Item 3 amendment: no longer also fetches /recents — that moved to
+    /// `refreshRecentsOnly()` below on its own, faster 30s cadence.
     func refresh() {
         let script = """
         try {
@@ -116,6 +129,45 @@ final class ChatsFetcher {
             updated_at: item.updated_at || item.updatedAt || null
           })).filter(c => c.uuid);
 
+          return { ok: true, chats: chats };
+        } catch (e) {
+          return { error: String(e) };
+        }
+        """
+
+        session.run(script: script) { [weak self] result in
+            self?.handle(result: result)
+        }
+    }
+
+    /// Item 3 amendment: guards against overlapping in-flight fetches — if
+    /// the previous 30s tick's round-trip hasn't returned yet (slow
+    /// network, webview hiccup), this tick is skipped rather than stacking
+    /// a second concurrent JS call onto the same shared webview.
+    private var recentsInFlight = false
+
+    /// Fetches ONLY `/recents` (not chat_conversations) — see this file's
+    /// header comment for why this is split out from `refresh()` and on its
+    /// own 30s timer (AppDelegate's cloudSessionsTimer). Re-resolves the org
+    /// id itself each call rather than caching it, since this genuinely is
+    /// an independent round-trip now (not a shared context with refresh()),
+    /// and `/organizations` is a cheap, small call.
+    func refreshRecentsOnly() {
+        guard !recentsInFlight else {
+            NSLog("[ChatsFetcher] recents-only fetch skipped: previous fetch still in flight")
+            return
+        }
+        recentsInFlight = true
+
+        let script = """
+        try {
+          const orgsRes = await fetch('https://claude.ai/api/organizations', { credentials: 'include' });
+          if (orgsRes.status === 401 || orgsRes.status === 403) { return { loggedOut: true }; }
+          if (!orgsRes.ok) { return { error: 'orgs_http_' + orgsRes.status }; }
+          const orgs = await orgsRes.json();
+          if (!orgs || orgs.length === 0) { return { error: 'no_orgs' }; }
+          const orgId = orgs[0].uuid;
+
           // Item 4: cloud-only sessions. /recents aggregates the
           // "chat"/"code"/"cowork" surfaces. Root-caused 2026-07-18 via a
           // temporary full-payload dump (removed after diagnosis): items
@@ -127,65 +179,48 @@ final class ChatsFetcher {
           // it was right there in the response, sorted first (this endpoint
           // returns newest-updated-first already). Both types are Cowork/
           // Code sessions running server-side with no local file, so both
-          // belong in the cloud-sessions list. Fetched in this same
-          // round-trip since it's the same org/credentials call as
-          // chat_conversations above. Defensive: this is a second,
-          // less-verified endpoint — a failure or shape change here must
-          // never fail the whole refresh, since chats are the primary
-          // payload.
-          let cloudSessions = [];
-          let cloudSessionsRawShape = null;
-          try {
-            const recentsRes = await fetch('https://claude.ai/api/organizations/' + orgId + '/recents', { credentials: 'include' });
-            if (recentsRes.ok) {
-              const recentsBody = await recentsRes.text();
-              let recentsParsed;
-              try { recentsParsed = JSON.parse(recentsBody); } catch (e) { recentsParsed = null; }
-              const recentsList = Array.isArray(recentsParsed)
-                ? recentsParsed
-                : (recentsParsed && Array.isArray(recentsParsed.data) ? recentsParsed.data
-                   : (recentsParsed && Array.isArray(recentsParsed.items) ? recentsParsed.items
-                      : (recentsParsed && Array.isArray(recentsParsed.recents) ? recentsParsed.recents : null)));
-              if (recentsList) {
-                cloudSessions = recentsList
-                  .filter(item => item && (item.type === 'code_session' || item.type === 'cowork_session'))
-                  .map(item => ({
-                    id: item.id || item.uuid || '',
-                    title: item.title || item.name || item.summary || '',
-                    updated_at: item.updated_at || item.updatedAt || null,
-                    // Status classification item: /recents items carry a
-                    // coarse `status` field plus a `worker_status` field
-                    // specifically describing what the underlying
-                    // Code/Cowork worker process is doing right now (e.g.
-                    // observed "running" on an actively-executing session).
-                    // Passed through raw (not interpreted here) so
-                    // CloudSessionsModel can map them — see this file's
-                    // header comment for what's been verified vs. not.
-                    status: item.status || null,
-                    worker_status: item.worker_status || item.workerStatus || null
-                  }))
-                  .filter(c => c.id);
-                if (cloudSessions.length === 0 && recentsList.length > 0) {
-                  cloudSessionsRawShape = 'recents_no_session_items:' + JSON.stringify(recentsList[0]).slice(0, 300);
-                }
-              } else {
-                cloudSessionsRawShape = 'recents_unexpected_shape:' + JSON.stringify(recentsParsed).slice(0, 300);
-              }
-            } else {
-              cloudSessionsRawShape = 'recents_http_' + recentsRes.status;
-            }
-          } catch (e) {
-            cloudSessionsRawShape = 'recents_exception:' + String(e);
+          // belong in the cloud-sessions list.
+          const recentsRes = await fetch('https://claude.ai/api/organizations/' + orgId + '/recents', { credentials: 'include' });
+          if (recentsRes.status === 401 || recentsRes.status === 403) { return { loggedOut: true }; }
+          if (!recentsRes.ok) { return { error: 'recents_http_' + recentsRes.status }; }
+          const recentsBody = await recentsRes.text();
+          let recentsParsed;
+          try { recentsParsed = JSON.parse(recentsBody); } catch (e) { return { error: 'parse_error_' + String(e) }; }
+          const recentsList = Array.isArray(recentsParsed)
+            ? recentsParsed
+            : (recentsParsed && Array.isArray(recentsParsed.data) ? recentsParsed.data
+               : (recentsParsed && Array.isArray(recentsParsed.items) ? recentsParsed.items
+                  : (recentsParsed && Array.isArray(recentsParsed.recents) ? recentsParsed.recents : null)));
+          if (!recentsList) {
+            return { error: 'unexpected_shape' };
           }
+          const cloudSessions = recentsList
+            .filter(item => item && (item.type === 'code_session' || item.type === 'cowork_session'))
+            .map(item => ({
+              id: item.id || item.uuid || '',
+              title: item.title || item.name || item.summary || '',
+              updated_at: item.updated_at || item.updatedAt || null,
+              // Status classification item: /recents items carry a coarse
+              // `status` field plus a `worker_status` field specifically
+              // describing what the underlying Code/Cowork worker process
+              // is doing right now (e.g. observed "running" on an
+              // actively-executing session). Passed through raw (not
+              // interpreted here) so CloudSessionsModel can map them — see
+              // that model's header comment for what's verified vs. not.
+              status: item.status || null,
+              worker_status: item.worker_status || item.workerStatus || null
+            }))
+            .filter(c => c.id);
 
-          return { ok: true, chats: chats, cloudSessions: cloudSessions, cloudSessionsRawShape: cloudSessionsRawShape };
+          return { ok: true, cloudSessions: cloudSessions };
         } catch (e) {
           return { error: String(e) };
         }
         """
 
         session.run(script: script) { [weak self] result in
-            self?.handle(result: result)
+            self?.recentsInFlight = false
+            self?.handleRecentsOnly(result: result)
         }
     }
 
@@ -218,35 +253,59 @@ final class ChatsFetcher {
                 model.lastError = nil
                 model.apply(chats: chats)
                 NSLog("[ChatsFetcher] fetched %d conversations", chats.count)
-
-                // Item 4: apply cloud sessions regardless of shape success —
-                // apply(raw:localIds:localTitles:) degrades to an empty list
-                // on its own if `raw` is empty, and a shape mismatch here
-                // (logged below) must never affect the chats path above.
-                let cloudRaw = dict["cloudSessions"] as? [[String: Any]] ?? []
-                if let rawShape = dict["cloudSessionsRawShape"] as? String {
-                    NSLog("[ChatsFetcher] cloud sessions unexpected shape: %@", rawShape)
-                }
-                // Status classification item: log the raw status/worker_status
-                // combos actually coming back so the mapping in
-                // CloudSessionsModel can be verified/tuned against real data
-                // rather than guessed — see that model's `mapWorkStatus`.
-                let statusCombos = Set(cloudRaw.map { item -> String in
-                    let s = (item["status"] as? String) ?? "nil"
-                    let w = (item["worker_status"] as? String) ?? "nil"
-                    return "status=\(s) worker_status=\(w)"
-                })
-                if !statusCombos.isEmpty {
-                    NSLog("[ChatsFetcher] cloud session status/worker_status combos observed: %@", statusCombos.sorted().joined(separator: " | "))
-                }
-                let localIds = localSessionIds()
-                let localTitles = localSessionTitles()
-                cloudSessions.apply(raw: cloudRaw, localIds: localIds, localTitles: localTitles)
-                NSLog("[ChatsFetcher] cloud sessions: %d raw, %d after local-id/title filter+cap (%d local ids, %d local titles known)", cloudRaw.count, cloudSessions.sessions.count, localIds.count, localTitles.count)
                 return
             }
             model.lastError = "Unexpected response shape"
             NSLog("[ChatsFetcher] unexpected dict shape, keys=%@", Array(dict.keys).description)
+        }
+    }
+
+    /// Item 3 amendment: handles `refreshRecentsOnly()`'s response. Deliberately
+    /// does not touch `model`/`model.lastError` (that's chats' own state,
+    /// unrelated to this endpoint) — a failure here is logged only, same
+    /// "defensive, never affects the sibling payload" spirit as the old
+    /// combined handler had for cloud sessions.
+    private func handleRecentsOnly(result: Result<Any, Error>) {
+        switch result {
+        case .failure(let error):
+            NSLog("[ChatsFetcher] recents-only JS bridge error: %@", error.localizedDescription)
+
+        case .success(let value):
+            guard let dict = value as? [String: Any] else {
+                NSLog("[ChatsFetcher] recents-only unexpected top-level response (not a dict)")
+                return
+            }
+            if let loggedOut = dict["loggedOut"] as? Bool, loggedOut {
+                model.isLoggedOut = true
+                NSLog("[ChatsFetcher] recents-only loggedOut")
+                onLoginNeeded()
+                return
+            }
+            if let err = dict["error"] as? String {
+                NSLog("[ChatsFetcher] recents-only error=%@", err)
+                return
+            }
+            guard let ok = dict["ok"] as? Bool, ok else {
+                NSLog("[ChatsFetcher] recents-only unexpected dict shape, keys=%@", Array(dict.keys).description)
+                return
+            }
+            let cloudRaw = dict["cloudSessions"] as? [[String: Any]] ?? []
+            // Status classification item: log the raw status/worker_status
+            // combos actually coming back so the mapping in
+            // CloudSessionsModel can be verified/tuned against real data
+            // rather than guessed — see that model's `mapWorkStatus`.
+            let statusCombos = Set(cloudRaw.map { item -> String in
+                let s = (item["status"] as? String) ?? "nil"
+                let w = (item["worker_status"] as? String) ?? "nil"
+                return "status=\(s) worker_status=\(w)"
+            })
+            if !statusCombos.isEmpty {
+                NSLog("[ChatsFetcher] cloud session status/worker_status combos observed: %@", statusCombos.sorted().joined(separator: " | "))
+            }
+            let localIds = localSessionIds()
+            let localTitles = localSessionTitles()
+            cloudSessions.apply(raw: cloudRaw, localIds: localIds, localTitles: localTitles)
+            NSLog("[ChatsFetcher] cloud sessions: %d raw, %d after local-id/title filter+cap (%d local ids, %d local titles known)", cloudRaw.count, cloudSessions.sessions.count, localIds.count, localTitles.count)
         }
     }
 }

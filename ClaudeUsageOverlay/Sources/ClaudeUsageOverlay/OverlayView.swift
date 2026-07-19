@@ -262,12 +262,13 @@ struct OverlayView: View {
         }
     }
 
-    private func statusColor(_ workStatus: SessionWorkStatus) -> Color {
-        switch workStatus {
-        case .running: return .green
-        case .needsInput: return .orange
-        case .idle: return .gray
-        }
+    /// Status classification item: title text dims to signal done/idle —
+    /// the dot's absence (see StatusIndicator) is the primary "this row is
+    /// done" cue, but graying the title too makes it unambiguous even
+    /// before you consciously notice a dot is missing. Running/needs-input
+    /// rows keep the normal bright title.
+    private func titleColor(_ workStatus: SessionWorkStatus?) -> Color {
+        (workStatus ?? .idle) == .idle ? .white.opacity(0.45) : .white.opacity(0.95)
     }
 
     /// Combined running/needs-input/done counts across the full (local +
@@ -320,16 +321,14 @@ struct OverlayView: View {
     @ViewBuilder
     private func sessionRow(_ entry: SessionEntry) -> some View {
         HStack(spacing: 6) {
-            // Status classification item: unified running(green)/needs-input
-            // (orange)/idle(gray) dot, same language cloudSessionRow uses.
-            // Falls back to the legacy blue(active)/orange(waiting) dot when
-            // `workStatus` is nil — a daemon build from before this field
-            // existed hasn't written it into state.json yet, and there's
-            // nothing here to classify with in that case.
-            Circle()
-                .fill(entry.workStatus.map(statusColor) ?? (entry.isActive ? Color.blue : Color.orange))
-                .frame(width: 6, height: 6)
-                .help(entry.workStatus?.label ?? (entry.isActive ? "Active" : "Rate-limited, waiting to resume"))
+            // Status classification item: unified running(pulsing
+            // green)/needs-input(amber)/idle(no dot) indicator, same
+            // language cloudSessionRow uses. A daemon build predating
+            // `work_status` (nil) degrades to the idle/done treatment —
+            // there's no classification to draw from in that case, and
+            // idle is the safer default (never wrongly implies the row
+            // needs attention).
+            StatusIndicator(workStatus: entry.workStatus)
 
             VStack(alignment: .leading, spacing: 1) {
                 // The session's own title (e.g. "Test session do nothing")
@@ -338,12 +337,12 @@ struct OverlayView: View {
                 // this used to show.
                 Text(entry.displayTitle)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white.opacity(0.95))
+                    .foregroundColor(titleColor(entry.workStatus))
                     .lineLimit(1)
                 if entry.displayTitle != entry.projectName {
                     Text(entry.projectName)
                         .font(.system(size: 8.5))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor((entry.workStatus ?? .idle) == .idle ? .white.opacity(0.25) : .white.opacity(0.4))
                         .lineLimit(1)
                 }
                 if entry.needsAttention {
@@ -391,32 +390,26 @@ struct OverlayView: View {
                             .font(.system(size: 8))
                             .foregroundColor(.red.opacity(0.9))
                     }
-                    Toggle("", isOn: Binding(
-                        get: { entry.resumeArmed },
-                        set: { sessions.setResumeArmed(entry.id, $0) }
-                    ))
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .labelsHidden()
-                    .tint(.red)
+                    // Toggle styling item: custom-drawn switch (CompactSwitch)
+                    // replaces SwiftUI's native Toggle(.switch) here — see
+                    // OverlayControls.swift's header comment for why (.tint
+                    // doesn't reliably render on this control at .mini size
+                    // on this macOS build). Saturated red track when armed.
+                    CompactSwitch(isOn: entry.resumeArmed, tint: Color(nsColor: .systemRed)) {
+                        sessions.setResumeArmed(entry.id, !entry.resumeArmed)
+                    }
                 }
                 .help(entry.resumeArmed
                       ? "Armed: the daemon will attempt to auto-resume this Cowork session via UI automation (currently dry-run only — logs intent, does not click anything)"
                       : "Arm auto-resume for this Cowork session via UI automation of Claude Desktop's Resume space (currently dry-run only)")
             } else {
-                // Toggle styling item: iOS-Settings-style saturated green
-                // track when on (replacing the previous default/blue system
-                // tint) — this is now the sole visual indicator that
-                // auto-resume is armed for this row, since the row
-                // background tint below was removed.
-                Toggle("", isOn: Binding(
-                    get: { entry.enabled },
-                    set: { sessions.setEnabled(entry.id, $0) }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .labelsHidden()
-                .tint(.green)
+                // Toggle styling item: custom-drawn switch (CompactSwitch),
+                // saturated green track when on — this is now the sole
+                // visual indicator that auto-resume is armed for this row,
+                // since the row background tint was removed previously.
+                CompactSwitch(isOn: entry.enabled, tint: Color(nsColor: .systemGreen)) {
+                    sessions.setEnabled(entry.id, !entry.enabled)
+                }
                 .help(entry.isActive ? "Auto-resume if this session hits a rate limit" : "Auto-resume when the limit resets")
             }
         }
@@ -448,41 +441,45 @@ struct OverlayView: View {
     @ViewBuilder
     private func cloudSessionRow(_ entry: CloudSessionEntry) -> some View {
         let active = cloudSessions.isActive(entry)
+        // Status classification item: idle/done rows gray out regardless of
+        // `active` (updated-recently) — a session that finished cleanly
+        // shouldn't read as "bright" just because it was touched a few
+        // minutes ago. Running/needs-input rows keep the existing
+        // recency-driven brightness.
+        let isDone = entry.workStatus == .idle
         HStack(spacing: 6) {
-            // Status classification item: same running(green)/needs-input
-            // (orange)/idle(gray) dot language as sessionRow — replaces the
-            // old green(recently-updated)/gray dot, which conflated "updated
-            // recently" with "Claude is actively working" (not the same
-            // thing; `active`/isActive below still separately drives the
-            // brighter-text treatment for a recently-touched row).
-            Circle()
-                .fill(statusColor(entry.workStatus))
-                .frame(width: 6, height: 6)
-                .help(entry.workStatus.label)
+            // Status classification item: same running(pulsing
+            // green)/needs-input(amber)/idle(no dot) language as
+            // sessionRow — replaces the old green(recently-updated)/gray
+            // dot, which conflated "updated recently" with "Claude is
+            // actively working" (not the same thing; `active`/isActive
+            // below still separately drives the brighter-text treatment
+            // for a recently-touched, non-done row).
+            StatusIndicator(workStatus: entry.workStatus)
 
             Image(systemName: "cloud.fill")
                 .font(.system(size: 9))
-                .foregroundColor(.cyan.opacity(active ? 0.95 : 0.5))
+                .foregroundColor(.cyan.opacity(isDone ? 0.35 : (active ? 0.95 : 0.5)))
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(entry.displayTitle)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white.opacity(active ? 0.95 : 0.55))
+                    .foregroundColor(isDone ? .white.opacity(0.45) : .white.opacity(active ? 0.95 : 0.55))
                     .lineLimit(1)
                 Text("cloud session")
                     .font(.system(size: 8, weight: .medium))
-                    .foregroundColor(.cyan.opacity(active ? 0.6 : 0.35))
+                    .foregroundColor(.cyan.opacity(isDone ? 0.25 : (active ? 0.6 : 0.35)))
             }
 
             Spacer()
 
             Text(cloudSessions.relativeText(for: entry.updatedAt))
                 .font(.system(size: 8.5))
-                .foregroundColor(active ? .green.opacity(0.85) : .white.opacity(0.4))
+                .foregroundColor(isDone ? .white.opacity(0.3) : (active ? .green.opacity(0.85) : .white.opacity(0.4)))
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 6)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.cyan.opacity(active ? 0.14 : 0.06)))
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.cyan.opacity(isDone ? 0.05 : (active ? 0.14 : 0.06))))
     }
 
     // MARK: - Recent chats

@@ -77,7 +77,7 @@ LOCK_FILE = STATE_DIR / "state.json.lock"
 LOG_DIR = STATE_DIR / "logs"
 DAEMON_LOG = STATE_DIR / "daemon.log"
 
-POLL_INTERVAL_SECONDS = 30
+POLL_INTERVAL_SECONDS = 10
 # Usage analytics run much less often than the session poll. Collection is
 # incremental (byte offsets) so an hourly cadence loses nothing; pricing
 # refresh hits the network, so at most daily.
@@ -456,8 +456,9 @@ def scan_sessions(state: dict) -> None:
                 existing["resets_at"] = resets_at
                 existing["last_seen"] = now
                 # Item 5: `last_seen` above is poll-cycle bookkeeping — it
-                # gets bumped to `now` every ~30s cycle this session's file
-                # is still inside SCAN_WINDOW_MINUTES, regardless of whether
+                # gets bumped to `now` every ~10s cycle (item 3: widget/daemon
+                # cadences tightened from 30s) this session's file is still
+                # inside SCAN_WINDOW_MINUTES, regardless of whether
                 # it was actually touched again, so it's useless as an
                 # "activity age" signal (it would just always read "just
                 # now" until the entry ages out and disappears). `mtime`
