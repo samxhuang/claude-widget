@@ -113,82 +113,297 @@ PRUNE_AFTER_HOURS = 48
 ACTIVE_STALE_MINUTES = ACTIVE_WINDOW_MINUTES * 2
 # Per-session "work_status" classification (running / needs_input / idle),
 # additive to the existing active/waiting `status` field (which resume logic
-# depends on and which this does NOT change). A session touched this
-# recently is "running" outright, regardless of what its last event looks
-# like — tool calls (bash commands, subagent work) can legitimately take
-# longer than this. Only once a session has been quiet for longer than this
-# do we look at the *shape* of its last event to tell "stuck waiting on a
-# permission prompt" apart from "turn finished cleanly." Empirically (see
-# classify_work_status's docstring), Claude Code's jsonl transcripts have no
-# dedicated "permission requested"/"approval" event type to key off of — the
-# reliable signal is structural: an assistant turn's last content block is a
-# tool_use with no subsequent tool_result event.
+# depends on and which this does NOT change).
+#
+# Redesigned 2026-07-19 from live ground-truth sessions (one sitting on a
+# permission prompt, one running a background subagent, one mid-agentic-work
+# with a pending Agent tool call). Empirical findings the rules below rest on:
+#
+#   * There is still no "permission_request"-style event type in the jsonl.
+#     BUT: the assistant `tool_use` event IS flushed to the transcript the
+#     moment the call is issued — i.e. while the permission prompt is on
+#     screen the file's last conversational event is that pending tool_use,
+#     and the file then goes quiet (observed live: pending Bash tool_use as
+#     the literal last line, file mtime frozen for minutes, prompt visible
+#     in the UI the whole time).
+#   * A pending tool_use is structurally IDENTICAL whether it's waiting for
+#     approval or actually executing (same keys: id/name/input/caller — no
+#     approval marker ever appears). The discriminators live OUTSIDE the
+#     main transcript:
+#       - ~/.claude/sessions/<pid>.json maps every live session process to
+#         its sessionId ({"pid": ..., "sessionId": ..., ...}). This gives a
+#         precise session -> process handle.
+#       - While a Bash tool is EXECUTING, the session process has a child
+#         shell whose command line sources ~/.claude/shell-snapshots/
+#         snapshot-*.sh (observed live under the working session's pid;
+#         absent under the permission-blocked session's pid). Permission
+#         prompts happen BEFORE the shell is spawned, so:
+#         pending Bash + no shell child  => waiting on approval.
+#       - Subagent (Agent/Task tool) work is written to sibling
+#         <session_id>/subagents/agent-*.jsonl files, and large streamed
+#         tool output to <session_id>/tool-results/*.txt — both keep fresh
+#         mtimes while the parent transcript sits on the pending Agent
+#         tool_use (observed: parent quiet 15+ min, subagent file mtime
+#         seconds old). Fresh sidecar => running, no matter how quiet the
+#         parent file is.
+#   * A cleanly finished turn is explicit in-band: the final assistant event's
+#     message carries stop_reason == "end_turn" (mid-turn blocks carry
+#     "tool_use"). So "idle" no longer needs a 90s quiet window — end_turn
+#     with no fresh sidecar activity is idle immediately.
 WORK_STATUS_RUNNING_WINDOW_SECONDS = 90
 # Tools whose entire purpose is to block on the human. A pending call to one
-# of these means "needs input" the moment it's issued — no quiet-window wait
-# (unlike ordinary tools, where a pending call usually just means the tool is
-# still executing).
+# of these means "needs input" the moment it's issued.
 USER_INPUT_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+# Tools that delegate to a subagent; their liveness signal is the
+# subagents/ sidecar dir, not the main transcript.
+SUBAGENT_TOOLS = {"Agent", "Task"}
+# In-process tools that complete in well under a second when approved — a
+# pending call to one of these that is older than a few seconds can only be
+# a permission prompt.
+INSTANT_TOOLS = {
+    "Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Glob", "Grep",
+    "LS", "TodoWrite", "BashOutput", "KillShell", "TaskStop",
+}
+# Grace before a pending call to an INSTANT_TOOL counts as a permission
+# prompt (covers the flush -> execute -> result-write race).
+PENDING_INSTANT_GRACE_SECONDS = 10
+# Grace for everything else we can't observe from outside (WebFetch, MCP
+# tools, and Bash when no process table is available): these legitimately
+# run for a while with zero on-disk footprint.
+PENDING_SLOW_GRACE_SECONDS = 60
+
+SESSIONS_DIR = HOME / ".claude" / "sessions"
+# Command-line substrings that identify a tool child process actually
+# executing under a session's pid (Bash tool shells source a shell-snapshot
+# on startup; sandboxed variants wrap the same thing).
+_TOOL_CHILD_MARKERS = (".claude/shell-snapshots/", "sandbox-exec")
 
 
-def classify_work_status(objs: list[dict], mtime: float, now: float) -> str:
-    """Classifies a CLI session's transcript as "running", "needs_input", or
-    "idle" for the widget's per-row status dot.
+def collect_runtime_snapshot() -> dict:
+    """Once-per-cycle process-level signals shared by every session's
+    classification: which live process owns which session (from
+    ~/.claude/sessions/<pid>.json), and which of those processes currently
+    have a tool child actually executing (a shell sourcing a
+    ~/.claude/shell-snapshots snapshot). One ps fork + a handful of tiny
+    JSON reads per cycle."""
+    procs = []
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        procs.append((pid, ppid, parts[2] if len(parts) > 2 else ""))
 
-    Evidence gathered 2026-07-19 against real transcripts in
-    ~/.claude/projects/-Users-sam-git-claude-widget/*.jsonl (including this
-    very conversation's own session while an agent was actively running in
-    it) and a broad scan across every session file under ~/.claude/projects:
-    there is no explicit "permission_request"/"approval"-style event type in
-    these logs (checked every distinct top-level "type" value that appears
-    anywhere) — Claude Code doesn't log a separate marker for "blocked on a
-    permission prompt." The reliable structural signal instead: each
-    streamed content block (thinking / text / tool_use) is appended as its
-    own top-level jsonl object (not batched into one multi-block message
-    object), so the *last* conversational (type "assistant" or "user")
-    object in the file tells you exactly how the turn currently stands:
-      - last conversational object is "assistant" whose message content's
-        last block is type "tool_use" -> that tool call has no matching
-        "user"-type tool_result event yet (there's nothing after it) ->
-        execution is blocked on something, most commonly a permission
-        prompt.
-      - last conversational object is "user" with a tool_result (or any
-        other shape), or "assistant" ending in "text" -> the turn resolved
-        cleanly (tool finished, or Claude replied and stopped).
-    A pending tool_use is only "needs_input" if the session has ALSO gone
-    quiet for a while (WORK_STATUS_RUNNING_WINDOW_SECONDS) — a fresh pending
-    tool_use just means a tool is still running (e.g. a slow Bash command or
-    a subagent mid-flight), not that a human needs to approve anything.
+    alive = {pid for pid, _, _ in procs}
+    parent_of = {pid: ppid for pid, ppid, _ in procs}
+    busy_pids = set()
+    for pid, ppid, cmd in procs:
+        if any(marker in cmd for marker in _TOOL_CHILD_MARKERS):
+            # Credit the executing shell to its ancestors (the session
+            # process is usually the direct parent; walk a couple levels to
+            # cover wrapper processes).
+            ancestor = ppid
+            for _ in range(3):
+                if ancestor in (0, 1):
+                    break
+                busy_pids.add(ancestor)
+                ancestor = parent_of.get(ancestor, 0)
 
-    Exception: some tools exist purely to wait on the human (AskUserQuestion,
-    ExitPlanMode's plan-approval prompt). A pending call to one of those IS
-    the session asking for input — classify needs_input immediately, no
-    quiet-window wait.
+    session_pids = {}
+    if SESSIONS_DIR.is_dir():
+        for f in SESSIONS_DIR.glob("*.json"):
+            try:
+                info = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            pid, sid = info.get("pid"), info.get("sessionId")
+            if isinstance(pid, int) and isinstance(sid, str) and pid in alive:
+                session_pids[sid] = pid
+
+    return {
+        "session_pids": session_pids,
+        "busy_pids": busy_pids,
+        "have_ps": bool(procs),
+    }
+
+
+def sidecar_activity_mtime(jsonl_path: Path) -> float:
+    """Most recent write to the session's sidecar activity files: subagent
+    transcripts (<session_id>/subagents/*.jsonl) and streamed big tool
+    outputs (<session_id>/tool-results/*). Fresh writes here mean work is
+    happening even while the main transcript is quiet."""
+    latest = 0.0
+    base = jsonl_path.parent / jsonl_path.stem
+    for sub in ("subagents", "tool-results"):
+        d = base / sub
+        if d.is_dir():
+            try:
+                for p in d.iterdir():
+                    try:
+                        latest = max(latest, p.stat().st_mtime)
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+    return latest
+
+
+def _parse_event_time(obj: dict) -> float | None:
+    ts = obj.get("timestamp")
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def classify_work_status(
+    objs: list[dict],
+    mtime: float,
+    now: float,
+    jsonl_path: Path | None = None,
+    session_id: str | None = None,
+    runtime: dict | None = None,
+) -> str:
+    """Classifies a session as "running", "needs_input", or "idle" for the
+    widget's per-row status dot. See the big comment above the constants for
+    the on-disk evidence each rule keys off.
+
+    Rules, in order:
+      1. Pending call to a USER_INPUT_TOOL (AskUserQuestion / ExitPlanMode)
+         -> needs_input immediately.
+      2. Session process has an executing tool child (shell-snapshot shell)
+         -> running (covers long Bash commands, including ones a subagent
+         is running — they spawn under the same session pid).
+      3. Fresh subagents/ or tool-results/ sidecar writes -> running
+         (background/parallel subagents keep working after the parent's
+         turn even ends).
+      4. Pending ordinary tool_use, none of the above: it's a permission
+         prompt once it outlives its grace — 0s for Bash when we can see
+         the process table (an executing Bash ALWAYS has a shell child, so
+         its absence is decisive within one poll cycle), ~10s for
+         in-process instant tools (Edit/Write/Read...), ~60s for
+         tools that run remotely/invisibly (WebFetch, MCP).
+      5. No pending call and the last assistant event says
+         stop_reason == "end_turn": the turn finished. If its closing text
+         ends with a question mark, Claude is (informally) asking the human
+         something -> needs_input; otherwise idle right away — no quiet
+         window needed.
+      6. Otherwise (mid-turn shapes: fresh human prompt, tool_result just
+         landed, streaming blocks): running while the transcript was
+         touched inside WORK_STATUS_RUNNING_WINDOW_SECONDS, else idle
+         (stalled/killed mid-turn, or streaming silently longer than the
+         window — accepted residual).
+
+    Text-question policy (rule 5): a turn that ends with "...?" reads as a
+    question to the human, so it gets the needs_input dot; anything else
+    that ended cleanly is idle. AskUserQuestion/plan-approval — the common,
+    structured ways Claude blocks on the human — are already caught by
+    rule 1, so this only affects informal trailing questions.
     """
+    runtime = runtime or {}
+    session_pids = runtime.get("session_pids") or {}
+    busy_pids = runtime.get("busy_pids") or set()
+    have_ps = bool(runtime.get("have_ps"))
+    pid = session_pids.get(session_id) if session_id else None
+    executing = pid is not None and pid in busy_pids
+
+    # --- walk the current turn backwards: newest conversational event and
+    # any tool_use calls not yet answered by a tool_result. tool_results
+    # always land after their tool_use, so scanning backwards we meet
+    # results before uses. The turn is bounded by a non-tool_result user
+    # event (a human/injected prompt) or a previous turn's end_turn.
+    result_ids = set()
+    pending = []  # (tool_name, event_time or None)
     last_conv = None
-    for obj in reversed(objs):
-        if obj.get("type") in ("assistant", "user"):
+    for obj in reversed(objs[-400:]):
+        obj_type = obj.get("type")
+        if obj_type not in ("assistant", "user"):
+            continue  # queue-operation / attachment / system / ai-title ...
+        message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        content = message.get("content")
+        if last_conv is None:
             last_conv = obj
-            break
+        if obj_type == "user":
+            saw_result = False
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        result_ids.add(block.get("tool_use_id"))
+                        saw_result = True
+            if not saw_result:
+                break  # human prompt: start of the current turn
+        else:
+            if isinstance(content, list):
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and block.get("id") not in result_ids
+                    ):
+                        pending.append((block.get("name") or "", _parse_event_time(obj)))
+            if obj is not last_conv and message.get("stop_reason") == "end_turn":
+                break  # previous turn's clean ending
 
-    pending_tool = None
-    if last_conv is not None and last_conv.get("type") == "assistant":
-        message = last_conv.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if (
-            isinstance(content, list)
-            and content
-            and isinstance(content[-1], dict)
-            and content[-1].get("type") == "tool_use"
-        ):
-            pending_tool = content[-1].get("name") or ""
-
-    if pending_tool in USER_INPUT_TOOLS:
+    # Rule 1: tools that exist to block on the human.
+    if any(name in USER_INPUT_TOOLS for name, _ in pending):
         return "needs_input"
+
+    # Rule 2: a tool child is executing right now under this session's pid.
+    if executing:
+        return "running"
+
+    # Rule 3: subagent / streamed-output sidecars are being written.
+    sidecar_ts = sidecar_activity_mtime(jsonl_path) if jsonl_path else 0.0
+    sidecar_fresh = sidecar_ts > 0 and (now - sidecar_ts) <= WORK_STATUS_RUNNING_WINDOW_SECONDS
+    if sidecar_fresh:
+        return "running"
+
+    # Rule 4: an unresolved ordinary tool call with no observable execution.
+    if pending:
+        ages = [now - ts for _, ts in pending if ts is not None]
+        age = min(ages) if ages else (now - mtime)
+        grace = 0.0
+        for name, _ in pending:
+            if name == "Bash" and have_ps and pid is not None:
+                tool_grace = 0.0  # executing Bash always has a shell child
+            elif name in INSTANT_TOOLS:
+                tool_grace = float(PENDING_INSTANT_GRACE_SECONDS)
+            else:
+                tool_grace = float(PENDING_SLOW_GRACE_SECONDS)
+            grace = max(grace, tool_grace)
+        return "running" if age <= grace else "needs_input"
+
+    # Rule 5: turn finished cleanly (explicit end_turn) — idle immediately,
+    # or needs_input if the closing text is an informal question.
+    if last_conv is not None and last_conv.get("type") == "assistant":
+        message = last_conv.get("message") if isinstance(last_conv.get("message"), dict) else {}
+        if message.get("stop_reason") == "end_turn":
+            closing_text = ""
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        closing_text = block.get("text") or ""
+            if closing_text.rstrip().rstrip("*_`").endswith("?"):
+                return "needs_input"
+            return "idle"
+
+    # Rule 6: mid-turn (streaming, human prompt just sent, tool_result just
+    # landed) — running while recently touched.
     if (now - mtime) <= WORK_STATUS_RUNNING_WINDOW_SECONDS:
         return "running"
-    if pending_tool is not None:
-        return "needs_input"
     return "idle"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
@@ -339,15 +554,7 @@ def latest_activity_mtime(jsonl_path: Path) -> float:
     they were actively running. This returns the most recent mtime across
     the session's own file and any of its subagent transcripts, so
     delegated work counts as activity too."""
-    latest = jsonl_path.stat().st_mtime
-    subagents_dir = jsonl_path.parent / jsonl_path.stem / "subagents"
-    if subagents_dir.is_dir():
-        for sub_path in subagents_dir.glob("*.jsonl"):
-            try:
-                latest = max(latest, sub_path.stat().st_mtime)
-            except OSError:
-                continue
-    return latest
+    return max(jsonl_path.stat().st_mtime, sidecar_activity_mtime(jsonl_path))
 
 
 def scan_sessions(state: dict) -> None:
@@ -362,6 +569,7 @@ def scan_sessions(state: dict) -> None:
 
     now = time.time()
     scan_cutoff = now - SCAN_WINDOW_MINUTES * 60
+    runtime = collect_runtime_snapshot()
 
     for project_folder in PROJECTS_DIR.iterdir():
         if not project_folder.is_dir():
@@ -458,7 +666,10 @@ def scan_sessions(state: dict) -> None:
                 continue
 
             session_title = find_session_title(objs)
-            work_status = classify_work_status(objs, mtime, now)
+            work_status = classify_work_status(
+                objs, mtime, now,
+                jsonl_path=jsonl_path, session_id=session_id, runtime=runtime,
+            )
 
             if existing:
                 was_active = existing.get("status") == "active"
