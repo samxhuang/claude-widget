@@ -271,18 +271,19 @@ final class GraphModel: ObservableObject {
 
     /// Earliest instant the cost series has any data for — the boundary
     /// between "measured $0 because nothing ran" and "no measurement exists".
-    /// Daily keys are "YYYY-MM-DD" UTC (see plan_fit's cost_series).
+    /// The hour-resolution series is authoritative when present: a daily key
+    /// ("YYYY-MM-DD") can only parse as UTC midnight, and taking min() across
+    /// both series let that midnight shave hours off the true start (first
+    /// data 04:00 → 4 phantom hours of "coverage"), quietly deflating the
+    /// estimate relative to plan_fit's hourly-anchored run rate. Daily is a
+    /// fallback for the (currently hypothetical) case of daily-only data.
     private func costDataEarliest() -> Date? {
-        var earliest = hourlyCost.keys.min()
-        if let firstDaily = dailyCost.keys.min() {
-            let f = DateFormatter()
-            f.dateFormat = "yyyy-MM-dd"
-            f.timeZone = TimeZone(identifier: "UTC")
-            if let d = f.date(from: firstDaily), earliest == nil || d < earliest! {
-                earliest = d
-            }
-        }
-        return earliest
+        if let earliest = hourlyCost.keys.min() { return earliest }
+        guard let firstDaily = dailyCost.keys.min() else { return nil }
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.timeZone = TimeZone(identifier: "UTC")
+        return f.date(from: firstDaily)
     }
 
     /// "$18.42" when the cost data spans the whole period, "$18.42 · est $210"
