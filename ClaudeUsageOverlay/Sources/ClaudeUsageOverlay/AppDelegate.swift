@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = UsageModel()
     private let sessionsModel = SessionsModel()
     private let chatsModel = ChatsModel()
+    private let planFitModel = PlanFitModel()
     // One hidden, authenticated WKWebView shared by both fetchers — see
     // ClaudeWebSession's header comment for why this isn't two webviews.
     private let webSession = ClaudeWebSession()
@@ -20,14 +21,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sessionsTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
-    // Panel sizing: fixed width, height computed from which of the two
-    // collapsible sections (Sessions, Recent chats) are expanded. Anchored
-    // to the top-right corner of the screen — resizing only moves the
-    // bottom edge, never the top-right one.
+    // Panel sizing: fixed width, height computed from which of the three
+    // collapsible sections (Sessions, Recent chats, Plan fit) are expanded.
+    // Anchored to the top-right corner of the screen — resizing only moves
+    // the bottom edge, never the top-right one.
     private let panelWidth: CGFloat = 280
     private let collapsedPanelHeight: CGFloat = 214
     private let sessionsExpandedExtra: CGFloat = 290
     private let chatsExpandedExtra: CGFloat = 280
+    // Plan fit isn't wrapped in a ScrollView (unlike Sessions/Chats) since
+    // its content is a fixed handful of lines, so this needs to cover the
+    // full expanded height: up to 4 moving-average lines, the API-equivalent
+    // line, the peaks line, up to 3 tier lines, and the (possibly
+    // two-line-wrapped) maturity + recommendation text.
+    private let planFitExpandedExtra: CGFloat = 260
     private var panelTopY: CGFloat = 0
     private var panelRightX: CGFloat = 0
 
@@ -55,9 +62,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.chatsFetcher.refresh()
         }
 
+        // Plan fit reads a local file (no webview dependency), so it can
+        // refresh immediately rather than waiting on the webview navigation.
+        planFitModel.refresh()
+
         dataTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.fetcher.refresh()
             self?.chatsFetcher.refresh()
+            self?.planFitModel.refresh()
         }
         uiTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.model.tick()
@@ -85,6 +97,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] expanded in
                 self?.updatePanelSize()
                 self?.statusItem.menu?.item(withTitle: "Show Chats")?.state = expanded ? .on : .off
+            }
+            .store(in: &cancellables)
+
+        planFitModel.$planFitExpanded
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] expanded in
+                self?.updatePanelSize()
+                self?.statusItem.menu?.item(withTitle: "Show Plan Fit")?.state = expanded ? .on : .off
             }
             .store(in: &cancellables)
     }
@@ -117,6 +138,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chatsToggleItem.state = chatsModel.chatsExpanded ? .on : .off
         menu.addItem(chatsToggleItem)
 
+        let planFitToggleItem = NSMenuItem(title: "Show Plan Fit", action: #selector(togglePlanFitSection), keyEquivalent: "")
+        planFitToggleItem.target = self
+        planFitToggleItem.state = planFitModel.planFitExpanded ? .on : .off
+        menu.addItem(planFitToggleItem)
+
         menu.addItem(.separator())
         menu.addItem(withTitle: "Sign In…", action: #selector(presentLoginWindow), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Sign Out", action: #selector(signOut), keyEquivalent: "").target = self
@@ -137,6 +163,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleChatsSection() {
         chatsModel.chatsExpanded.toggle()
+    }
+
+    @objc private func togglePlanFitSection() {
+        planFitModel.planFitExpanded.toggle()
     }
 
     @objc private func toggleOverlay() {
@@ -176,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupOverlayPanel() {
         let initialHeight = currentPanelHeight()
 
-        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel))
+        let hosting = NSHostingView(rootView: OverlayView(model: model, sessions: sessionsModel, chats: chatsModel, planFit: planFitModel))
         // Without this, NSHostingView installs Auto Layout min/max-size
         // constraints on itself (macOS 13+ default: .standardBounds) that
         // reflect the SwiftUI content's intrinsic size — and since it's the
@@ -225,13 +255,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSRect(x: panelRightX - panelWidth, y: panelTopY - height, width: panelWidth, height: height)
     }
 
-    /// Sessions and Recent chats are independently collapsible, so the
-    /// panel's height is the collapsed base plus whichever of the two
-    /// sections' extra heights currently apply.
+    /// Sessions, Recent chats, and Plan fit are independently collapsible,
+    /// so the panel's height is the collapsed base plus whichever of the
+    /// three sections' extra heights currently apply.
     private func currentPanelHeight() -> CGFloat {
         var height = collapsedPanelHeight
         if sessionsModel.sessionsExpanded { height += sessionsExpandedExtra }
         if chatsModel.chatsExpanded { height += chatsExpandedExtra }
+        if planFitModel.planFitExpanded { height += planFitExpandedExtra }
         return height
     }
 

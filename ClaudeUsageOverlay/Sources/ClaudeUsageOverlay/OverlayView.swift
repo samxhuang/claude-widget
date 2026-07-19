@@ -5,6 +5,7 @@ struct OverlayView: View {
     @ObservedObject var model: UsageModel
     @ObservedObject var sessions: SessionsModel
     @ObservedObject var chats: ChatsModel
+    @ObservedObject var planFit: PlanFitModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -39,6 +40,10 @@ struct OverlayView: View {
             Divider().background(Color.white.opacity(0.15))
 
             chatsSection
+
+            Divider().background(Color.white.opacity(0.15))
+
+            planFitSection
         }
         .padding(EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12))
         .frame(width: 280)
@@ -285,6 +290,118 @@ struct OverlayView: View {
     private func openChat(_ uuid: String) {
         guard let url = URL(string: "https://claude.ai/chat/\(uuid)") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    // MARK: - Plan fit
+
+    @ViewBuilder
+    private var planFitSection: some View {
+        HStack {
+            Image(systemName: planFit.planFitExpanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundColor(.white.opacity(0.6))
+            Text("Plan fit")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+            Spacer()
+            if let plan = planFit.data?.currentPlan {
+                Text(planFit.displayName(forPlanKey: plan))
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.18)))
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            planFit.toggleExpanded()
+        }
+
+        if planFit.planFitExpanded {
+            if let data = planFit.data {
+                VStack(alignment: .leading, spacing: 6) {
+                    // Moving averages — one line per window, coverage
+                    // annotation only shown while the window is still
+                    // filling up. Missing windows are simply omitted.
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(["1d", "7d", "30d", "90d"], id: \.self) { key in
+                            if let w = data.movingAverages[key] {
+                                Text(planFit.movingAverageLine(key: key, window: w))
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.white.opacity(0.8))
+                            }
+                        }
+                    }
+
+                    if let apiEquiv = planFit.apiEquivalentText(data) {
+                        Text(apiEquiv)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(.white.opacity(0.9))
+                    }
+
+                    if let peaks = planFit.peaksText(data) {
+                        Text(peaks)
+                            .font(.system(size: 9))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+
+                    if !data.tiers.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(data.tiers, id: \.key) { tier in
+                                tierRow(tier)
+                            }
+                        }
+                    }
+
+                    if let maturity = data.dataMaturity {
+                        Text(maturity)
+                            .font(.system(size: 8))
+                            .foregroundColor(.white.opacity(0.35))
+                    }
+                    if let rec = data.recommendation {
+                        Text(rec)
+                            .font(.system(size: 8))
+                            .foregroundColor(.white.opacity(0.35))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            } else {
+                Text("collecting data…")
+                    .font(.system(size: 9))
+                    .foregroundColor(.white.opacity(0.4))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tierRow(_ tier: TierVerdict) -> some View {
+        HStack(spacing: 4) {
+            Text(tier.name)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.85))
+            if let price = planFit.priceText(tier) {
+                Text(price)
+                    .font(.system(size: 9))
+                    .foregroundColor(.white.opacity(0.55))
+            }
+            Spacer()
+            if let ratio = planFit.ratioText(tier) {
+                Text(ratio)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.white.opacity(0.8))
+            }
+            if let p5 = tier.projectedPeak5hUtil {
+                Text(String(format: "5h %.0f%%", p5))
+                    .font(.system(size: 8.5))
+                    .foregroundColor(tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.5))
+            }
+            if let p7 = tier.projectedPeak7dUtil {
+                Text(String(format: "7d %.0f%%", p7))
+                    .font(.system(size: 8.5))
+                    .foregroundColor(tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.5))
+            }
+        }
     }
 
     // MARK: - Usage rows

@@ -14,6 +14,10 @@ final class UsageFetcher {
     private let session: ClaudeWebSession
     private let model: UsageModel
     private let onLoginNeeded: () -> Void
+    // Owned here rather than injected: logging a snapshot is a pure side
+    // effect of a successful fetch, not something any other part of the app
+    // needs to see or control.
+    private let snapshotLogger = SnapshotLogger()
 
     init(session: ClaudeWebSession, model: UsageModel, onLoginNeeded: @escaping () -> Void) {
         self.session = session
@@ -69,6 +73,10 @@ final class UsageFetcher {
                 model.isLoggedOut = false
                 model.lastError = nil
                 model.apply(usage: usage)
+                // Feed the usage-analytics compactor. Only reached on a
+                // confirmed success (not error, not loggedOut), and the
+                // logger itself throttles to >=100s between writes.
+                snapshotLogger.record(usage: usage)
             }
         }
     }
