@@ -544,7 +544,16 @@ struct OverlayView: View {
                 budgetRowOrScaffold(label: "Weekly budget", window: data?.budgetWeekly)
             }
             if monthlyConfigured {
-                budgetRowOrScaffold(label: "Monthly budget", window: data?.budgetMonthly)
+                // Prefer the API's authoritative Spend Limit (Enterprise) over
+                // the daemon's locally-reconstructed monthly cost. Same dollar
+                // bar, but the number matches Claude Desktop's usage tab and
+                // needs no daemon / remote-host token collection. Falls back to
+                // the reconstructed budget when the account has no spend limit.
+                if let spendWindow = model.spendBudgetWindow {
+                    budgetRow(label: "Monthly spend", window: spendWindow)
+                } else {
+                    budgetRowOrScaffold(label: "Monthly budget", window: data?.budgetMonthly)
+                }
             }
         } else {
             Button(action: onOpenSettings) {

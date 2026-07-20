@@ -49,6 +49,31 @@ from page context. 401/403 on ANY endpoint ⇒ `.loggedOut`.
     relays `scopedLimits` to the daemon via
     `~/.claude-autoresume/usage/scoped_limits.json` (widget-owned on-disk
     format, same freeze rule as snapshots.jsonl) to arm auto-resume.
+- **`spend` / `extra_usage`** (observed 2026-07-20, Enterprise account): the
+  account's dollar Spend Limit — the authoritative figure Claude Desktop's
+  usage tab shows ("$4.04 of $1,000.00 spent"). Two blocks in the same
+  response carry it and agree; `decodeSpendLimit` prefers the structured
+  `spend`, falls back to flat `extra_usage`:
+  - `spend`: `{ used: { currency:"USD", amount_minor:404, exponent:2 },
+    limit: { currency:"USD", amount_minor:100000, exponent:2 },
+    cap: { money:null, credits:{ amount_minor, exponent } },
+    enabled:true, severity:"normal", percent, balance, disclaimer,
+    auto_reload, can_toggle, can_purchase_credits, disabled_reason }`.
+    Money is MINOR units + `exponent` (amount_minor 404, exponent 2 = $4.04).
+  - `extra_usage`: `{ used_credits:404, monthly_limit:100000, utilization:0.404,
+    currency:"USD", decimal_places:2, is_enabled, weekly, daily,
+    disabled_reason }` — same numbers, flat.
+  - Maps to `UsageReport.spendLimit: SpendLimit?`. **Max/Pro** return both
+    blocks but empty (`spend.limit:null`, `spend.enabled:false`,
+    `extra_usage.*:null`) ⇒ `decodeSpendLimit` yields **nil** (no bar).
+  - **No reset date** is present in this payload — Desktop's "resets on
+    <date>" is sourced elsewhere (a billing endpoint we don't call), so
+    `SpendLimit` has no `resetsAt`.
+  - Sibling keys `cinder_cove`, `omelette_promotional`, `iguana_necktie`,
+    `amber_ladder`, `nimbus_quill`, `tangelo`, `seven_day_*` are **volatile
+    internal codenames** (promotions/experiments) — `cinder_cove` even uses a
+    different shape (`used_dollars`/`limit_dollars` floats + `resets_at`). NOT
+    parsed; only `spend`/`extra_usage` are treated as stable.
 
 ### GET https://claude.ai/api/organizations/{uuid}/chat_conversations?limit=30
 Plain JSON array (confirmed HTTP 200 + valid JSON; wrong paths 404).

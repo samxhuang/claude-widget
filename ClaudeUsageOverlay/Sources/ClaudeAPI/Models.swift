@@ -77,12 +77,56 @@ public struct ScopedLimit {
     public let resetsAtRaw: String?
 }
 
+/// The account's dollar Spend Limit, parsed from the usage endpoint's
+/// `spend` object (Enterprise / spend-capped accounts). This is the
+/// authoritative figure Claude Desktop's usage tab shows — e.g. "$4.04 of
+/// $1,000.00 spent" — read straight from the API, NOT reconstructed from local
+/// token cost. Absent (nil) on plans without a spend limit (Max/Pro), where
+/// the `spend`/`extra_usage` blocks are missing.
+///
+/// Money is carried in MINOR units with an `exponent`, matching the API (USD
+/// exponent 2 ⇒ `amount_minor` 404 = $4.04). The reset date is NOT part of the
+/// usage payload — Desktop sources "resets on <date>" elsewhere — so there is
+/// deliberately no `resetsAt` here.
+public struct SpendLimit {
+    /// Spent so far, in minor currency units (cents for USD). 404 ⇒ $4.04.
+    public let spentMinor: Int
+    /// The cap, in minor units. 100000 ⇒ $1000.00.
+    public let limitMinor: Int
+    /// Minor-unit exponent (USD ⇒ 2): `amount / 10^exponent` = major units.
+    public let exponent: Int
+    /// ISO-4217 currency code ("USD").
+    public let currency: String
+    /// The API's own utilization percent (0–100+) when present, else nil (the
+    /// app then computes it from spent/limit). Observed as e.g. 0.404 = 0.404%.
+    public let utilizationPercent: Double?
+    /// Whether the API flags the spend limit as in effect.
+    public let enabled: Bool
+    /// API severity ("normal"/…); threshold hint / diagnostics.
+    public let severity: String?
+
+    private var divisor: Double { pow(10.0, Double(exponent)) }
+    /// Spent in major currency units (dollars). 404 (exp 2) ⇒ 4.04.
+    public var spentAmount: Double { Double(spentMinor) / divisor }
+    /// The cap in major units. 100000 (exp 2) ⇒ 1000.0.
+    public var limitAmount: Double { Double(limitMinor) / divisor }
+    /// Utilization percent: the API's value if given, else spent/limit·100.
+    public var percent: Double {
+        if let u = utilizationPercent { return u }
+        return limitMinor > 0 ? Double(spentMinor) / Double(limitMinor) * 100.0 : 0
+    }
+}
+
 public struct UsageReport {
     public let session: UsageWindow   // API's 5-hour window
     public let weekly: UsageWindow    // API's 7-day window
     /// Active per-model caps parsed from the usage `limits[]` array (empty
     /// when none apply). See ScopedLimit.
     public let scopedLimits: [ScopedLimit]
+    /// The account's dollar spend limit when the plan has one (Enterprise/
+    /// spend-capped), else nil — authoritative, mirrors Desktop's usage tab.
+    /// See SpendLimit.
+    public let spendLimit: SpendLimit?
     /// The full raw usage response, opaque. Exists ONLY for SnapshotLogger's
     /// `"raw"` field (historical snapshot format keeps the whole object for
     /// future analytics). Nothing may parse this outside the ClaudeAPI

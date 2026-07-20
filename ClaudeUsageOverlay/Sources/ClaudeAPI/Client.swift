@@ -278,8 +278,62 @@ public final class ClaudeAPIClient {
             session: window(usage["five_hour"] as? [String: Any]),
             weekly: window(usage["seven_day"] as? [String: Any]),
             scopedLimits: decodeScopedLimits(usage["limits"]),
+            spendLimit: decodeSpendLimit(usage["spend"], usage["extra_usage"]),
             rawJSON: usage
         )
+    }
+
+    /// The Enterprise / spend-capped account's dollar Spend Limit — the number
+    /// Desktop's usage tab shows. Two shapes carry it in the same response and
+    /// agree; we prefer the structured `spend` object and fall back to the flat
+    /// `extra_usage` block:
+    ///   spend:       { used:{amount_minor,exponent,currency},
+    ///                  limit:{amount_minor,exponent,currency}, enabled, severity }
+    ///   extra_usage: { used_credits, monthly_limit, utilization, currency,
+    ///                  decimal_places, is_enabled }
+    /// Both absent (Max/Pro) ⇒ nil. The sibling promo keys (cinder_cove,
+    /// omelette_promotional, …) are volatile internal codenames and ignored.
+    /// See CONTRACT.md and Models.SpendLimit.
+    private static func decodeSpendLimit(_ spendRaw: Any?, _ extraRaw: Any?) -> SpendLimit? {
+        let spend = spendRaw as? [String: Any]
+        let extra = extraRaw as? [String: Any]
+
+        func money(_ dict: [String: Any]?, _ key: String) -> (minor: Int, exp: Int, cur: String)? {
+            guard let m = dict?[key] as? [String: Any],
+                  let minor = (m["amount_minor"] as? NSNumber)?.intValue else { return nil }
+            return (minor,
+                    (m["exponent"] as? NSNumber)?.intValue ?? 2,
+                    (m["currency"] as? String) ?? "USD")
+        }
+
+        if let used = money(spend, "used"), let limit = money(spend, "limit") {
+            return SpendLimit(
+                spentMinor: used.minor,
+                limitMinor: limit.minor,
+                exponent: limit.exp,
+                currency: limit.cur,
+                utilizationPercent: (extra?["utilization"] as? NSNumber)?.doubleValue,
+                enabled: (spend?["enabled"] as? Bool) ?? true,
+                severity: spend?["severity"] as? String
+            )
+        }
+
+        // Fallback: the flat extra_usage shape (same numbers).
+        if let extra,
+           let usedC = (extra["used_credits"] as? NSNumber)?.intValue,
+           let monthly = (extra["monthly_limit"] as? NSNumber)?.intValue {
+            return SpendLimit(
+                spentMinor: usedC,
+                limitMinor: monthly,
+                exponent: (extra["decimal_places"] as? NSNumber)?.intValue ?? 2,
+                currency: (extra["currency"] as? String) ?? "USD",
+                utilizationPercent: (extra["utilization"] as? NSNumber)?.doubleValue,
+                enabled: (extra["is_enabled"] as? Bool) ?? true,
+                severity: nil
+            )
+        }
+
+        return nil
     }
 
     /// The usage `limits[]` array carries a mix of entries: the account-wide

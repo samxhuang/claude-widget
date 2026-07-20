@@ -16,6 +16,12 @@ final class UsageModel: ObservableObject {
     @Published var lastError: String?
     @Published var lastUpdated: Date?
 
+    /// The account's dollar Spend Limit straight from the usage API
+    /// (Enterprise / spend-capped plans), or nil on plans without one (Max/
+    /// Pro). This is the authoritative figure Claude Desktop's usage tab shows
+    /// — displayed as-is, never reconstructed from local token cost.
+    @Published var spendLimit: SpendLimit?
+
     @Published var now: Date = Date()
 
     private static let sessionWindowDuration: TimeInterval = 5 * 3600
@@ -62,7 +68,30 @@ final class UsageModel: ObservableObject {
             weeklyPercent = report.weekly.percent
             weeklyResetsAt = report.weekly.resetsAt
         }
+        // Always reflect the current response: nil on Max/Pro (no spend block),
+        // set on Enterprise. Every successful usage fetch carries the field.
+        spendLimit = report.spendLimit
         lastUpdated = Date()
+    }
+
+    /// A display `BudgetWindow` for the API-provided spend limit, or nil when
+    /// the plan has no active dollar limit. Lets the main usage rows render the
+    /// authoritative spend with the same dollar-bar renderer as reconstructed
+    /// budgets — but sourced from the API, no daemon/transcripts involved.
+    /// No projection dot or reset countdown: the usage payload carries neither
+    /// a rate nor a reset date (Desktop sources the reset elsewhere).
+    var spendBudgetWindow: BudgetWindow? {
+        guard let s = spendLimit, s.enabled, s.limitMinor > 0 else { return nil }
+        return BudgetWindow(
+            limitUsd: s.limitAmount,
+            spentUsd: s.spentAmount,
+            pct: s.percent,
+            projectedUsd: nil,
+            projectedPct: nil,
+            periodStart: nil,
+            periodEnd: nil,
+            includesRemote: false
+        )
     }
 
     func resetText(for date: Date?) -> String {
