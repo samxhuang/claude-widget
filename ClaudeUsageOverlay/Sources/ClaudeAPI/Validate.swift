@@ -97,7 +97,12 @@ public final class ClaudeAPIValidator {
                 if report.weekly.percent == nil { problems.append("weekly.percent missing") }
                 if report.weekly.resetsAt == nil { problems.append("weekly.resetsAt missing/unparseable") }
                 if problems.isEmpty {
-                    self.record("usage", true, "session \(report.session.percent!)%, weekly \(report.weekly.percent!)%, both windows parseable")
+                    // Model-scoped caps (e.g. Fable) are optional — count them
+                    // for visibility, but their absence is not a failure.
+                    let active = report.scopedLimits.filter { $0.isActive }
+                    let scopedNote = active.isEmpty ? "" : ", \(active.count) active model cap(s): "
+                        + active.map { "\($0.modelDisplayName)@\($0.percent.map { "\($0)%" } ?? "?")\($0.resetsAt == nil ? " (no reset!)" : "")" }.joined(separator: ", ")
+                    self.record("usage", true, "session \(report.session.percent!)%, weekly \(report.weekly.percent!)%, both windows parseable" + scopedNote)
                 } else {
                     self.record("usage", false, problems.joined(separator: "; "))
                 }

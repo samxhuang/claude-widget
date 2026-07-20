@@ -54,6 +54,34 @@ def rate_limit(resets, ts="2026-07-18T14:02:00.000Z") -> dict:
     return {"type": "rate_limit_event", "resetsAt": resets, "timestamp": ts}
 
 
+def assistant_model(model="claude-fable-5", ts="2026-07-18T14:01:00.000Z") -> dict:
+    """An ordinary assistant turn carrying a concrete model id — the signal
+    model_limit_model() keys off to attribute a per-model cap 429."""
+    return {
+        "type": "assistant",
+        "message": {"role": "assistant", "model": model,
+                    "content": [{"type": "text", "text": "working"}],
+                    "stop_reason": "tool_use"},
+        "timestamp": ts,
+    }
+
+
+def model_limit_error(ts="2026-07-18T14:02:00.000Z") -> dict:
+    """A per-model cap (e.g. Fable) as it actually lands in a transcript: a
+    plain 429 assistant error stamped model '<synthetic>', with NO reset time
+    of its own (verified against a live Fable-limited session)."""
+    return {
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 429,
+        "error": "rate_limit",
+        "message": {"role": "assistant", "model": "<synthetic>",
+                    "content": [{"type": "text",
+                                 "text": "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model."}]},
+        "timestamp": ts,
+    }
+
+
 def ai_title(title="A title") -> dict:
     return {"type": "ai-title", "aiTitle": title}
 
@@ -84,6 +112,7 @@ class TempEnvMixin:
             "LOCK_FILE": ar.LOCK_FILE,
             "DAEMON_LOG": ar.DAEMON_LOG,
             "SESSIONS_DIR": ar.SESSIONS_DIR,
+            "SCOPED_LIMITS_FILE": ar.SCOPED_LIMITS_FILE,
         }
         ar.PROJECTS_DIR = self.projects_dir
         ar.COWORK_SESSIONS_DIR = self.cowork_dir
@@ -92,6 +121,8 @@ class TempEnvMixin:
         ar.LOCK_FILE = self.state_dir / "state.json.lock"
         ar.DAEMON_LOG = self.state_dir / "daemon.log"
         ar.SESSIONS_DIR = self.tmp / "sessions"  # nonexistent -> no live procs
+        (self.state_dir / "usage").mkdir(exist_ok=True)
+        ar.SCOPED_LIMITS_FILE = self.state_dir / "usage" / "scoped_limits.json"
         ar._PARSE_CACHE.clear()
 
     def tearDown(self):
@@ -110,6 +141,14 @@ class TempEnvMixin:
         if mtime is not None:
             os.utime(path, (mtime, mtime))
         return path
+
+    def write_scoped_limits(self, limits):
+        """Write the widget-relayed scoped_limits.json. `limits` is a list of
+        {model_display_name, resets_at, ...} dicts (matching what
+        ScopedLimitLogger emits)."""
+        ar.SCOPED_LIMITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ar.SCOPED_LIMITS_FILE.write_text(json.dumps(
+            {"updated_at": "2026-07-20T09:25:00Z", "limits": limits}))
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +211,165 @@ class TestP1StaleRateLimit(TempEnvMixin, unittest.TestCase):
              "timestamp": "2026-07-18T14:02:30.000Z"},
         ])
         self.assertEqual(rec["status"], "waiting")
+
+
+# ---------------------------------------------------------------------------
+# Per-model caps (e.g. Fable): a plain 429 with no reset of its own must still
+# make the session "waiting", armed off the widget-relayed scoped_limits.json.
+# ---------------------------------------------------------------------------
+
+class TestScopedModelLimits(TempEnvMixin, unittest.TestCase):
+    def _record(self, session_id, rows, scoped_limits=None):
+        self.write_cli_transcript(session_id, rows)
+        if scoped_limits is not None:
+            self.write_scoped_limits(scoped_limits)
+        now = ar.time.time()
+        records = ar.compute_cli_records(now, {}, ar._PARSE_CACHE)
+        self.assertIn(session_id, records)
+        return records[session_id]
+
+    def test_normalize_model_token(self):
+        self.assertEqual(ar.normalize_model_token("claude-fable-5"), "fable")
+        self.assertEqual(ar.normalize_model_token("Fable"), "fable")
+        self.assertEqual(ar.normalize_model_token("claude-opus-4-8"), "opus")
+        self.assertEqual(ar.normalize_model_token("claude-haiku-4-5-20251001"), "haiku")
+        self.assertEqual(ar.normalize_model_token(""), "")
+        self.assertEqual(ar.normalize_model_token(None), "")
+
+    def test_scoped_limit_reset_matches_by_family(self):
+        sl = {"fable": 1_800_000_000.0}
+        self.assertEqual(ar.scoped_limit_reset(sl, "claude-fable-5"), 1_800_000_000.0)
+        self.assertIsNone(ar.scoped_limit_reset(sl, "claude-opus-4-8"))
+
+    def test_load_scoped_limits_defensive(self):
+        # Missing file -> {}
+        self.assertEqual(ar.load_scoped_limits(), {})
+        # Malformed JSON -> {}
+        ar.SCOPED_LIMITS_FILE.write_text("{not json")
+        self.assertEqual(ar.load_scoped_limits(), {})
+        # Well-formed -> {token: reset}
+        self.write_scoped_limits([
+            {"model_display_name": "Fable", "model_id": None,
+             "resets_at": "2026-07-20T17:59:59Z", "percent": 100, "severity": "critical"},
+            {"model_display_name": "", "resets_at": "2026-07-20T17:59:59Z"},   # dropped (no name)
+            {"model_display_name": "Opus", "resets_at": None},                  # dropped (no reset)
+        ])
+        loaded = ar.load_scoped_limits()
+        self.assertIn("fable", loaded)
+        self.assertNotIn("opus", loaded)
+        self.assertNotIn("", loaded)
+
+    def test_model_limit_429_at_tail_is_waiting_with_relayed_reset(self):
+        """The core fix: a Fable-cap 429 as the effective tail becomes waiting,
+        with its reset time pulled from the relayed scoped_limits.json."""
+        reset = "2026-07-20T17:59:59Z"
+        rec = self._record("sess_fable", [
+            human_user(cwd=str(self.tmp)),
+            assistant_model("claude-fable-5"),
+            model_limit_error(),
+        ], scoped_limits=[{"model_display_name": "Fable", "resets_at": reset}])
+        self.assertEqual(rec["status"], "waiting")
+        self.assertEqual(rec["scoped_model"], "claude-fable-5")
+        self.assertEqual(rec["resets_at"], ar.parse_reset_timestamp(reset))
+
+    def test_model_limit_without_relay_is_waiting_but_unarmed(self):
+        """If the relay hasn't supplied a reset yet, the session still shows as
+        waiting (so it doesn't vanish) but resets_at is None (not armed)."""
+        rec = self._record("sess_fable_norelay", [
+            human_user(cwd=str(self.tmp)),
+            assistant_model("claude-fable-5"),
+            model_limit_error(),
+        ])
+        self.assertEqual(rec["status"], "waiting")
+        self.assertEqual(rec["scoped_model"], "claude-fable-5")
+        self.assertIsNone(rec["resets_at"])
+
+    def test_model_limit_followed_by_metadata_still_waiting(self):
+        """Desktop bookkeeping appended after the 429 (ai-title, relocated,
+        worktree-state, ...) must not mask the cap that is still the tail."""
+        rec = self._record("sess_fable_meta", [
+            human_user(cwd=str(self.tmp)),
+            assistant_model("claude-fable-5"),
+            model_limit_error(),
+            ai_title("Auto title"),
+            {"type": "worktree-state"},
+            {"type": "relocated"},
+        ], scoped_limits=[{"model_display_name": "Fable", "resets_at": "2026-07-20T17:59:59Z"}])
+        self.assertEqual(rec["status"], "waiting")
+        self.assertEqual(rec["scoped_model"], "claude-fable-5")
+
+    def test_genuine_turn_after_429_is_active_not_waiting(self):
+        """User switched models / bought credits and kept working: a real turn
+        newer than the 429 means the session moved on — active, not a cap."""
+        rec = self._record("sess_fable_resumed", [
+            human_user(cwd=str(self.tmp)),
+            assistant_model("claude-fable-5"),
+            model_limit_error(),
+            human_user("switched to opus, continue", cwd=str(self.tmp),
+                       ts="2026-07-18T14:10:00.000Z"),
+            assistant_model("claude-opus-4-8", ts="2026-07-18T14:11:00.000Z"),
+        ], scoped_limits=[{"model_display_name": "Fable", "resets_at": "2026-07-20T17:59:59Z"}])
+        self.assertEqual(rec["status"], "active")
+        self.assertIsNone(rec["scoped_model"])
+        self.assertIsNone(rec["resets_at"])
+
+    def test_structured_rate_limit_still_wins_over_429_notice(self):
+        """Regression guard: the account-wide 5h cap emits BOTH a structured
+        rate_limit_event AND an inline 429 notice. That must still be read as a
+        normal rate limit (reset from the event), NOT a per-model cap."""
+        rec = self._record("sess_5h", [
+            human_user(cwd=str(self.tmp)),
+            rate_limit(1_800_000_000),
+            {"type": "assistant", "isApiErrorMessage": True, "apiErrorStatus": 429,
+             "message": {"model": "<synthetic>",
+                         "content": [{"type": "text", "text": "You've hit your usage limit"}]},
+             "timestamp": "2026-07-18T14:02:30.000Z"},
+        ])
+        self.assertEqual(rec["status"], "waiting")
+        self.assertEqual(rec["resets_at"], 1_800_000_000)
+        self.assertIsNone(rec["scoped_model"])   # not misread as a model cap
+
+
+class TestReconcileScopedResets(TempEnvMixin, unittest.TestCase):
+    def test_reconcile_fills_reset_for_persisted_entry(self):
+        """A model-limited waiting entry whose transcript has aged out of the
+        scan window (so it produces no records) still gets armed once the relay
+        supplies the reset — reconcile runs independent of the scan window."""
+        reset = ar.parse_reset_timestamp("2026-07-20T17:59:59Z")
+        state = {"sess_x": {"kind": "cli", "status": "waiting",
+                            "scoped_model": "claude-fable-5", "resets_at": None,
+                            "handled": False, "enabled": True}}
+        ar.reconcile_scoped_limit_resets(state, {"fable": reset})
+        self.assertEqual(state["sess_x"]["resets_at"], reset)
+
+    def test_reconcile_refreshes_stale_reset(self):
+        state = {"sess_x": {"status": "waiting", "scoped_model": "claude-fable-5",
+                            "resets_at": 1000.0, "handled": False}}
+        ar.reconcile_scoped_limit_resets(state, {"fable": 2000.0})
+        self.assertEqual(state["sess_x"]["resets_at"], 2000.0)
+
+    def test_reconcile_ignores_non_scoped_and_handled(self):
+        state = {
+            "normal_wait": {"status": "waiting", "scoped_model": None,
+                            "resets_at": 1000.0, "handled": False},
+            "handled_scoped": {"status": "waiting", "scoped_model": "claude-fable-5",
+                               "resets_at": None, "handled": True},
+            "active": {"status": "active", "scoped_model": None, "resets_at": None},
+        }
+        ar.reconcile_scoped_limit_resets(state, {"fable": 9999.0})
+        self.assertEqual(state["normal_wait"]["resets_at"], 1000.0)  # untouched
+        self.assertIsNone(state["handled_scoped"]["resets_at"])      # handled: untouched
+        self.assertIsNone(state["active"]["resets_at"])
+
+    def test_model_limited_waiting_survives_pruning(self):
+        """A waiting model-cap entry (even with resets_at=None) is never dropped
+        by prune_old_entries — same as a normal rate-limited wait."""
+        state = {"sess_x": {"kind": "cli", "status": "waiting",
+                            "scoped_model": "claude-fable-5", "resets_at": None,
+                            "handled": False, "enabled": False,
+                            "last_activity_at": 0, "detected_at": 0}}
+        ar.prune_old_entries(state, retention_minutes=30)
+        self.assertIn("sess_x", state)
 
 
 # ---------------------------------------------------------------------------

@@ -309,6 +309,27 @@ class TierRescalingTests(TempStateDirTestCase):
         self.assertAlmostEqual(observed["five_hour"]["peak_pct"], 50.0, places=1)
         self.assertAlmostEqual(observed["five_hour"]["avg_pct"], 50.0, places=1)
 
+    def test_daily_peaks_merge_raw_and_bucket_by_utc_day(self):
+        raw = [
+            {"ts": "2026-07-18T10:00:00+00:00", "five_hour": {"utilization": 50}, "seven_day": {"utilization": 10}},
+            {"ts": "2026-07-18T14:00:00+00:00", "five_hour": {"utilization": 70}, "seven_day": {"utilization": 12}},
+        ]
+        buckets = [
+            {"ts_start": "2026-07-10T03:00:00+00:00", "n": 5,
+             "five_hour": {"min": 0, "max": 30, "avg": 15, "last": 20},
+             "seven_day": {"min": 0, "max": 8, "avg": 4, "last": 5}},
+            {"ts_start": "2026-07-10T09:00:00+00:00", "n": 5,
+             "five_hour": {"min": 0, "max": 45, "avg": 20, "last": 25},
+             "seven_day": {"min": 0, "max": 6, "avg": 3, "last": 4}},
+        ]
+        points = plan_fit._merge_utilization_points(raw, [], buckets)
+        peaks = plan_fit._daily_peaks(points)
+        from datetime import date
+        self.assertAlmostEqual(peaks["five_hour"][date(2026, 7, 18)], 70.0)
+        self.assertAlmostEqual(peaks["five_hour"][date(2026, 7, 10)], 45.0)
+        self.assertAlmostEqual(peaks["seven_day"][date(2026, 7, 18)], 12.0)
+        self.assertAlmostEqual(peaks["seven_day"][date(2026, 7, 10)], 8.0)
+
     def test_no_snapshots_gives_null_utilization_and_warning(self):
         _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
         now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
@@ -317,6 +338,130 @@ class TierRescalingTests(TempStateDirTestCase):
         self.assertIsNone(observed["five_hour"]["peak_pct"])
         self.assertIsNone(observed["seven_day"]["peak_pct"])
         self.assertTrue(any("utilization snapshots" in w for w in result["warnings"]))
+
+
+# ---------------------------------------------------------------------------
+# Throttle-tolerance verdict (cap-days/month, not all-time peak)
+# ---------------------------------------------------------------------------
+
+class ThrottleVerdictTests(TempStateDirTestCase):
+    """Viability is cap-day frequency within tolerance (5h: <=1/month, 7d:
+    0/month), so one outlier day can no longer permanently veto a cheaper
+    tier — but frequent throttling still does."""
+
+    def _write_days(self, day_rows):
+        """day_rows: list of (iso_day, max_5h_pct, max_7d_pct) — one hourly
+        bucket per day, observed against max_20x (the default plan)."""
+        rows = [{
+            "ts_start": f"{day}T12:00:00+00:00", "n": 30,
+            "five_hour": {"min": 0, "max": p5, "avg": p5 / 2, "last": p5},
+            "seven_day": {"min": 0, "max": p7, "avg": p7 / 2, "last": p7},
+        } for day, p5, p7 in day_rows]
+        _write_jsonl(self.usage_dir / "snapshots_1h.jsonl", rows)
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+
+    @staticmethod
+    def _june_days(n=30):
+        return [f"2026-06-{d:02d}" for d in range(1, n + 1)]
+
+    def test_single_outlier_day_no_longer_vetoes_cheaper_tier(self):
+        # 29 quiet days (2% of Max 20x -> 40% of Pro) + 1 monster day
+        # (30% -> 600% of Pro): exactly 1 projected cap-day in 30 observed
+        # days = 1.0/month, within the 5h tolerance -> Pro is viable even
+        # though its all-time projected peak is 600%.
+        days = self._june_days()
+        self._write_days([(d, 30 if i == 0 else 2, 1) for i, d in enumerate(days)])
+        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+
+        pro = result["verdict"]["plans"]["pro"]
+        self.assertTrue(pro["viable"])
+        self.assertAlmostEqual(pro["throttle_days_5h_per_month"], 1.0)
+        self.assertAlmostEqual(pro["median_throttle_peak_5h_pct"], 600.0)
+        self.assertEqual(pro["price_delta_vs_current_usd"], -180)
+        # The peak is still reported as context and still exceeds 100%.
+        self.assertGreater(result["tier_projection"]["pro"]["peak_five_hour_pct"], 100)
+        rec = result["verdict"]["recommendation"]
+        self.assertIn("Pro fits", rec)
+        self.assertIn("save $180/mo", rec)
+
+    def test_frequent_cap_days_still_disqualify(self):
+        # 10 of 30 days at 30% of Max 20x: Pro projects 600% (cap-day) and
+        # Max 5x projects 120% (cap-day) on each -> 10/month >> tolerance.
+        days = self._june_days()
+        self._write_days([(d, 30 if i < 10 else 2, 1) for i, d in enumerate(days)])
+        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+
+        v = result["verdict"]["plans"]
+        self.assertFalse(v["pro"]["viable"])
+        self.assertFalse(v["max_5x"]["viable"])
+        self.assertTrue(v["max_20x"]["viable"])
+        self.assertAlmostEqual(v["pro"]["throttle_days_5h_per_month"], 10.0)
+        rec = result["verdict"]["recommendation"]
+        self.assertIn("Your current plan", rec)
+        # Current fits -> the recommendation peeks one tier down.
+        self.assertIn("A tier down, Max 5x", rec)
+
+    def test_single_seven_day_cap_day_disqualifies(self):
+        # 7d tolerance is zero: one day whose 7d peak projects to 120% of
+        # Pro's weekly cap kills Pro even though its 5h profile is clean.
+        days = self._june_days()
+        self._write_days([(d, 2, 6 if i == 15 else 1) for i, d in enumerate(days)])
+        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+
+        v = result["verdict"]["plans"]
+        self.assertFalse(v["pro"]["viable"])
+        self.assertAlmostEqual(v["pro"]["throttle_days_7d_per_month"], 1.0)
+        self.assertIsNone(v["pro"]["median_throttle_peak_5h_pct"])
+        # 6% * 4 = 24% of Max 5x's weekly cap -> fine there.
+        self.assertTrue(v["max_5x"]["viable"])
+        self.assertIn("Max 5x", result["verdict"]["recommendation"])
+
+    def test_median_severity_over_cap_days(self):
+        # Pro cap-day peaks 600 / 400 / 200 -> median 400.
+        days = self._june_days()
+        peaks = {0: 30, 1: 20, 2: 10}  # % of Max 20x -> x20 on Pro
+        self._write_days([(d, peaks.get(i, 2), 1) for i, d in enumerate(days)])
+        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+        pro = result["verdict"]["plans"]["pro"]
+        self.assertAlmostEqual(pro["median_throttle_peak_5h_pct"], 400.0)
+        self.assertAlmostEqual(pro["throttle_days_5h_per_month"], 3.0)
+        self.assertFalse(pro["viable"])  # 3/month > 1/month tolerance
+
+    def test_no_tier_viable_mentions_max_20x_cap_days(self):
+        # Hitting the Max 20x cap (100%) most days: even the top tier is
+        # over tolerance, and the recommendation says so in cap-day terms.
+        days = self._june_days(10)
+        self._write_days([(d, 100, 1) for d in days])
+        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+        v = result["verdict"]
+        self.assertFalse(v["plans"]["max_20x"]["viable"])
+        self.assertIn("Even Max 20x", v["recommendation"])
+        self.assertIn("d/mo", v["recommendation"])
+
+    def test_tolerance_block_present(self):
+        self._write_days([("2026-06-01", 2, 1)])
+        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+        tol = result["verdict"]["throttle_tolerance"]
+        self.assertEqual(tol["five_hour_days_per_month"], plan_fit.THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH)
+        self.assertEqual(tol["seven_day_days_per_month"], plan_fit.THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH)
+
+    def test_upgrade_recommendation_prices_the_difference(self):
+        # Current plan Pro, usage that needs Max 5x: recommendation should
+        # phrase the upgrade cost, not "savings".
+        days = self._june_days()
+        # Observed against Pro: 50% of Pro's 5h cap on 10 days -> Pro fine?
+        # No: we need Pro NOT viable -> days at/over 100% of Pro. Use 100%.
+        self._write_days([(d, 100 if i < 10 else 10, 1) for i, d in enumerate(days)])
+        _write_json(self.state_dir / "config.json",
+                    _config(account={"type": "max", "plan": "pro"}))
+        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+        v = result["verdict"]
+        self.assertFalse(v["plans"]["pro"]["viable"])
+        # 100% of Pro = 20% of Max 5x -> viable there.
+        self.assertTrue(v["plans"]["max_5x"]["viable"])
+        self.assertIn("Your current plan, Pro, would be capped", v["recommendation"])
+        self.assertIn("Max 5x fits", v["recommendation"])
+        self.assertIn("for $80/mo more", v["recommendation"])
 
 
 # ---------------------------------------------------------------------------

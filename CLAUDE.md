@@ -288,13 +288,90 @@ picking up new work so you don't re-diagnose the same things.
    session before deploying (see commit — reproduced the false positive,
    confirmed the fix flips it to `running`).
 
-5. **Usage bars: estimated-usage projection.** Added to both the Session
+5. **Throttle-tolerance plan-fit verdict (replaces peak-based viability).**
+   A tier's `viable` flag no longer means "the all-time projected peak never
+   crossed 100%" (one monster session permanently vetoed cheaper tiers). It
+   now counts **projected cap-days**: per-UTC-day peak utilization
+   (`_daily_peaks` — per-day maxima survive bucket compaction, unlike
+   percentiles) rescaled per tier, days ≥100% counted and normalized to a
+   30-day month (`_tier_throttle`), viable when within tolerance
+   (`THROTTLE_TOLERANCE_*`: 5h ≤1 cap-day/mo, 7d 0 — weekly-cap lockouts are
+   treated as disqualifying). Severity (median cap-day peak) and
+   `price_delta_vs_current_usd` ride along in `verdict.plans`;
+   `throttle_projection` + `verdict.throttle_tolerance` are new top-level
+   report blocks; the 7d tolerance compare uses exact rates, not the
+   display-rounded ones. Widget: tier grid's last column is now "Cap d/mo"
+   (with peak/severity in the tooltip), and `TierVerdict.isFlagged` trusts
+   the backend verdict when throttle fields are present — the legacy local
+   peak>100 red-flag only applies to old plan_fit.json files, since a >100%
+   peak on a viable tier is now expected, not an error. All-time peaks stay
+   in the report/UI as context only. The recommendation string is succinct
+   and always peeks at the adjacent tier: one tier DOWN when the
+   recommended tier fits ("A tier down, Max 5x would be capped ~30 d/mo
+   (5h)…"), one tier UP when the current plan is over tolerance. The widget
+   now actually renders it (plus the data-maturity line) on the Plan-fit
+   tab — it had been parsed-but-never-displayed since the tab was built —
+   and because the fixed `planFitPanelHeight` was probe-measured before
+   those lines existed, `AppDelegate.planFitTextExtra()` measures the live
+   strings (NSString boundingRect at render fonts) and adds that to the
+   panel height so the text never clips.
+
+6. **Usage bars: estimated-usage projection.** Added to both the Session
    (5h) and Weekly bars: a small dot marking where usage is projected to
    land by reset (linear extrapolation from elapsed vs. remaining window
    time — `UsageModel.estimatedPercent`), turning red and pinning at 100% if
    the projection would exceed it, plus a muted `"(N%)"` next to the actual
    percent label. No estimate shown in the first minute of a window (too
    little data to extrapolate from).
+
+## Per-model (Fable) cap → waiting + auto-resume (2026-07-20)
+
+Fable-limited (and any per-model-capped) CLI sessions were vanishing from the
+widget's Sessions list. Root cause: the daemon only recognizes a "waiting"
+(rate-limited) session from a `rate_limit`-**typed** transcript event (the
+account-wide 5h/weekly cap, which carries its own `resetsAt`). A **per-model**
+cap is a different shape — a plain `assistant` turn with
+`isApiErrorMessage:true` + `apiErrorStatus:429` ("You've reached your Fable 5
+limit…"), model `<synthetic>`, and **no reset time of its own**. So it was
+never marked waiting; the session went silent and aged out of the ~35m scan
+window. The reset time DOES exist, but only on the usage page — the usage
+endpoint's `limits[]` array has a `kind:"weekly_scoped"`,
+`scope.model.display_name:"Fable"`, `is_active`, `percent`, `resets_at` entry.
+
+Fix spans all three layers (the daemon is pure-stdlib and can't reach
+claude.ai, so the reset is **relayed** from the widget):
+
+1. **ClaudeAPI** — `UsageReport.scopedLimits: [ScopedLimit]` parsed from
+   `limits[]` (model-scoped entries only) in `Client.decodeUsage`; documented
+   in CONTRACT.md; `--validate-api` prints active caps. Raw field names stay
+   inside the module (boundary check still clean).
+2. **Widget** — `ScopedLimitLogger` writes active caps to
+   `~/.claude-autoresume/usage/scoped_limits.json` (atomic replace, widget's
+   own frozen on-disk format like snapshots.jsonl; single-writer → no flock),
+   fired from `UsageFetcher` on every usage fetch.
+3. **Daemon** (`autoresume.py`) — `_parse_cli_transcript` detects a 429
+   model-limit tail *only when there's no structured `rate_limit` event*
+   (the 5h cap emits both; regression-tested), captures the concrete model
+   via `model_limit_model` (nearest non-`<synthetic>` assistant model).
+   `compute_cli_records` marks it `waiting`, reset via `scoped_limit_reset`
+   (family-token match, `normalize_model_token`: `claude-fable-5`↔`Fable`).
+   `scoped_model` is stored on the entry; `reconcile_scoped_limit_resets`
+   (poll loop, under lock, **independent of the scan window**) fills/refreshes
+   the reset once the relay catches up — covers the case where the dead
+   transcript already left the window. Auto-resume stays **opt-in**:
+   `enabled` defaults False, resume fires via the unchanged
+   `resume_due_sessions` (model left as-is on resume). A model-limited wait
+   with `resets_at=None` shows but isn't armed; it's never quiet-pruned
+   (waiting entries aren't, same as a 5h wait).
+
+Tests: `TestScopedModelLimits` + `TestReconcileScopedResets` in
+test_autoresume.py (63 total green). **Deploy status: widget rebuilt +
+bundle binary swapped for --validate-api; daemon NOT yet redeployed** — run
+`claude-autoresume/install.sh` to make the fixed daemon live, and
+`ClaudeUsageOverlay/build_and_run.command` to relaunch the widget so it
+starts writing scoped_limits.json. Until both run, existing already-vanished
+Fable sessions won't retroactively reappear (their transcripts are long out
+of window); the fix catches *future* Fable caps while they're still fresh.
 
 ## Open threads / things a future session might reasonably pick up
 

@@ -76,6 +76,23 @@ MA_WINDOWS_DAYS = (1, 7, 30, 90)
 # same pace against the same month definition instead of disagreeing by 1.5%.
 MONTHLY_RUN_RATE_DAYS = 30.0
 
+# Throttle-tolerance verdict (2026-07-19). Tier viability used to be "the
+# all-time projected peak never crossed 100%", which let a single monster
+# session permanently veto a cheaper tier no matter how unrepresentative it
+# was. It is now frequency + severity based: the utilization series is grouped
+# into UTC days, each day's peak is projected onto each tier (same linear
+# rescale as _tier_projection), and the days that would have hit the cap
+# (>= THROTTLE_CAP_PCT) are counted and normalized to a 30-day month. A tier
+# is viable when that cap-day frequency stays within tolerance. The 5h
+# default tolerates ~1 cap-day/month (a capped 5h window is a wait of at most
+# a few hours); the 7d default tolerates none — blowing the weekly cap can
+# lock work out for days, so even the "fair" metric treats it as
+# disqualifying. All-time peaks are still reported for context; they just no
+# longer decide viability on their own.
+THROTTLE_CAP_PCT = 100.0
+THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH = 1.0
+THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH = 0.0
+
 # Budget (API-account dollar limits) — see _budget_block / autoresume_config C1.
 BUDGET_PROJECTION_MIN_ELAPSED_SECONDS = 3600  # suppress linear projection in a period's first hour
 
@@ -856,6 +873,78 @@ def _utilization_observed(points: list[dict]) -> dict:
     return result
 
 
+def _daily_peaks(points: list[dict]) -> dict:
+    """Per-UTC-day peak utilization for each dimension, from the merged point
+    series: {"five_hour": {date: pct}, "seven_day": {date: pct}}.
+
+    Days are the unit the throttle verdict counts in ("how many days a month
+    would this plan have capped me"): a runaway session inflates exactly one
+    day instead of dominating an all-time peak. Per-day maxima also survive
+    snapshot compaction — 15m/1h buckets keep `max`, so a day's peak stays
+    recoverable long after raw rows are pruned, unlike a full-distribution
+    percentile. Bucket points never straddle days (ts_start is at most
+    hour-floored)."""
+    result: dict = {"five_hour": {}, "seven_day": {}}
+    for p in points:
+        day = _point_ts(p).date()
+        for dim in ("five_hour", "seven_day"):
+            if p["kind"] == "raw":
+                val = p[dim]
+            else:
+                d = p[dim]
+                val = d.get("max") if d else None
+            if isinstance(val, (int, float)):
+                cur = result[dim].get(day)
+                if cur is None or float(val) > cur:
+                    result[dim][day] = float(val)
+    return result
+
+
+def _median(values: list) -> float:
+    s = sorted(values)
+    mid = len(s) // 2
+    return float(s[mid]) if len(s) % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _tier_throttle(daily_peaks: dict, current_plan: str = CURRENT_PLAN) -> dict:
+    """Cap-day frequency + severity per tier, from per-day peak utilization.
+
+    For each tier and dimension: project every observed day's peak onto the
+    tier and count the days at/over THROTTLE_CAP_PCT. `throttle_days_per_month`
+    normalizes the count to a 30-day month (rounded for display; _verdict
+    recomputes the exact rate from throttle_days/days_observed for the
+    tolerance comparison). `median_throttle_peak_pct` is the median projected
+    peak across the cap days — how bad a *typical* cap day was: ~105% means a
+    short wait near the window's edge, 300% means locked out most of the day.
+    """
+    current_mult = float(TIER_MULTIPLIERS.get(current_plan, TIER_MULTIPLIERS[CURRENT_PLAN]))
+    out: dict = {}
+    for tier, mult in TIER_MULTIPLIERS.items():
+        factor = current_mult / mult
+        tier_out: dict = {}
+        for dim in ("five_hour", "seven_day"):
+            peaks = daily_peaks.get(dim) or {}
+            days_observed = len(peaks)
+            if days_observed == 0:
+                tier_out[dim] = {
+                    "days_observed": 0,
+                    "throttle_days": 0,
+                    "throttle_days_per_month": None,
+                    "median_throttle_peak_pct": None,
+                }
+                continue
+            over = [v * factor for v in peaks.values() if v * factor >= THROTTLE_CAP_PCT]
+            per_month = len(over) / days_observed * MONTHLY_RUN_RATE_DAYS
+            tier_out[dim] = {
+                "days_observed": days_observed,
+                "throttle_days": len(over),
+                "throttle_days_per_month": round(per_month, 1),
+                "median_throttle_peak_pct": round(_median(over), 1) if over else None,
+            }
+        out[tier] = tier_out
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Plan-change containment (usage/plan_history.jsonl sidecar)
 # ---------------------------------------------------------------------------
@@ -1065,28 +1154,83 @@ def _tier_projection(observed: dict, current_plan: str = CURRENT_PLAN) -> dict:
     return projection
 
 
-def _verdict(tier_projection: dict, run_rate: dict, days_covered_widest: int, widest_window: int,
+SHORT_TIER_NAME = {"pro": "Pro", "max_5x": "Max 5x", "max_20x": "Max 20x"}
+
+
+def _brief_cap_days(plan_entry: dict) -> str | None:
+    """Compact cap-day summary — "~15 d/mo (5h) + ~30 d/mo (7d)" — or None
+    when the plan projects no cap-days at all."""
+    parts = []
+    t5 = plan_entry["throttle_days_5h_per_month"]
+    t7 = plan_entry["throttle_days_7d_per_month"]
+    if t5:
+        parts.append(f"~{t5:g} d/mo (5h)")
+    if t7:
+        parts.append(f"~{t7:g} d/mo (7d)")
+    return " + ".join(parts) if parts else None
+
+
+def _tier_down_peek(plans: dict, tier: str) -> str:
+    """One sentence on the tier below `tier` — what dropping one more level
+    would cost in cap-days. Empty when `tier` is the cheapest, or when the
+    lower tier is clean (it would then be the recommended tier itself, so
+    this can only really be empty for missing data)."""
+    idx = TIER_ORDER.index(tier)
+    if idx == 0:
+        return ""
+    down_entry = plans[TIER_ORDER[idx - 1]]
+    days = _brief_cap_days(down_entry)
+    if days is None:
+        return ""
+    peek = f" A tier down, {SHORT_TIER_NAME[TIER_ORDER[idx - 1]]} would be capped {days}"
+    sev = down_entry["median_throttle_peak_5h_pct"] or down_entry["median_throttle_peak_7d_pct"]
+    if sev is not None:
+        peek += f", typically near {sev:.0f}% of cap"
+    return peek + "."
+
+
+def _verdict(tier_projection: dict, throttle: dict, run_rate: dict,
+             days_covered_widest: int, widest_window: int,
              current_plan: str = CURRENT_PLAN,
              truncated_by_plan_change: bool = False) -> dict:
     plans = {}
     run_rate_value = run_rate.get("value_usd_per_month")
+    current_price = TIER_PRICE_USD.get(current_plan, TIER_PRICE_USD[CURRENT_PLAN])
     for tier in TIER_ORDER:
         price = TIER_PRICE_USD[tier]
         proj = tier_projection[tier]
+        thr = throttle[tier]
         ratio = round(run_rate_value / price, 2) if run_rate_value is not None else None
         peak_5h = proj["peak_five_hour_pct"]
         peak_7d = proj["peak_seven_day_pct"]
         has_peak_data = peak_5h is not None or peak_7d is not None
+
+        # Tolerance comparison uses the EXACT per-month rate (recomputed from
+        # the raw counts), not the display-rounded one — a 7d rate of
+        # 0.04/month must still disqualify under the zero-tolerance default
+        # even though it displays as 0.0.
+        def _exact_per_month(dim_stats: dict):
+            if dim_stats["days_observed"] == 0:
+                return None
+            return dim_stats["throttle_days"] / dim_stats["days_observed"] * MONTHLY_RUN_RATE_DAYS
+
+        t5 = _exact_per_month(thr["five_hour"])
+        t7 = _exact_per_month(thr["seven_day"])
         viable = True
-        if peak_5h is not None and peak_5h > 100:
+        if t5 is not None and t5 > THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH:
             viable = False
-        if peak_7d is not None and peak_7d > 100:
+        if t7 is not None and t7 > THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH:
             viable = False
         plans[tier] = {
             "price_usd": price,
             "api_equiv_ratio": ratio,
             "projected_peak_7d_util": peak_7d,
             "projected_peak_5h_util": peak_5h,
+            "throttle_days_5h_per_month": thr["five_hour"]["throttle_days_per_month"],
+            "throttle_days_7d_per_month": thr["seven_day"]["throttle_days_per_month"],
+            "median_throttle_peak_5h_pct": thr["five_hour"]["median_throttle_peak_pct"],
+            "median_throttle_peak_7d_pct": thr["seven_day"]["median_throttle_peak_pct"],
+            "price_delta_vs_current_usd": price - current_price,
             "viable": viable,
             "has_peak_data": has_peak_data,
         }
@@ -1123,28 +1267,59 @@ def _verdict(tier_projection: dict, run_rate: dict, days_covered_widest: int, wi
             )
     elif viable_tiers:
         cheapest = viable_tiers[0]
-        qualifier = " (based on limited, preliminary data — recheck once more history is collected)" if preliminary else ""
+        cheapest_name = SHORT_TIER_NAME.get(cheapest, cheapest)
+        current_name = SHORT_TIER_NAME.get(current_plan, current_plan)
+        days = _brief_cap_days(plans[cheapest])
+        fit_clause = f"capped only {days}" if days else "no projected cap-days"
         if cheapest == current_plan:
+            # Current plan fits: say so briefly, then peek one tier down so
+            # the user can see what a downgrade would actually cost them.
             recommendation = (
-                f"Your current plan, {tier_label[cheapest]}, matches your usage — "
-                f"projected peak utilization stays under the cap{qualifier}."
+                f"Your current plan, {cheapest_name}, fits — {fit_clause}."
+                + _tier_down_peek(plans, cheapest)
+            )
+        elif plans[cheapest]["price_delta_vs_current_usd"] < 0:
+            # A cheaper tier fits: lead with it + savings, then peek one
+            # further down.
+            save = -plans[cheapest]["price_delta_vs_current_usd"]
+            recommendation = (
+                f"{cheapest_name} fits — {fit_clause}; save ${save:g}/mo vs {current_name}."
+                + _tier_down_peek(plans, cheapest)
             )
         else:
-            recommendation = (
-                f"{tier_label[cheapest]} looks sufficient — projected peak utilization stays "
-                f"under the cap even during your busiest observed windows{qualifier}."
-            )
+            # Current plan is over tolerance; the peek goes UP to the
+            # cheapest tier that fits.
+            delta = plans[cheapest]["price_delta_vs_current_usd"]
+            cur_entry = plans.get(current_plan)
+            cur_days = _brief_cap_days(cur_entry) if cur_entry else None
+            cur_clause = f"would be capped {cur_days} — over tolerance" if cur_days else "is over tolerance"
+            fits = f"{cheapest_name} fits"
+            if days:
+                fits += f" (capped {days})"
+            if delta > 0:
+                fits += f" for ${delta:g}/mo more"
+            recommendation = f"Your current plan, {current_name}, {cur_clause}. {fits}."
+        if preliminary:
+            recommendation += " Preliminary — recheck with more history."
     else:
+        m20_days = _brief_cap_days(plans["max_20x"])
+        capped = f"would be capped {m20_days}" if m20_days else "is over tolerance"
         recommendation = (
-            "Even Max 20x would have been pushed over its cap during your peak usage window — "
-            "peaks matter more than the average here, since they're what actually interrupt work. "
-            "Consider spreading usage out, or budgeting for API overage during spikes."
+            f"Even Max 20x {capped}. Spread usage out, or budget for API overage during spikes."
         )
+        if preliminary:
+            recommendation += " Preliminary — recheck with more history."
 
     return {
         "plans": plans,
         "recommendation": recommendation,
         "data_maturity": data_maturity,
+        # Surfaced so consumers (widget tooltip, CLI) can say what "viable"
+        # means without hardcoding the thresholds a second time.
+        "throttle_tolerance": {
+            "five_hour_days_per_month": THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH,
+            "seven_day_days_per_month": THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH,
+        },
     }
 
 
@@ -1385,9 +1560,20 @@ def compute(state_dir: Path, now: datetime) -> dict:
 
     tier_projection = _tier_projection(utilization_observed, current_plan)
 
+    daily_peaks = _daily_peaks(observed_points)
+    throttle_projection = _tier_throttle(daily_peaks, current_plan)
+    assumptions.append(
+        "Plan viability counts projected cap-days: each UTC day's peak utilization is rescaled "
+        "per tier, days at/over 100% are counted and normalized to a 30-day month, and a tier is "
+        f"viable when within tolerance (5h: <= {THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH:g}/month; "
+        f"7d: <= {THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH:g}/month). All-time peaks are context, "
+        "not the verdict."
+    )
+
     widest_window = MA_WINDOWS_DAYS[-1]
     days_covered_widest = moving_averages[f"{widest_window}d"]["days_covered"]
-    verdict = _verdict(tier_projection, run_rate, days_covered_widest, widest_window,
+    verdict = _verdict(tier_projection, throttle_projection, run_rate,
+                       days_covered_widest, widest_window,
                        current_plan, truncated_by_plan_change=truncated_by_plan_change)
 
     # Graph-ready cost series for the widget's usage-over-time view. Hourly
@@ -1438,6 +1624,7 @@ def compute(state_dir: Path, now: datetime) -> dict:
         "cost_peaks": cost_peaks,
         "utilization_observed": utilization_observed,
         "tier_projection": tier_projection,
+        "throttle_projection": throttle_projection,
         "verdict": verdict,
         "totals": {
             "by_model": totals_out,
@@ -1514,13 +1701,39 @@ def _print_report(result: dict) -> None:
               f"avg 5h {_format_pct(tp['avg_five_hour_pct'])}, avg 7d {_format_pct(tp['avg_seven_day_pct'])}{cap_flag}")
     print()
 
+    def _format_cap_days(dim_stats: dict) -> str:
+        pm = dim_stats["throttle_days_per_month"]
+        if pm is None:
+            return "n/a"
+        s = f"{pm:g} d/mo"
+        med = dim_stats["median_throttle_peak_pct"]
+        if med is not None:
+            s += f" (median cap-day peak {med:.0f}%)"
+        return s
+
+    tp_throttle = result.get("throttle_projection")
+    if tp_throttle:
+        print("Cap-day projection (per-day peak >= 100%, normalized to 30 days):")
+        for tier in TIER_ORDER:
+            t = tp_throttle[tier]
+            print(f"  {tier:>8}: 5h {_format_cap_days(t['five_hour'])}, 7d {_format_cap_days(t['seven_day'])}")
+        print()
+
     v = result["verdict"]
     print("Verdict:")
     for tier in TIER_ORDER:
         p = v["plans"][tier]
         ratio = "n/a" if p["api_equiv_ratio"] is None else f"{p['api_equiv_ratio']:.2f}x"
-        print(f"  {tier:>8} (${p['price_usd']}/mo): viable={p['viable']}, api-equiv ratio={ratio}, "
+        t5 = p.get("throttle_days_5h_per_month")
+        t7 = p.get("throttle_days_7d_per_month")
+        cap_days = (f"cap-days/mo 5h={'n/a' if t5 is None else f'{t5:g}'} "
+                    f"7d={'n/a' if t7 is None else f'{t7:g}'}")
+        print(f"  {tier:>8} (${p['price_usd']}/mo): viable={p['viable']}, {cap_days}, api-equiv ratio={ratio}, "
               f"projected peak 7d={_format_pct(p['projected_peak_7d_util'])}, 5h={_format_pct(p['projected_peak_5h_util'])}")
+    tol = v.get("throttle_tolerance")
+    if tol:
+        print(f"  Tolerance: 5h <= {tol['five_hour_days_per_month']:g} cap-day(s)/mo, "
+              f"7d <= {tol['seven_day_days_per_month']:g} cap-day(s)/mo")
     print(f"  Data maturity: {v['data_maturity']}")
     print(f"  Recommendation: {v['recommendation']}")
     print()

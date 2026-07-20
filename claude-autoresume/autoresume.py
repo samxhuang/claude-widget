@@ -92,6 +92,17 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.json.lock"
 LOG_DIR = STATE_DIR / "logs"
 DAEMON_LOG = STATE_DIR / "daemon.log"
+# Per-model usage caps (e.g. the weekly Fable limit) relayed by the widget
+# after each usage fetch. The daemon can't reach claude.ai to learn these
+# reset times itself, and a CLI transcript that hits such a cap records only a
+# plain 429 with no reset of its own — so this file is the sole reset source
+# that arms auto-resume for a model-limited session. Written by the widget's
+# ScopedLimitLogger (atomic replace); read-only here. Format:
+#   { "updated_at": ISO8601,
+#     "limits": [ { "model_display_name": "Fable", "model_id": null,
+#                   "resets_at": ISO8601, "percent": 100,
+#                   "severity": "critical" }, ... ] }
+SCOPED_LIMITS_FILE = STATE_DIR / "usage" / "scoped_limits.json"
 
 POLL_INTERVAL_SECONDS = 10
 # Usage analytics run much less often than the session poll. Collection is
@@ -599,6 +610,79 @@ def parse_reset_timestamp(value) -> float | None:
     return None
 
 
+def normalize_model_token(model) -> str:
+    """Reduce a model id ('claude-fable-5') or a usage-page display name
+    ('Fable') to a comparable family token ('fable'), so a transcript's model
+    can be matched against a relayed per-model cap regardless of which form
+    each side uses. Strips a leading 'claude-' and any trailing version parts
+    (all-digit segments): 'claude-fable-5' -> 'fable', 'claude-opus-4-8' ->
+    'opus', 'Fable' -> 'fable'. Returns '' for empty/garbage input."""
+    if not isinstance(model, str):
+        return ""
+    token = model.strip().lower()
+    if not token:
+        return ""
+    if token.startswith("claude-"):
+        token = token[len("claude-"):]
+    parts = [p for p in token.replace("_", "-").split("-") if p and not p.isdigit()]
+    return parts[0] if parts else token
+
+
+def load_scoped_limits() -> dict:
+    """Read the widget-relayed per-model caps (SCOPED_LIMITS_FILE) and return
+    {family_token: resets_at_epoch} for every entry with a parseable reset.
+    Fully defensive: a missing/malformed/empty file yields {} — the daemon
+    can't reach claude.ai itself, so absence just means 'no reset known yet',
+    and a model-limited session still shows as waiting (just not armed) until
+    the relay catches up. The widget only writes active caps, so no is_active
+    filtering is needed here."""
+    try:
+        raw = SCOPED_LIMITS_FILE.read_text()
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for item in (data.get("limits") or []):
+        if not isinstance(item, dict):
+            continue
+        display = item.get("model_display_name") or item.get("model_id") or ""
+        token = normalize_model_token(display)
+        if not token:
+            continue
+        reset = parse_reset_timestamp(item.get("resets_at"))
+        if reset is not None:
+            out[token] = reset
+    return out
+
+
+def scoped_limit_reset(scoped_limits: dict, model) -> float | None:
+    """The relayed reset epoch for the cap gating `model` (a transcript model
+    id or display name), or None if no matching cap has been relayed yet."""
+    token = normalize_model_token(model)
+    if not token:
+        return None
+    return scoped_limits.get(token)
+
+
+def model_limit_model(objs: list[dict]) -> str | None:
+    """The concrete model a tail model-limit 429 applies to. The 429 notice
+    itself is stamped model '<synthetic>', so the real model is the newest
+    ordinary assistant turn carrying a concrete model id (e.g.
+    'claude-fable-5'). Returns None if none is found."""
+    for obj in reversed(objs):
+        if obj.get("type") == "assistant":
+            message = obj.get("message")
+            model = message.get("model") if isinstance(message, dict) else None
+            if isinstance(model, str) and model and model != "<synthetic>":
+                return model
+    return None
+
+
 def find_cwd_in_lines(objs: list[dict]) -> str | None:
     # Iterate newest-first: if the session cd'd partway through, the most
     # recent cwd is where a resume should land, not the directory it started
@@ -741,7 +825,19 @@ def _parse_cli_transcript(jsonl_path: Path, file_stat, project_folder: Path) -> 
     # / ...) is skipped so it can't mask a rate_limit that IS still the tail,
     # and the limit's own inline synthetic notice line (model "<synthetic>" /
     # isApiErrorMessage) is skipped for the same reason.
+    #
+    # A PER-MODEL cap (e.g. the weekly Fable limit) is a DIFFERENT shape: it
+    # surfaces NOT as a rate_limit-typed event but as an ordinary `assistant`
+    # turn with `isApiErrorMessage` + `apiErrorStatus == 429` (text "You've
+    # reached your Fable 5 limit…"), and it carries NO reset time of its own
+    # (the reset lives only on the usage page, relayed via scoped_limits.json).
+    # It's distinguished from the 5h/weekly cap purely by the ABSENCE of a
+    # rate_limit-typed event: the account-wide cap emits BOTH its structured
+    # event AND an inline 429 notice, so we can't tell them apart by the notice
+    # alone. So: remember the newest tail-effective 429 notice as we walk, but
+    # only treat it as a model cap if the walk finds no rate_limit event.
     rate_limit_obj = None
+    model_limit_obj = None
     for obj in reversed(objs):
         obj_type = obj.get("type", "")
         if "rate_limit" in obj_type.lower():
@@ -751,9 +847,20 @@ def _parse_cli_transcript(jsonl_path: Path, file_stat, project_folder: Path) -> 
             break  # session ended normally
         if obj_type in ("user", "assistant"):
             message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+            if (obj.get("isApiErrorMessage") and obj.get("apiErrorStatus") == 429
+                    and model_limit_obj is None):
+                model_limit_obj = obj  # candidate per-model cap at the tail
             if obj.get("isApiErrorMessage") or message.get("model") == "<synthetic>":
                 continue  # the limit's own inline notice, not a resumption
             break  # a genuine turn newer than any limit — session moved on
+
+    # Per-model cap only when there's NO structured rate_limit event (that path
+    # owns the account-wide caps and has its own reset), the tail really is a
+    # 429 notice, and it's a real human session. The reset comes later, in
+    # compute_cli_records, from the relayed scoped_limits.json.
+    model_limit = None
+    if rate_limit_obj is None and model_limit_obj is not None and has_human_message:
+        model_limit = model_limit_model(objs)
 
     waiting_resets_at = None
     if rate_limit_obj is not None and has_human_message:
@@ -780,6 +887,10 @@ def _parse_cli_transcript(jsonl_path: Path, file_stat, project_folder: Path) -> 
         "size": file_stat.st_size,
         "has_human_message": has_human_message,
         "waiting_resets_at": waiting_resets_at,
+        # Concrete model id ('claude-fable-5') when the effective tail is a
+        # per-model cap 429, else None. Content-derived, so cacheable; the
+        # reset time is looked up per-cycle from scoped_limits.json (NOT here).
+        "model_limit": model_limit,
         "project_dir": project_dir or None,
         "session_title": find_session_title(objs),
         "prompt_preview": find_prompt_preview(objs),
@@ -790,7 +901,8 @@ def _parse_cli_transcript(jsonl_path: Path, file_stat, project_folder: Path) -> 
 
 
 def compute_cli_records(now: float, runtime: dict, cache: dict,
-                        retention_minutes: float = ACTIVE_WINDOW_MINUTES) -> dict:
+                        retention_minutes: float = ACTIVE_WINDOW_MINUTES,
+                        scoped_limits: dict | None = None) -> dict:
     """OUTSIDE StateLock: scan recent CLI transcripts and return
     {session_id: record}. This does NOT read or mutate state.json — it only
     computes what the files say; merge_cli_records() applies that to state
@@ -798,12 +910,18 @@ def compute_cli_records(now: float, runtime: dict, cache: dict,
     classification out here is the whole point (the lock was previously held
     across a full re-read of every in-window transcript, every 10s).
 
+    `scoped_limits` is the per-model cap reset map from load_scoped_limits()
+    (defaults to a fresh read); it's what supplies a Fable-limited session's
+    reset time, since the transcript's own 429 carries none.
+
     A record's "status" is "active", "waiting", or None. None is meaningful:
     the file is in-window but is not a trackable session right now (no human
     message, or gone quiet, or no current rate limit) — merge will drop any
     existing UNHANDLED entry for it, exactly as the old scan's `status is
     None` branch did. A trackable session whose project dir can't be resolved
     yields no record at all (same as the old skip)."""
+    if scoped_limits is None:
+        scoped_limits = load_scoped_limits()
     records: dict = {}
     if not PROJECTS_DIR.is_dir():
         return records
@@ -885,9 +1003,23 @@ def compute_cli_records(now: float, runtime: dict, cache: dict,
             # emitted, last_seen stops advancing, and the retention+grace
             # cutoff drops the entry.
             pending_tool = False
+            scoped_model = None
             if derived["waiting_resets_at"] is not None:
                 status = "waiting"
                 resets_at = derived["waiting_resets_at"]
+            elif derived.get("model_limit"):
+                # Per-model cap (e.g. Fable): a "waiting" session like a normal
+                # rate limit, but its reset time isn't in the transcript — pull
+                # it from the widget-relayed scoped_limits.json. resets_at may
+                # be None if the relay hasn't caught up yet: the row still shows
+                # (visible + kept past the quiet-drop, exactly like the 5h cap),
+                # it just isn't armed for auto-resume until the reset arrives
+                # (reconcile_scoped_limit_resets fills it in later, even after
+                # the transcript leaves the scan window). scoped_model is stored
+                # so that reconcile knows which cap to match.
+                status = "waiting"
+                scoped_model = derived["model_limit"]
+                resets_at = scoped_limit_reset(scoped_limits, scoped_model)
             elif derived["has_human_message"]:
                 if (now - activity_mtime) > active_window_seconds:
                     pending_tool = bool(_scan_current_turn(derived["objs_tail"])[0])
@@ -921,6 +1053,11 @@ def compute_cli_records(now: float, runtime: dict, cache: dict,
                 # record is "active" (pending tool call past the retention
                 # edge) — prune_old_entries keys off it (see above).
                 "pending_tool": pending_tool,
+                # Model id of a per-model cap (e.g. 'claude-fable-5') when this
+                # is a model-limited waiting session, else None. merge stores
+                # it; reconcile_scoped_limit_resets uses it to fill/refresh
+                # resets_at from scoped_limits.json.
+                "scoped_model": scoped_model,
             }
 
     # Bound memory: forget any cached file that has left the scan window.
@@ -958,6 +1095,9 @@ def merge_cli_records(state: dict, records: dict, now: float) -> None:
             existing["prompt_preview"] = rec["prompt_preview"]
             existing["status"] = rec["status"]
             existing["resets_at"] = rec["resets_at"]
+            # Which per-model cap (if any) this waiting session is blocked on;
+            # None for a normal 5h/weekly rate limit or an active session.
+            existing["scoped_model"] = rec.get("scoped_model")
             existing["last_seen"] = now
             # `last_seen` is poll-cycle bookkeeping (bumped every ~10s while
             # in-window, regardless of real activity), so it's useless as an
@@ -971,13 +1111,20 @@ def merge_cli_records(state: dict, records: dict, now: float) -> None:
             # call. prune_old_entries switches to last_seen for these.
             existing["pending_tool"] = rec.get("pending_tool", False)
             if was_active and rec["status"] == "waiting":
-                log(f"Session {session_id} in {rec['project_dir']} transitioned active -> rate-limited "
-                    f"(enabled={existing.get('enabled', False)} preserved), "
-                    f"resets at {datetime.fromtimestamp(rec['resets_at'])}")
+                # rec["resets_at"] can be None for a per-model cap whose reset
+                # the relay hasn't supplied yet — don't crash formatting it.
+                kind = f"model cap ({rec['scoped_model']})" if rec.get("scoped_model") else "rate-limited"
+                when = (f"resets at {datetime.fromtimestamp(rec['resets_at'])}"
+                        if rec["resets_at"] else "reset time pending (from usage page)")
+                log(f"Session {session_id} in {rec['project_dir']} transitioned active -> {kind} "
+                    f"(enabled={existing.get('enabled', False)} preserved), {when}")
         else:
-            log(f"Detected {rec['status']} session {session_id} ({rec['session_title']!r}) in {rec['project_dir']}"
-                + (f", resets at {datetime.fromtimestamp(rec['resets_at'])}" if rec["resets_at"] else "")
-                + " — added to widget, NOT auto-resuming")
+            scoped = rec.get("scoped_model")
+            when = (f", resets at {datetime.fromtimestamp(rec['resets_at'])}" if rec["resets_at"]
+                    else (", reset time pending (from usage page)" if scoped else ""))
+            what = f"{rec['status']} (model cap: {scoped})" if scoped else rec["status"]
+            log(f"Detected {what} session {session_id} ({rec['session_title']!r}) in {rec['project_dir']}"
+                + when + " — added to widget, NOT auto-resuming")
             state[session_id] = {
                 "kind": "cli",          # explicit type sentinel (see prune_deleted_sessions)
                 "project_dir": rec["project_dir"],
@@ -993,6 +1140,10 @@ def merge_cli_records(state: dict, records: dict, now: float) -> None:
                 "handled": False,
                 "handled_at": None,
                 "status": rec["status"],
+                # Which per-model cap (if any) this waiting session is blocked
+                # on; None for a normal rate limit / active session. See
+                # reconcile_scoped_limit_resets.
+                "scoped_model": scoped,
                 # Widget-owned display field, daemon-computed each cycle (never
                 # user-toggled): "running" / "needs_input" / "idle". See
                 # classify_work_status's docstring.
@@ -1178,6 +1329,29 @@ def merge_cowork_records(state: dict, records: dict, now: float) -> None:
                 "resume_armed": False,
                 "needs_attention": False,
             }
+
+
+def reconcile_scoped_limit_resets(state: dict, scoped_limits: dict) -> None:
+    """INSIDE StateLock: fill in / refresh reset times for model-limited (e.g.
+    Fable) waiting sessions from the widget-relayed scoped_limits.json.
+
+    A per-model cap's reset lives on the usage page, not in the transcript, and
+    the relay file can lag the moment the daemon first detects the cap — so a
+    session may be marked waiting with resets_at=None (visible but not armed).
+    This runs every poll INDEPENDENT of the transcript scan window, so the
+    arming happens as soon as the widget relays the reset even if the (dead)
+    transcript has already aged out of the scan window and stopped producing
+    records. Also refreshes a stale reset if the cap's window rolled. Never
+    touches non-scoped entries, handled entries, or widget-owned fields."""
+    for entry in state.values():
+        if entry.get("handled") or entry.get("status") != "waiting":
+            continue
+        model = entry.get("scoped_model")
+        if not model:
+            continue
+        reset = scoped_limit_reset(scoped_limits, model)
+        if reset is not None and entry.get("resets_at") != reset:
+            entry["resets_at"] = reset
 
 
 def resume_due_sessions(state: dict) -> None:
@@ -1533,12 +1707,20 @@ def main() -> None:
                     log(f"session idle retention: {retention_minutes:g}m -> {new_retention:g}m (config.json)")
                     retention_minutes = new_retention
             runtime = collect_runtime_snapshot()
-            cli_records = compute_cli_records(now, runtime, _PARSE_CACHE, retention_minutes)
+            # Per-model caps (e.g. Fable), relayed by the widget. Read once per
+            # cycle outside the lock (pure file read) and used both to arm new
+            # model-limited records and to reconcile already-persisted ones.
+            scoped_limits = load_scoped_limits()
+            cli_records = compute_cli_records(now, runtime, _PARSE_CACHE, retention_minutes,
+                                              scoped_limits)
             cowork_records = compute_cowork_records(now, retention_minutes)
             with StateLock():
                 state = load_state()
                 merge_cli_records(state, cli_records, now)
                 merge_cowork_records(state, cowork_records, now)
+                # Fill/refresh model-cap reset times even for sessions whose
+                # transcript has left the scan window (see the function docstring).
+                reconcile_scoped_limit_resets(state, scoped_limits)
                 resume_due_sessions(state)
                 # Track 1 scaffolding: dry-run only (see cowork_resume.DRY_RUN).
                 # Only touches Cowork sessions the widget has explicitly armed

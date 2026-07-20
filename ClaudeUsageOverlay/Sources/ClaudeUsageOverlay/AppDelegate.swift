@@ -47,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var fetcher: UsageFetcher!
     private var chatsFetcher: ChatsFetcher!
     private var loginWindowController: LoginWindowController?
+    private var sessionKeyWindowController: SessionKeyWindowController?
     private var graphWindowController: GraphWindowController?
 
     private var dataTimer: Timer?
@@ -494,6 +495,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(withTitle: "Settings…", action: #selector(presentSettingsWindow), keyEquivalent: ",").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Sign In…", action: #selector(presentLoginWindow), keyEquivalent: "").target = self
+        // Escape hatch for SSO the embedded window can't do (passkey/YubiKey,
+        // managed-browser device trust): paste a session cookie from your real
+        // browser. See SessionKeyWindowController.
+        menu.addItem(withTitle: "Sign In with Session Key…", action: #selector(presentSessionKeyWindow), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Sign Out", action: #selector(signOut), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q").target = self
@@ -560,6 +565,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             loginWindowController = LoginWindowController()
         }
         loginWindowController?.show()
+    }
+
+    /// Manual session-key sign-in (SSO the embedded webview can't complete).
+    /// Installs the pasted cookie, then verifies with a real usage fetch so the
+    /// window reports genuine success/failure rather than just "cookie set".
+    @objc private func presentSessionKeyWindow() {
+        if sessionKeyWindowController == nil {
+            sessionKeyWindowController = SessionKeyWindowController(onSubmit: { [weak self] pasted, done in
+                guard let self = self else { done(false); return }
+                self.apiClient.signIn(sessionKey: pasted) { installed in
+                    guard installed else { done(false); return }
+                    // Confirm the cookie actually authenticates. A 401/403
+                    // surfaces as .loggedOut; any other error (offline, etc.)
+                    // isn't the cookie's fault, so treat it as tentatively OK.
+                    self.apiClient.fetchUsage { result in
+                        switch result {
+                        case .failure(.loggedOut):
+                            done(false)
+                        case .failure:
+                            self.refreshNow()
+                            done(true)
+                        case .success:
+                            self.model.isLoggedOut = false
+                            self.chatsModel.isLoggedOut = false
+                            self.refreshNow()
+                            done(true)
+                        }
+                    }
+                }
+            })
+        }
+        sessionKeyWindowController?.show()
     }
 
     /// Item 3: opens (or re-shows) the larger, resizable graph window from
@@ -745,12 +782,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .graph:
             return graphPanelHeight
         case .planFit:
-            return planFitPanelHeight
+            return planFitPanelHeight + planFitTextExtra()
         case .main:
             var height = collapsedPanelHeight - apiRowCountDelta()
             if sessionsModel.sessionsExpanded { height += sessionsExpandedExtra }
             return height
         }
+    }
+
+    /// The Plan-fit tab's verdict recommendation + data-maturity lines
+    /// (rendered since 2026-07-19; previously the recommendation only lived
+    /// in plan_fit.json/CLI) wrap to a data-dependent number of lines, so
+    /// their height can't be baked into the fixed `planFitPanelHeight`
+    /// constant — it was measured before they existed and clipped them.
+    /// Measure the actual strings at their render fonts against the card's
+    /// text width (280 − 2×12 padding); each present line also adds the tab
+    /// VStack's 9pt sibling spacing, plus 2pt slack per block since
+    /// NSString's line breaking can differ from SwiftUI's by a hair. Gated
+    /// exactly like planFitTabContent gates the lines themselves (hidden on
+    /// API accounts). The `planFitModel.$data` subscription in
+    /// setupOverlayPanel already calls updatePanelSize() on every plan-fit
+    /// refresh, and the tab-selection sink covers switching in — so this
+    /// re-measures whenever the text can have changed.
+    private func planFitTextExtra() -> CGFloat {
+        guard !configStore.config.isApiAccount, let data = planFitModel.data else { return 0 }
+        let textWidth: CGFloat = 280 - 2 * 12
+        func measuredHeight(_ text: String, fontSize: CGFloat) -> CGFloat {
+            let bounds = (text as NSString).boundingRect(
+                with: NSSize(width: textWidth, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: [.font: NSFont.systemFont(ofSize: fontSize)])
+            return ceil(bounds.height) + 2
+        }
+        var extra: CGFloat = 0
+        if let rec = data.recommendation {
+            extra += 9 + measuredHeight(rec, fontSize: 8.5)
+        }
+        if let maturity = data.dataMaturity {
+            extra += 9 + measuredHeight(maturity, fontSize: 8)
+        }
+        return extra
     }
 
     /// WS-2: how much SHORTER the Main tab's top block is than the two

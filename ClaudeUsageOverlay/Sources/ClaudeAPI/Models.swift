@@ -49,9 +49,40 @@ public struct UsageWindow {
     public let resetsAtRaw: String?
 }
 
+/// One per-model (model-scoped) usage cap from the usage endpoint's
+/// `limits[]` array — e.g. the weekly Fable cap. Distinct from the
+/// account-wide session/weekly windows: each of these gates a SINGLE model,
+/// and its `resetsAt` is the ONLY place the app can learn when a
+/// model-limited session becomes usable again. A CLI transcript that hit a
+/// per-model cap records a plain 429 with NO reset time of its own, so the
+/// daemon relies on this being relayed to it (see the widget's
+/// ScopedLimitLogger → the daemon's scoped_limits.json).
+public struct ScopedLimit {
+    /// Human-readable model name as the API labels it ("Fable", "Opus", …).
+    /// The scope's model `id` has been observed null, so this is the
+    /// join key the daemon matches transcript models against.
+    public let modelDisplayName: String
+    /// Model id when the API provides one (often null today) — the preferred
+    /// join key when present.
+    public let modelID: String?
+    public let resetsAt: Date?
+    public let percent: Int?
+    /// API severity string ("normal"/"critical"/…). Diagnostics only.
+    public let severity: String?
+    /// True when the API flags this cap as currently in effect. Only active
+    /// caps are worth relaying (an inactive one has nothing to wait on).
+    public let isActive: Bool
+    /// Raw reset string as the API returned it, for the widget's own on-disk
+    /// relay format — same rationale as UsageWindow.resetsAtRaw.
+    public let resetsAtRaw: String?
+}
+
 public struct UsageReport {
     public let session: UsageWindow   // API's 5-hour window
     public let weekly: UsageWindow    // API's 7-day window
+    /// Active per-model caps parsed from the usage `limits[]` array (empty
+    /// when none apply). See ScopedLimit.
+    public let scopedLimits: [ScopedLimit]
     /// The full raw usage response, opaque. Exists ONLY for SnapshotLogger's
     /// `"raw"` field (historical snapshot format keeps the whole object for
     /// future analytics). Nothing may parse this outside the ClaudeAPI

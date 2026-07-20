@@ -23,7 +23,7 @@ from page context. 401/403 on ANY endpoint ⇒ `.loggedOut`.
 `orgs[0]` (S9; `capabilities` may be absent entirely).
 
 ### GET https://claude.ai/api/organizations/{uuid}/usage
-`{ five_hour: { utilization, resets_at }, seven_day: { ... }, ... }`
+`{ five_hour: { utilization, resets_at }, seven_day: { ... }, limits: [...], ... }`
 - `utilization`: number (percent).
 - `resets_at`: ISO8601, with or without fractional seconds.
 - Maps to `UsageReport` (session=five_hour, weekly=seven_day). The whole
@@ -31,6 +31,24 @@ from page context. 401/403 on ANY endpoint ⇒ `.loggedOut`.
   snapshots.jsonl on-disk format (which historically mirrors these field
   names) is owned by SnapshotLogger/GraphModel/usage_collector.py, NOT by
   this module; do not "fix" those names when the API renames fields.
+- `limits`: array (observed 2026-07-20) of every active/known cap. Each
+  entry: `{ group, kind, scope, is_active, resets_at, severity, percent }`.
+  - The account-wide caps duplicate the top-level windows: `kind`
+    `session` (group `session`) and `weekly_all` (group `weekly`), both
+    `scope: null`.
+  - **Per-model caps** carry `kind: "weekly_scoped"` and
+    `scope: { model: { id, display_name }, surface }`. `scope.model.id`
+    has been observed `null`, so `display_name` (e.g. `"Fable"`) is the
+    join key. Example live entry: `{ kind: "weekly_scoped", scope: { model:
+    { id: null, display_name: "Fable" } }, is_active: true, percent: 100,
+    severity: "critical", resets_at: "…" }`.
+  - `decodeScopedLimits` keeps ONLY the model-scoped entries →
+    `UsageReport.scopedLimits: [ScopedLimit]`. This is the sole source of a
+    per-model cap's reset time: a CLI transcript that hits one records a
+    plain 429 `isApiErrorMessage` with NO reset of its own, so the widget
+    relays `scopedLimits` to the daemon via
+    `~/.claude-autoresume/usage/scoped_limits.json` (widget-owned on-disk
+    format, same freeze rule as snapshots.jsonl) to arm auto-resume.
 
 ### GET https://claude.ai/api/organizations/{uuid}/chat_conversations?limit=30
 Plain JSON array (confirmed HTTP 200 + valid JSON; wrong paths 404).

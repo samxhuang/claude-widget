@@ -156,6 +156,65 @@ final class ClaudeWebSession: NSObject, WKNavigationDelegate {
         }
     }
 
+    /// Manual sign-in for environments where the interactive login window
+    /// can't complete the auth ceremony — e.g. an org SSO that requires a
+    /// passkey/YubiKey in managed Chrome, which this ad-hoc-signed app's
+    /// WKWebView (no browser entitlement, not the managed browser) cannot
+    /// satisfy. The user signs in with their real browser, copies the
+    /// claude.ai session cookie, and hands its value here; we install it into
+    /// the shared cookie store so every `fetch()` authenticates exactly as if
+    /// the login window had set it, then restart the navigation lifecycle so
+    /// queued/future work runs against the freshly-authenticated jar.
+    ///
+    /// Accepts either a bare cookie value or a `sessionKey=…[; …]` fragment
+    /// (extracts the value). `completion(false)` means the input yielded no
+    /// usable value — it does NOT verify the cookie actually authenticates;
+    /// the caller confirms that with a real fetch.
+    func installSessionKey(_ pasted: String, completion: @escaping (Bool) -> Void) {
+        guard let value = Self.extractSessionKey(from: pasted) else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        let props: [HTTPCookiePropertyKey: Any] = [
+            .domain: "." + ClaudeWebURLs.host,
+            .path: "/",
+            .name: ClaudeWebURLs.sessionCookieName,
+            .value: value,
+            .secure: "TRUE",
+            // Persist ~1y; the real cookie rotates sooner and the user re-pastes.
+            .expires: Date(timeIntervalSinceNow: 60 * 60 * 24 * 365)
+        ]
+        guard let cookie = HTTPCookie(properties: props) else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        WKWebsiteDataStore.default().httpCookieStore.setCookie(cookie) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self else { completion(true); return }
+                // Restart navigation so pending + future fetches see the cookie.
+                self.didLoadBase = false
+                self.retryDelay = Self.minRetryDelay
+                self.retryScheduled = false
+                self.loadBase()
+                completion(true)
+            }
+        }
+    }
+
+    /// Pulls the session-cookie value out of pasted text. Handles a bare value
+    /// or a `sessionKey=<value>[; other=…]` cookie fragment (what you get if
+    /// you copy a whole Cookie header instead of just the one value).
+    static func extractSessionKey(from pasted: String) -> String? {
+        let trimmed = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let marker = ClaudeWebURLs.sessionCookieName + "="
+        if let r = trimmed.range(of: marker) {
+            let value = trimmed[r.upperBound...].prefix { $0 != ";" && !$0.isWhitespace }
+            return value.isEmpty ? nil : String(value)
+        }
+        return trimmed
+    }
+
     /// Forces a full cookie/session reset (used by "Sign Out" in the menu).
     /// Affects every caller of this shared session, which is the desired
     /// behavior — there's one claude.ai login, not one per feature.

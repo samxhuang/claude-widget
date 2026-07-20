@@ -192,6 +192,17 @@ public final class ClaudeAPIClient {
         session.resetSession(completion: completion)
     }
 
+    /// Manual sign-in: install a claude.ai session cookie captured from the
+    /// user's real browser. The escape hatch for SSO setups the embedded login
+    /// window can't complete (passkey/YubiKey, managed-browser device trust) —
+    /// see ClaudeWebSession.installSessionKey. `installed == false` means the
+    /// pasted text yielded no usable cookie value; a `true` here only means the
+    /// cookie was set, so callers should follow with a real fetch to confirm it
+    /// actually authenticates.
+    public func signIn(sessionKey pasted: String, completion: @escaping (_ installed: Bool) -> Void) {
+        session.installSessionKey(pasted, completion: completion)
+    }
+
     // MARK: - Shared script fragments
 
     /// Fetches /organizations and defines `orgId`, preferring an org whose
@@ -266,8 +277,37 @@ public final class ClaudeAPIClient {
         return UsageReport(
             session: window(usage["five_hour"] as? [String: Any]),
             weekly: window(usage["seven_day"] as? [String: Any]),
+            scopedLimits: decodeScopedLimits(usage["limits"]),
             rawJSON: usage
         )
+    }
+
+    /// The usage `limits[]` array carries a mix of entries: the account-wide
+    /// session/weekly caps (already decoded as UsageWindows above) AND
+    /// per-model caps, distinguished by a `scope.model` object. We keep only
+    /// the model-scoped ones — e.g.
+    /// `{kind: "weekly_scoped", scope: {model: {display_name: "Fable"}},
+    ///   resets_at, percent, severity, is_active}`. Entries without a model
+    /// scope are dropped (not our concern here); a completely absent/oddly
+    /// shaped array yields an empty list, never a crash.
+    private static func decodeScopedLimits(_ raw: Any?) -> [ScopedLimit] {
+        guard let items = raw as? [[String: Any]] else { return [] }
+        return items.compactMap { item -> ScopedLimit? in
+            guard let scope = item["scope"] as? [String: Any],
+                  let model = scope["model"] as? [String: Any] else { return nil }
+            let display = (model["display_name"] as? String)?.trimmingCharacters(in: .whitespaces)
+            guard let display, !display.isEmpty else { return nil }
+            let resetsRaw = item["resets_at"] as? String
+            return ScopedLimit(
+                modelDisplayName: display,
+                modelID: model["id"] as? String,
+                resetsAt: parseISODate(resetsRaw),
+                percent: (item["percent"] as? NSNumber)?.intValue,
+                severity: item["severity"] as? String,
+                isActive: (item["is_active"] as? Bool) ?? false,
+                resetsAtRaw: resetsRaw
+            )
+        }
     }
 
     /// Maps the recents feed's raw `status`/`worker_status` vocabulary to

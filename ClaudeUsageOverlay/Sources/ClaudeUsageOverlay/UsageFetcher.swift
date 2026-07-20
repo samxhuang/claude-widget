@@ -14,6 +14,11 @@ final class UsageFetcher {
     // effect of a successful fetch, not something any other part of the app
     // needs to see or control.
     private let snapshotLogger = SnapshotLogger()
+    // Relays active per-model caps (e.g. the Fable limit) to the daemon so it
+    // can arm auto-resume for model-limited sessions — the daemon can't reach
+    // claude.ai to learn their reset times itself. Same side-effect-only
+    // ownership as snapshotLogger.
+    private let scopedLimitLogger = ScopedLimitLogger()
 
     init(client: ClaudeAPIClient, model: UsageModel, onLoginNeeded: @escaping () -> Void) {
         self.client = client
@@ -39,6 +44,10 @@ final class UsageFetcher {
                 // confirmed success (not error, not loggedOut), and the
                 // logger itself throttles to >=100s between writes.
                 self.snapshotLogger.record(report: report)
+                // Relay active per-model caps for the daemon (unthrottled —
+                // the file is a full-state snapshot, and clearing a just-reset
+                // cap needs to propagate promptly).
+                self.scopedLimitLogger.record(report: report)
             }
         }
     }

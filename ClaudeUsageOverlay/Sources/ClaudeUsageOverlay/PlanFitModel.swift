@@ -19,15 +19,29 @@ struct TierVerdict {
     var apiEquivRatio: Double?
     var projectedPeak7dUtil: Double?
     var projectedPeak5hUtil: Double?
+    /// Throttle-tolerance verdict fields (2026-07-19 daemon): projected
+    /// cap-hit days per 30-day month and the median projected peak across
+    /// those cap days. All nil when the deployed daemon predates the
+    /// throttle verdict — display falls back to the peak columns.
+    var throttleDays5hPerMonth: Double?
+    var throttleDays7dPerMonth: Double?
+    var medianThrottlePeak5hPct: Double?
+    var medianThrottlePeak7dPct: Double?
     var viable: Bool
     var hasPeakData: Bool
 
-    /// The backend's own `viable` flag is the primary signal, but we also
-    /// flag locally if a projected peak utilization is over 100% even when
-    /// `viable` wasn't (yet) updated to reflect it — belt and suspenders,
-    /// since this is exactly the number a Max-20x user cares about most.
+    var hasThrottleData: Bool {
+        throttleDays5hPerMonth != nil || throttleDays7dPerMonth != nil
+    }
+
+    /// The backend's `viable` flag is authoritative. Under the throttle
+    /// verdict a projected peak over 100% is EXPECTED on a viable tier (one
+    /// outlier day within tolerance), so the old local peak>100 red-flag
+    /// only applies as a fallback when the daemon is an old build whose
+    /// plan_fit.json carries no throttle fields.
     var isFlagged: Bool {
         if !viable { return true }
+        if hasThrottleData { return false }
         if let p5 = projectedPeak5hUtil, p5 > 100 { return true }
         if let p7 = projectedPeak7dUtil, p7 > 100 { return true }
         return false
@@ -219,6 +233,10 @@ final class PlanFitModel: ObservableObject {
                         apiEquivRatio: doubleValue(p["api_equiv_ratio"]),
                         projectedPeak7dUtil: doubleValue(p["projected_peak_7d_util"]),
                         projectedPeak5hUtil: doubleValue(p["projected_peak_5h_util"]),
+                        throttleDays5hPerMonth: doubleValue(p["throttle_days_5h_per_month"]),
+                        throttleDays7dPerMonth: doubleValue(p["throttle_days_7d_per_month"]),
+                        medianThrottlePeak5hPct: doubleValue(p["median_throttle_peak_5h_pct"]),
+                        medianThrottlePeak7dPct: doubleValue(p["median_throttle_peak_7d_pct"]),
                         viable: p["viable"] as? Bool ?? true,
                         hasPeakData: p["has_peak_data"] as? Bool ?? false
                     ))
@@ -323,6 +341,34 @@ final class PlanFitModel: ObservableObject {
     func priceText(_ tier: TierVerdict) -> String? {
         guard let price = tier.priceUsd else { return nil }
         return "$\(Int(price))"
+    }
+
+    /// "5h 0.4 · 7d 0" — projected cap-hit days per 30-day month for the
+    /// tier grid's last column. nil when the deployed daemon predates the
+    /// throttle verdict, so the caller can fall back to the legacy peaks
+    /// text instead of showing an empty cell.
+    func capDaysText(_ tier: TierVerdict) -> String? {
+        guard tier.hasThrottleData else { return nil }
+        func fmt(_ v: Double?) -> String {
+            guard let v = v else { return "—" }
+            return v == v.rounded() ? String(format: "%.0f", v) : String(format: "%.1f", v)
+        }
+        return "5h \(fmt(tier.throttleDays5hPerMonth)) · 7d \(fmt(tier.throttleDays7dPerMonth))"
+    }
+
+    /// Tooltip for a throttle-verdict tier row: what the cap-day numbers
+    /// mean plus the all-time peaks (still worth seeing, just demoted from
+    /// deciding viability) and the typical cap-day severity.
+    func capDaysHelpText(_ tier: TierVerdict, peaksText: String) -> String {
+        var lines = ["Projected days per month hitting the cap (5h / 7d windows)."]
+        lines.append("All-time projected peaks: \(peaksText)")
+        if let sev = tier.medianThrottlePeak5hPct {
+            lines.append(String(format: "Typical 5h cap-day peaks near %.0f%% of cap.", sev))
+        }
+        if let sev = tier.medianThrottlePeak7dPct {
+            lines.append(String(format: "Typical 7d cap-day peaks near %.0f%% of cap.", sev))
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// "163×" — the tier's price expressed as a multiple of what the same

@@ -1344,6 +1344,22 @@ struct OverlayView: View {
                 if !data.tiers.isEmpty && !isApi {
                     tierGrid(data.tiers)
                 }
+
+                // The verdict's own words. Parsed since the tab was built but
+                // never rendered anywhere — the recommendation only lived in
+                // plan_fit.json / the CLI report. Same Max-plan framing gate
+                // as the tier grid.
+                if !isApi, let rec = data.recommendation {
+                    Text(rec)
+                        .font(.system(size: 8.5))
+                        .foregroundColor(.white.opacity(0.6))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !isApi, let maturity = data.dataMaturity {
+                    Text(maturity)
+                        .font(.system(size: 8))
+                        .foregroundColor(.white.opacity(0.35))
+                }
             }
         } else {
             Text("collecting data…")
@@ -1385,12 +1401,17 @@ struct OverlayView: View {
     /// usage" (item 4a) without repeating "API value" on every row.
     @ViewBuilder
     private func tierGrid(_ tiers: [TierVerdict]) -> some View {
+        // Throttle-verdict daemon builds report projected cap-days/month per
+        // tier; the last column shows those (frequency is what viability is
+        // judged on now). Legacy plan_fit.json without throttle fields keeps
+        // the old projected-peaks column.
+        let anyThrottle = tiers.contains { $0.hasThrottleData }
         Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
             GridRow {
                 Text("Plan")
                 Text("Price").gridColumnAlignment(.trailing)
                 Text("× API").gridColumnAlignment(.trailing)
-                Text("Peaks")
+                Text(anyThrottle ? "Cap d/mo" : "Peaks")
             }
             .font(.system(size: 7.5, weight: .semibold))
             .foregroundColor(.white.opacity(0.4))
@@ -1414,9 +1435,12 @@ struct OverlayView: View {
             Text(planFit.ratioText(tier) ?? "—")
                 .font(.system(size: 9, weight: .medium).monospacedDigit())
                 .foregroundColor(.white.opacity(0.8))
-            Text(tierPeaksText(tier))
+            Text(planFit.capDaysText(tier) ?? tierPeaksText(tier))
                 .font(.system(size: 8.5).monospacedDigit())
                 .foregroundColor(tier.isFlagged ? .red.opacity(0.9) : .white.opacity(0.5))
+                .help(tier.hasThrottleData
+                      ? planFit.capDaysHelpText(tier, peaksText: tierPeaksText(tier))
+                      : "Projected peak utilization (5h / 7d windows)")
         }
     }
 
