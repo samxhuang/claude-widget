@@ -279,6 +279,32 @@ class TestIncremental(TempStateMixin, unittest.TestCase):
         self.assertIn("claude-haiku-4-5", models)
         self.assertEqual(models["claude-haiku-4-5"]["input"], 50)
 
+    def test_workflow_nested_subagent_transcripts_are_scanned(self):
+        # Workflow-spawned agents nest one level deeper than plain subagents:
+        # <session_id>/subagents/workflows/wf_<id>/agent-*.jsonl. A
+        # non-recursive glob silently dropped their entire token spend
+        # (regression: 2026-07-19, 55 agents / ~$338 API-equivalent missed).
+        session = self.projects_dir / "proj1" / "sess1.jsonl"
+        wf_agent = (self.projects_dir / "proj1" / "sess1" / "subagents"
+                    / "workflows" / "wf_abc123-1" / "agent-a1.jsonl")
+        _write_jsonl(session, [
+            _assistant_event("msg_top", "req_top", "claude-sonnet-5", "2026-07-18T14:00:00.000Z",
+                              input_tokens=1, output_tokens=1),
+        ])
+        _write_jsonl(wf_agent, [
+            _assistant_event("msg_wf", "req_wf", "claude-fable-5", "2026-07-18T14:02:00.000Z",
+                              input_tokens=70, output_tokens=35),
+        ])
+
+        uc.collect(self.state_dir, now=BASE_EPOCH, projects_dir=self.projects_dir,
+                   cowork_dir=self.cowork_dir, quiet=True)
+
+        store = uc.load_store(self.state_dir)
+        models = store["hours"]["2026-07-18T14"][uc.SOURCE_CODE_CLI]
+        self.assertIn("claude-fable-5", models)
+        self.assertEqual(models["claude-fable-5"]["input"], 70)
+        self.assertEqual(models["claude-fable-5"]["output"], 35)
+
     def test_malformed_lines_skipped_not_fatal(self):
         session = self.projects_dir / "proj1" / "sess1.jsonl"
         session.parent.mkdir(parents=True, exist_ok=True)

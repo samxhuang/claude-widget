@@ -261,7 +261,10 @@ def collect_runtime_snapshot() -> dict:
 
 def sidecar_activity_mtime(jsonl_path: Path) -> float:
     """Most recent write to the session's sidecar activity files: subagent
-    transcripts (<session_id>/subagents/*.jsonl) and streamed big tool
+    transcripts (<session_id>/subagents/**/*, recursive — Workflow-spawned
+    agents nest under subagents/workflows/wf_<id>/, and only the leaf
+    agent-*.jsonl files' mtimes advance while they stream; the intermediate
+    directories' mtimes bump only on file creation) and streamed big tool
     outputs (<session_id>/tool-results/*). Fresh writes here mean work is
     happening even while the main transcript is quiet."""
     latest = 0.0
@@ -270,11 +273,12 @@ def sidecar_activity_mtime(jsonl_path: Path) -> float:
         d = base / sub
         if d.is_dir():
             try:
-                for p in d.iterdir():
-                    try:
-                        latest = max(latest, p.stat().st_mtime)
-                    except OSError:
-                        continue
+                for root, _dirs, files in os.walk(d):
+                    for name in files:
+                        try:
+                            latest = max(latest, os.path.getmtime(os.path.join(root, name)))
+                        except OSError:
+                            continue
             except OSError:
                 continue
     return latest

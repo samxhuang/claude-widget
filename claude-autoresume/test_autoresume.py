@@ -717,5 +717,37 @@ class TestConfigPlanCanonicalization(unittest.TestCase):
             self.assertEqual(self._plan_for(bad), acfg.DEFAULT_PLAN)
 
 
+# ---------------------------------------------------------------------------
+# Sidecar activity mtime must see Workflow-nested agent transcripts
+# (subagents/workflows/wf_<id>/agent-*.jsonl — the leaf files' mtimes advance
+# while agents stream, but the intermediate directories' mtimes don't, so a
+# non-recursive scan reads a running workflow as quiet)
+# ---------------------------------------------------------------------------
+
+class TestSidecarActivityMtimeRecursive(TempEnvMixin, unittest.TestCase):
+    def test_workflow_nested_agent_file_mtime_is_seen(self):
+        path = self.write_cli_transcript("sess1", [], mtime=1000.0)
+        wf_dir = self.projects_dir / "proj1" / "sess1" / "subagents" / "workflows" / "wf_x-1"
+        wf_dir.mkdir(parents=True)
+        agent_file = wf_dir / "agent-a1.jsonl"
+        agent_file.write_text("{}\n")
+        os.utime(agent_file, (5000.0, 5000.0))
+        # Freeze the intermediate dirs' mtimes in the past: only the leaf
+        # agent file is "fresh", which is exactly the streaming-workflow shape.
+        for d in (wf_dir, wf_dir.parent, wf_dir.parent.parent):
+            os.utime(d, (1000.0, 1000.0))
+        self.assertEqual(ar.sidecar_activity_mtime(path), 5000.0)
+        self.assertEqual(ar.latest_activity_mtime(path), 5000.0)
+
+    def test_plain_subagent_file_still_seen(self):
+        path = self.write_cli_transcript("sess1", [], mtime=1000.0)
+        sub_dir = self.projects_dir / "proj1" / "sess1" / "subagents"
+        sub_dir.mkdir(parents=True)
+        agent_file = sub_dir / "agent-a1.jsonl"
+        agent_file.write_text("{}\n")
+        os.utime(agent_file, (4000.0, 4000.0))
+        self.assertEqual(ar.sidecar_activity_mtime(path), 4000.0)
+
+
 if __name__ == "__main__":
     unittest.main()

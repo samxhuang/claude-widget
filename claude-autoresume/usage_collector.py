@@ -311,7 +311,9 @@ def _iter_code_cli_files(projects_dir: Path):
     """Top-level Code CLI session transcripts plus their subagent
     transcripts, mirroring autoresume.py's latest_activity_mtime() layout
     assumption: <project>/<session_id>.jsonl and
-    <project>/<session_id>/subagents/*.jsonl."""
+    <project>/<session_id>/subagents/**/*.jsonl (recursive: Workflow-spawned
+    agents nest one level deeper, subagents/workflows/wf_<id>/agent-*.jsonl —
+    a non-recursive glob silently drops their entire token spend)."""
     if not projects_dir.is_dir():
         return
     for project_folder in sorted(projects_dir.iterdir()):
@@ -321,7 +323,7 @@ def _iter_code_cli_files(projects_dir: Path):
             yield jsonl_path
             subagents_dir = jsonl_path.parent / jsonl_path.stem / "subagents"
             if subagents_dir.is_dir():
-                for sub_path in sorted(subagents_dir.glob("*.jsonl")):
+                for sub_path in sorted(subagents_dir.rglob("*.jsonl")):
                     yield sub_path
 
 
