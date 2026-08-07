@@ -57,17 +57,16 @@ in-window session costs a stat, not a full re-read, each poll.
 
 from __future__ import annotations  # keeps `X | None` / `list[str]` hints safe on Python 3.9 (macOS system python3)
 
-import fcntl
 import json
 import os
 import shutil
-import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
+import platform_compat  # The ONE OS seam: locks, paths, process table, spawn, atomic replace
 import plan_fit        # Usage analytics: plan-fit computation + pricing refresh
 import usage_collector  # Usage analytics: token collection from transcripts + snapshot compaction
 import cowork_resume  # Track 1: Cowork resume automation scaffolding — see that module's
@@ -79,15 +78,18 @@ import remote_sync    # Feature 2 "Shape C": fetch+merge remote hosts' state ove
 # Config
 # ---------------------------------------------------------------------------
 
-HOME = Path.home()
-PROJECTS_DIR = HOME / ".claude" / "projects"
+HOME = platform_compat.home()
+PROJECTS_DIR = platform_compat.projects_dir()
 # Cowork sessions (this includes Claude Desktop's Cowork mode) each get a
 # metadata file here (local_<uuid>.json: title, lastActivityAt, isArchived,
 # ...) plus a sibling local_<uuid>/audit.jsonl activity log. There is no
 # rate-limit/resume concept for these — Cowork manages its own lifecycle —
 # so we only ever show them in the widget as "active", never "waiting".
-COWORK_SESSIONS_DIR = HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
-STATE_DIR = HOME / ".claude-autoresume"
+# May be None on platforms where Cowork is not known to exist (see
+# platform_compat.cowork_sessions_dir); every use below guards for that and
+# skips the Cowork scan entirely rather than substituting a phantom path.
+COWORK_SESSIONS_DIR = platform_compat.cowork_sessions_dir()
+STATE_DIR = platform_compat.state_dir()
 STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.json.lock"
 LOG_DIR = STATE_DIR / "logs"
@@ -205,11 +207,13 @@ PENDING_INSTANT_GRACE_SECONDS = 10
 # run for a while with zero on-disk footprint.
 PENDING_SLOW_GRACE_SECONDS = 60
 
-SESSIONS_DIR = HOME / ".claude" / "sessions"
+SESSIONS_DIR = platform_compat.sessions_dir()
 # Command-line substrings that identify a tool child process actually
 # executing under a session's pid (Bash tool shells source a shell-snapshot
-# on startup; sandboxed variants wrap the same thing).
-_TOOL_CHILD_MARKERS = (".claude/shell-snapshots/", "sandbox-exec")
+# on startup; sandboxed variants wrap the same thing). Per-OS: `sandbox-exec`
+# is macOS-only, and Windows needs backslash normalization (and may not be
+# able to match on a command line at all — see platform_compat's R4 note).
+_TOOL_CHILD_MARKERS = platform_compat.tool_child_markers()
 
 
 def collect_runtime_snapshot() -> dict:
@@ -217,30 +221,15 @@ def collect_runtime_snapshot() -> dict:
     classification: which live process owns which session (from
     ~/.claude/sessions/<pid>.json), and which of those processes currently
     have a tool child actually executing (a shell sourcing a
-    ~/.claude/shell-snapshots snapshot). One ps fork + a handful of tiny
-    JSON reads per cycle."""
-    procs = []
-    try:
-        out = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,command="],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        out = ""
-    for line in out.splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) < 2:
-            continue
-        try:
-            pid, ppid = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        procs.append((pid, ppid, parts[2] if len(parts) > 2 else ""))
+    ~/.claude/shell-snapshots snapshot). One process-table snapshot (a `ps`
+    fork on POSIX) + a handful of tiny JSON reads per cycle."""
+    procs = platform_compat.process_snapshot()
 
     alive = {pid for pid, _, _ in procs}
     parent_of = {pid: ppid for pid, ppid, _ in procs}
     busy_pids = set()
     for pid, ppid, cmd in procs:
+        cmd = platform_compat.normalize_cmdline(cmd)
         if any(marker in cmd for marker in _TOOL_CHILD_MARKERS):
             # Credit the executing shell to its ancestors (the session
             # process is usually the direct parent; walk a couple levels to
@@ -521,8 +510,12 @@ def log(msg: str) -> None:
         DAEMON_LOG.parent.mkdir(parents=True, exist_ok=True)
         try:
             if DAEMON_LOG.exists() and DAEMON_LOG.stat().st_size > LOG_MAX_BYTES:
-                # .replace() atomically overwrites any previous .1 generation.
-                DAEMON_LOG.replace(DAEMON_LOG.with_name(DAEMON_LOG.name + ".1"))
+                # Atomically overwrites any previous .1 generation. Routed
+                # through platform_compat so Windows' sharing-violation retry
+                # applies here too (a tailing editor holding the log open is
+                # exactly the case that trips it); a plain os.replace on POSIX.
+                platform_compat.replace_with_retry(
+                    DAEMON_LOG, DAEMON_LOG.with_name(DAEMON_LOG.name + ".1"))
         except OSError:
             pass
         with open(DAEMON_LOG, "a") as f:
@@ -537,17 +530,20 @@ def log(msg: str) -> None:
 
 class StateLock:
     """Exclusive file lock shared with the Swift widget, so a toggle click
-    and a daemon poll cycle can never interleave and lose an update."""
+    and a daemon poll cycle can never interleave and lose an update.
+
+    The primitive lives in platform_compat.FileLock (flock(LOCK_EX) on POSIX,
+    LockFileEx on Windows); it opens the existing lock file rather than
+    recreating it, which is what makes the mutual exclusion real."""
 
     def __enter__(self):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        self._fh = open(LOCK_FILE, "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        self._lock = platform_compat.FileLock(LOCK_FILE)
+        self._lock.__enter__()
         return self
 
     def __exit__(self, *exc):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        self._lock.__exit__(*exc)
 
 
 def load_state() -> dict:
@@ -575,7 +571,7 @@ def save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(STATE_FILE)
+    platform_compat.replace_with_retry(tmp, STATE_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -1208,7 +1204,9 @@ def compute_cowork_records(now: float,
     read is already cheap (read_last_jsonl_object seeks from the end), so no
     parse cache is needed for these."""
     records: dict = {}
-    if not COWORK_SESSIONS_DIR.is_dir():
+    # None => this platform has no known Cowork directory (platform_compat
+    # returns None rather than a phantom path); skip the scan entirely.
+    if COWORK_SESSIONS_DIR is None or not COWORK_SESSIONS_DIR.is_dir():
         return records
 
     # Unlike the CLI scan there is no mtime-based scan-window skip here:
@@ -1396,7 +1394,10 @@ def resume_due_sessions(state: dict) -> None:
                 f.write(f"\n--- auto-resume attempt at {datetime.now().isoformat()} ({reason}) ---\n")
                 f.write(f"cmd: {' '.join(cmd)}\n\n")
                 f.flush()
-                subprocess.Popen(cmd, cwd=project_dir, stdout=f, stderr=subprocess.STDOUT)
+                # platform_compat handles the Windows specifics (no console
+                # flash, .cmd shim resolution); on POSIX this is the same
+                # subprocess.Popen call it always was.
+                platform_compat.spawn_detached(cmd, project_dir, f)
             log(f"Launched resume for {session_id}, output logging to {session_log}")
             entry["status"] = "resumed"
         except FileNotFoundError:
@@ -1451,7 +1452,13 @@ def prune_deleted_sessions(state: dict) -> None:
                 existing_jsonl_stems.update(p.stem for p in project_folder.glob("*.jsonl"))
 
     live_cowork_ids = set()
-    if COWORK_SESSIONS_DIR.is_dir():
+    # None => no known Cowork directory on this platform. We then cannot tell a
+    # deleted Cowork session from an un-scannable one, so we skip the Cowork
+    # branch of the staleness check below entirely rather than deleting every
+    # Cowork entry every cycle. (Unreachable on macOS, where the dir is always
+    # a real Path; see platform_compat.cowork_sessions_dir.)
+    cowork_scannable = COWORK_SESSIONS_DIR is not None
+    if cowork_scannable and COWORK_SESSIONS_DIR.is_dir():
         for meta_path in COWORK_SESSIONS_DIR.rglob("local_*.json"):
             session_dir = meta_path.with_suffix("")
             if not session_dir.is_dir() or not (session_dir / "audit.jsonl").exists():
@@ -1485,7 +1492,7 @@ def prune_deleted_sessions(state: dict) -> None:
         kind = entry.get("kind")
         is_cowork = (kind == "cowork") if kind is not None else (entry.get("project_name") == "Cowork")
         if is_cowork:
-            if session_id not in live_cowork_ids:
+            if cowork_scannable and session_id not in live_cowork_ids:
                 stale.append(session_id)
         elif session_id not in existing_jsonl_stems:
             stale.append(session_id)
@@ -1551,6 +1558,7 @@ def _plan_fit_config_inputs(config: dict) -> tuple:
         account.get("type"), account.get("plan"),
         budget.get("weekly_usd"), budget.get("monthly_usd"),
         budget.get("week_start"), budget.get("timezone"),
+        budget.get("projection_basis"),
     )
 
 
@@ -1660,7 +1668,9 @@ def _usage_analytics_worker() -> None:
 def main() -> None:
     log(f"claude-autoresume daemon starting (poll every {POLL_INTERVAL_SECONDS}s). "
         f"Default is OFF for every detected session — resumes only happen via the widget.")
-    log(f"Watching {PROJECTS_DIR} and {COWORK_SESSIONS_DIR}")
+    cowork_desc = (COWORK_SESSIONS_DIR if COWORK_SESSIONS_DIR is not None
+                   else "(no Cowork directory on this platform)")
+    log(f"Watching {PROJECTS_DIR} and {cowork_desc}")
 
     # Usage analytics runs on its own daemon thread so a slow analytics pass
     # can't stall the session poll below (P6). daemon=True so it dies with the

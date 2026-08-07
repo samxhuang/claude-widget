@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 import ClaudeAPI
 
 /// One recent claude.ai conversation, as returned by the chat_conversations
@@ -23,14 +22,14 @@ struct ChatEntry: Identifiable, Equatable, Hashable {
 /// Holds the most recently fetched claude.ai conversation list. Mirrors
 /// UsageModel's shape (isLoggedOut / lastError / lastUpdated) so OverlayView
 /// can reuse the same affordances for both sections.
-final class ChatsModel: ObservableObject {
-    @Published var chats: [ChatEntry] = []
+final class ChatsModel: Observable {
+    @Observed var chats: [ChatEntry] = []
 
-    @Published var isLoggedOut: Bool = false
-    @Published var lastError: String?
-    @Published var lastUpdated: Date?
+    @Observed var isLoggedOut: Bool = false
+    @Observed var lastError: String?
+    @Observed var lastUpdated: Date?
 
-    @Published var now: Date = Date()
+    @Observed var now: Date = Date()
 
     // Item 3 (merge): `chatsExpanded`/`toggleChatsExpanded` used to back
     // Recent chats' own collapsible section header. That section is gone —

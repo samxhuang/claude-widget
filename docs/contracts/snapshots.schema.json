@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-widget.invalid/contracts/snapshots.schema.json",
+  "title": "claude-autoresume usage/snapshots*.jsonl (one row)",
+  "description": "The utilization time-series, as three tiered JSON Lines files under ~/.claude-autoresume/usage/. This schema validates ONE LINE. The raw tier and the compacted tiers have genuinely different row shapes - the compacted rows are not merely coarser, they DROP fields (`raw`, `resets_at`) - so the root here is a oneOf over the two, and the named sub-schemas ('snapshots.raw' / 'snapshots.bucket') exist for validating a specific file.\n\nTiering: snapshots.jsonl holds raw rows for 24h, then they are folded into 15-minute buckets in snapshots_15m.jsonl (kept 30 days), then into 1-hour buckets in snapshots_1h.jsonl (kept forever). `max` is preserved exactly through every tier and never averaged away, because peak utilization analysis is what the product needs most.\n\nLocKING: snapshots.jsonl is appended by the WIDGET (single O_APPEND write of one complete line) and compacted by PYTHON. Both sides take fcntl flock(LOCK_EX) on usage/snapshots.lock - the widget around each append, the compactor across its whole stage-1 read -> bucket -> rename. Without that, an append landing between the compactor's read and its rename is silently lost to the rewrite, violating the project's no-data-loss guarantee for this file. The 15m and 1h files are compactor-private and need no lock. The widget must NEVER truncate snapshots.jsonl; only the Python compactor prunes.",
+  "x-contract-version": 1,
+  "x-in-band-version": false,
+  "x-in-band-version-note": "No version field on rows or files. Which shape a row has is inferred purely from whether it carries `ts` or `ts_start`.",
+  "x-writers": [
+    "ClaudeUsageOverlay SnapshotLogger.buildLine -> snapshots.jsonl (raw rows only)",
+    "claude-autoresume/usage_collector.py compact() -> snapshots_15m.jsonl, snapshots_1h.jsonl (bucket rows only), and rewrites snapshots.jsonl to the surviving raw rows"
+  ],
+  "x-readers": [
+    "ClaudeUsageOverlay GraphModel.parseRawSnapshots / parseBucketFile",
+    "claude-autoresume/plan_fit.py _merge_utilization_points -> _utilization_observed / _utilization_segments",
+    "claude-autoresume/usage_collector.py compact()"
+  ],
+  "oneOf": [
+    { "$ref": "#/$defs/rawRow" },
+    { "$ref": "#/$defs/bucketRow" }
+  ],
+  "$defs": {
+    "rawRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ts", "five_hour", "seven_day", "raw"],
+      "description": "One line of snapshots.jsonl. Appended by the widget once per successful usage fetch, throttled to at most one per 100 seconds (refresh fires ~every 2 minutes, but a manual 'Refresh Now' can land right after a timer tick).",
+      "properties": {
+        "ts": {
+          "type": "string",
+          "description": "ISO8601 with offset, from Swift's ISO8601DateFormatter([.withInternetDateTime]) - e.g. '2026-07-26T15:26:03Z' style with a numeric or Z zone. Note this is a DIFFERENT lexical form from the bucket rows' ts_start, which Python emits via strftime('%Y-%m-%dT%H:%M:%SZ'). Both readers cope with both."
+        },
+        "five_hour": { "$ref": "#/$defs/rawWindow", "description": "The rolling 5-hour session window." },
+        "seven_day": { "$ref": "#/$defs/rawWindow", "description": "The rolling 7-day weekly window." },
+        "raw": {
+          "type": "object",
+          "description": "The entire opaque usage-endpoint response, kept whole 'for future analytics'. NOT READ BY ANY CONSUMER today, and it is ~95% of this file's bytes. It also re-embeds raw claude.ai API field names inside a format CLAUDE.md declares frozen independently of that API. See findings F4-1.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "bucketRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ts_start", "n", "five_hour", "seven_day"],
+      "description": "One line of snapshots_15m.jsonl or snapshots_1h.jsonl. Identical shape in both files - only the bucket width differs, and the row does not record which it is (plan_fit supplies the nominal span from which file the row came out of).",
+      "properties": {
+        "ts_start": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+          "description": "UTC bucket start, floored to the bucket width, from Python's strftime('%Y-%m-%dT%H:%M:%SZ'). Doubles as the bucket's identity key when a later compact() run merges more rows into it."
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many source ROWS were folded into this bucket (raw rows at the 15m tier, 15m buckets' own n at the 1h tier). plan_fit uses it two ways: as the weight for the sample-count-weighted average, and to CAP a bucket's credited coverage at n x the nominal sample interval - so a bucket holding two samples out of a possible thirty contributes ~4 minutes of observed time, not an hour. Distinct from the per-dimension `_n` inside each window."
+        },
+        "five_hour": { "$ref": "#/$defs/bucketWindow" },
+        "seven_day": { "$ref": "#/$defs/bucketWindow" }
+      }
+    },
+    "rawWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["utilization", "resets_at"],
+      "properties": {
+        "utilization": {
+          "type": ["number", "null"],
+          "description": "Percent of that window's cap consumed, as reported by the server against the CURRENT plan. Null when the API did not supply it. This is the only field of a raw row anything actually reads."
+        },
+        "resets_at": {
+          "type": ["string", "null"],
+          "description": "When the window resets, as the API's raw string. WRITE-ONLY: no consumer reads it, and the compacted rows drop it entirely. See findings F4-2."
+        }
+      }
+    },
+    "bucketWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max", "avg", "last", "_sum", "_n", "_last_ts"],
+      "description": "Folded statistics for one window over the bucket. The underscore-prefixed fields are INTENTIONALLY PERSISTED rather than computed transiently: a bucket can receive contributions across more than one compact() run (a 1-hour bucket is fed by four 15-minute buckets that may age past the 30-day mark at slightly different times), and these are what let a later merge recompute avg and last correctly without re-reading data the finer tier has already discarded. Consumers that only want min/max/avg/last can ignore them.",
+      "properties": {
+        "min": { "type": ["number", "null"], "description": "Lowest utilization in the bucket. Anchors the low end of the lockout walk's per-segment range; when absent the segment collapses to its max, which reads as 'at the max the whole time'." },
+        "max": { "type": ["number", "null"], "description": "Highest utilization in the bucket. Preserved EXACTLY through every compaction tier - never averaged away - because peak analysis is what makes lockout time still recoverable from history whose raw rows are long gone." },
+        "avg": { "type": ["number", "null"], "description": "_sum / _n. Feeds the sample-count-weighted observed average." },
+        "last": { "type": ["number", "null"], "description": "Value of the newest contributing sample, by _last_ts." },
+        "_sum": { "type": "number", "description": "Bookkeeping: running sum of contributed values, so avg survives a cross-run merge." },
+        "_n": { "type": "integer", "minimum": 0, "description": "Bookkeeping: count of NON-NULL values contributed for THIS dimension. Not the same as the row-level `n`, which counts source rows regardless of whether this dimension had a value." },
+        "_last_ts": { "type": ["number", "null"], "description": "Bookkeeping: epoch seconds of the sample behind `last`, so a merge can tell which side's `last` is newer." }
+      }
+    }
+  }
+}

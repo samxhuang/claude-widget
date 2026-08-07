@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-widget.invalid/contracts/state.schema.json",
+  "title": "claude-autoresume state.json",
+  "description": "The session/status contract between the Python daemon and the Swift widget, at ~/.claude-autoresume/state.json. One object keyed by session id: a CLI transcript UUID, a Cowork 'local_<uuid>', or a remote-synced '<host>::<remote_sid>'. Every read-modify-write on either side takes an flock on the sibling state.json.lock (per-inode: never recreate that lock file). Field ownership is split three ways and is the single most important thing this schema records - see each field's 'x-owner'.",
+  "x-contract-version": 1,
+  "x-in-band-version": false,
+  "x-in-band-version-note": "state.json carries NO version field. The only versioning signal is this document. Readers must therefore treat every field added after the initial format as optional at runtime, which is exactly what the Swift reader does (see the x-reader notes below).",
+  "x-writers": [
+    "claude-autoresume/autoresume.py - merge_cli_records / merge_cowork_records / resume_due_sessions / reconcile_scoped_limit_resets / prune_* (under StateLock, save_state = tmp + replace, json.dumps(indent=2))",
+    "claude-autoresume/remote_sync.py - _merge_host (Mac side, folds a remote host's dump in under the same StateLock)",
+    "claude-autoresume/remote_ctl.py - apply-toggles (on a REMOTE host only, and only the three widget-owned toggle keys)",
+    "ClaudeUsageOverlay SessionsModel.mutate - widget-owned toggles only (enabled / force_resume / resume_armed); rewrites the whole file with JSONSerialization(.prettyPrinted)"
+  ],
+  "x-readers": [
+    "ClaudeUsageOverlay SessionsModel.refresh -> SessionEntry",
+    "claude-autoresume/autoresume.py load_state",
+    "claude-autoresume/remote_sync.py (host:: entries only)"
+  ],
+  "type": "object",
+  "propertyNames": {
+    "type": "string",
+    "minLength": 1,
+    "description": "Session id. Local CLI: the transcript UUID. Cowork: 'local_<uuid>'. Remote: '<host_name>::<remote_session_id>' - which is why config.json host names may not contain ':'."
+  },
+  "additionalProperties": { "$ref": "#/$defs/entry" },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "project_dir",
+        "project_name",
+        "session_title",
+        "prompt_preview",
+        "resets_at",
+        "last_activity_at",
+        "detected_at",
+        "last_seen",
+        "enabled",
+        "force_resume",
+        "handled",
+        "handled_at",
+        "status",
+        "work_status"
+      ],
+      "dependentRequired": {
+        "host": ["remote_id", "remote_stale", "remote_last_sync"],
+        "remote_id": ["host"]
+      },
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["cli", "cowork"],
+          "description": "Explicit type sentinel, added in the 2026-07-19 hardening pass. Daemon-owned. Before it existed the widget inferred Cowork from project_name == 'Cowork', which misclassified a CLI project directory literally named 'Cowork'; that heuristic survives in SessionEntry.isCowork only as a fallback for pre-sentinel daemons. Also used by prune_deleted_sessions to know which on-disk existence check applies.",
+          "x-owner": "daemon",
+          "x-reader": "Swift reads this as OPTIONAL (String?) and falls back to the project_name heuristic when absent."
+        },
+        "project_dir": {
+          "type": "string",
+          "description": "Absolute working directory the session should be resumed in. For CLI this is the LATEST cwd seen in the transcript, not the first - a session that cd'd partway through must resume where it ended up. The only field the Swift reader treats as mandatory: an entry without it is skipped entirely.",
+          "x-owner": "daemon"
+        },
+        "project_name": {
+          "type": "string",
+          "description": "Display name. CLI: basename(project_dir). Cowork: the literal string 'Cowork'.",
+          "x-owner": "daemon",
+          "x-reader": "Swift falls back to the last path component of project_dir when absent."
+        },
+        "session_title": {
+          "type": ["string", "null"],
+          "description": "Claude Code's own auto-generated or user-set session title. Far more useful than the project folder name for telling apart sessions in the same project, so it is the widget's primary row label (displayTitle falls back to project_name when empty).",
+          "x-owner": "daemon"
+        },
+        "prompt_preview": {
+          "type": "string",
+          "description": "First user message, truncated - shown as the row's secondary line. Always the empty string for Cowork entries (the daemon has no cheap preview source there).",
+          "x-owner": "daemon"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "waiting", "resumed", "failed"],
+          "description": "Lifecycle. 'active' = recently touched, not rate-limited. 'waiting' = rate-limited (account-wide 5h/weekly cap, or a per-model cap - see scoped_model) and eligible for auto-resume once resets_at passes. 'resumed'/'failed' are terminal outcomes of resume_due_sessions and always coincide with handled=true, so the widget never displays them (it filters handled entries out).",
+          "x-owner": "daemon",
+          "x-reader": "Swift defaults a missing/non-string status to 'active' - i.e. it fails OPEN, rendering a malformed entry as a live session."
+        },
+        "work_status": {
+          "type": "string",
+          "enum": ["running", "needs_input", "idle"],
+          "description": "Display-only classification recomputed every 10s poll by classify_work_status. Evidence-based, never time-guessed: pending tool_use blocks flushed before their results, ~/.claude/sessions/<pid>.json -> process table -> shell-snapshot children for 'is Bash actually executing', subagent/tool-result sidecar mtimes for delegated work, and an explicit stop_reason == 'end_turn' for a clean finish. A pending Agent/Task (subagent) call is given effectively infinite grace - there is no valid needs_input reading for one, since any approval happens inside the subagent's own transcript. Cowork entries are always 'running' by construction (a finished Cowork turn is dropped from state the same cycle).",
+          "x-owner": "daemon",
+          "x-reader": "Swift reads this as OPTIONAL; nil means 'daemon predates the field' and must degrade to the legacy blue/orange dot, NOT to idle."
+        },
+        "resets_at": {
+          "type": ["number", "null"],
+          "description": "Unix epoch seconds when the rate limit lifts; null while status == 'active', and also null for a per-model (e.g. Fable) cap whose reset the widget has not relayed yet - such a row shows but is not armed. CLOCK BASIS WARNING: for a remote entry this is server wall-clock and is deliberately NOT skew-adjusted by remote_sync, unlike last_activity_at / detected_at / handled_at which are. Two clock bases coexist in one entry.",
+          "x-owner": "daemon"
+        },
+        "scoped_model": {
+          "type": ["string", "null"],
+          "description": "CLI-only. The concrete model id (e.g. 'claude-fable-5') a per-model cap is gating, captured from the nearest non-'<synthetic>' assistant turn before the 429. Present only on CLI entries; null for an ordinary 5h/weekly rate limit or an active session. reconcile_scoped_limit_resets uses it to match against usage/scoped_limits.json and fill in resets_at later - independent of the transcript scan window, so a dead transcript that already aged out still gets armed.",
+          "x-owner": "daemon",
+          "x-optional-because": "Written on every CLI record; absent on Cowork entries.",
+          "x-reader": "Never read by the widget."
+        },
+        "pending_tool": {
+          "type": "boolean",
+          "description": "CLI-only. True ONLY while the quiet-drop guard is what is keeping this session 'active' - i.e. it is past the idle-retention edge but its last turn ends in an unresolved tool call. prune_old_entries must then judge the entry by last_seen (bumped every cycle while in the scan window) rather than last_activity_at, which is stale BY DEFINITION here because the running tool writes nothing. Keying the prune on last_activity_at caused a 10s add/drop/re-add flap that reset the user's enabled toggle.",
+          "x-owner": "daemon",
+          "x-optional-because": "Written on every CLI record; absent on Cowork entries.",
+          "x-reader": "Never read by the widget."
+        },
+        "last_activity_at": {
+          "type": "number",
+          "description": "Unix epoch seconds of the session's REAL last write - transcript mtime (including subagent sidecars) for CLI, lastActivityAt for Cowork. This, not last_seen, is what the widget shows as '<1m' / '17m'. Skew-adjusted onto the Mac clock for remote entries.",
+          "x-owner": "daemon",
+          "x-reader": "Swift reads this as OPTIONAL and falls back to the old 'active now' wording when absent."
+        },
+        "last_seen": {
+          "type": "number",
+          "description": "Unix epoch seconds of the last poll cycle that touched this entry. Poll-cycle bookkeeping only - bumped every ~10s while the session is in the scan window regardless of real activity, so it is USELESS as an activity-age signal. Its one real job is the pending_tool prune path. Stamped with the Mac clock for remote entries (not skewed - it is a Mac-side observation).",
+          "x-owner": "daemon"
+        },
+        "detected_at": {
+          "type": "number",
+          "description": "Unix epoch seconds when the daemon first created this entry. Never re-stamped on subsequent cycles. Skew-adjusted for remote entries.",
+          "x-owner": "daemon",
+          "x-reader": "Never read by the widget."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "WIDGET-OWNED. Arms auto-resume for this session: the daemon fires `claude --resume` once resets_at + RESET_BUFFER_SECONDS passes. Defaults to false on every newly-detected entry and is preserved verbatim across an active -> waiting transition and across every merge. Nothing in the daemon ever sets this to true - that is the project's opt-in hard constraint.",
+          "x-owner": "widget"
+        },
+        "force_resume": {
+          "type": "boolean",
+          "description": "WIDGET-OWNED, one-shot. Set true by the widget's 'Resume now' button; the daemon resumes immediately regardless of resets_at and clears it back to false. For remote entries remote_sync relays it to the host and only clears the local flag after a successful push (so a failed push retries next cycle).",
+          "x-owner": "widget"
+        },
+        "resume_armed": {
+          "type": "boolean",
+          "description": "WIDGET-OWNED, Cowork-only in practice. Opt-in arm for OS-level UI automation of Claude Desktop's Resume space (cowork_resume.py). Deliberately separate from `enabled`, which drives the CLI resume path and does not apply to Cowork rows. As of this build cowork_resume.py is hardcoded DRY_RUN=True, so arming produces log lines, never clicks.",
+          "x-owner": "widget",
+          "x-optional-because": "The daemon writes this key only when CREATING a Cowork entry; local CLI entries never get it. remote_sync stamps it on every remote entry regardless of kind, and SessionsModel.setResumeArmed can add it to any entry.",
+          "x-reader": "Swift defaults it to false when absent."
+        },
+        "needs_attention": {
+          "type": "boolean",
+          "description": "DAEMON-OWNED (cowork_resume.py), Cowork-only. The automation orchestrator hit an ambiguous match or could not complete a resume attempt and a human should look. Purely informational in the widget - only the daemon clears it, on a later successful resume.",
+          "x-owner": "daemon",
+          "x-optional-because": "Written only when the daemon CREATES a Cowork entry.",
+          "x-reader": "Swift defaults it to false when absent."
+        },
+        "handled": {
+          "type": "boolean",
+          "description": "DAEMON-OWNED terminal marker: this entry has been resumed (or failed to resume) once and must never be resurrected. Both merge functions skip handled entries outright, and the widget filters them out of the Sessions list - so a handled entry is invisible everywhere while prune_old_entries ages it out (PRUNE_AFTER_HOURS = 48).",
+          "x-owner": "daemon"
+        },
+        "handled_at": {
+          "type": ["number", "null"],
+          "description": "Unix epoch seconds when `handled` flipped true; null until then. Drives the 48h prune. Skew-adjusted for remote entries (_skew passes null through untouched).",
+          "x-owner": "daemon",
+          "x-reader": "Never read by the widget."
+        },
+        "host": {
+          "type": "string",
+          "description": "SYNC-OWNED (remote_sync._merge_host). The config.json host name this session lives on. Its presence is the single gate for all remote treatment: SessionEntry.isRemote, the desktopcomputer badge, the ssh-command-to-pasteboard click, and - critically - the `'host' in entry` guards that stop the Mac from ever running `claude --resume` for a session whose transcript does not exist locally.",
+          "x-owner": "sync",
+          "x-optional-because": "Present only on remote-synced entries."
+        },
+        "remote_id": {
+          "type": "string",
+          "description": "SYNC-OWNED. The session id on the remote's own ~/.claude/projects, i.e. the state.json key minus the '<host>::' prefix. Stored explicitly rather than re-derived so the toggle write-back and the prune agree on identity even if the key format ever changes.",
+          "x-owner": "sync",
+          "x-optional-because": "Present only on remote-synced entries."
+        },
+        "remote_stale": {
+          "type": "boolean",
+          "description": "SYNC-OWNED. True when the last sync cycle could not reach the host (15s ssh timeout). After REMOTE_DROP_HOURS (24h) of CONTINUOUS unreachability the entries are dropped entirely.",
+          "x-owner": "sync",
+          "x-optional-because": "Present only on remote-synced entries.",
+          "x-reader": "Swift defaults it to false when absent."
+        },
+        "remote_last_sync": {
+          "type": "number",
+          "description": "SYNC-OWNED. Mac-clock epoch seconds of the last successful dump from this host.",
+          "x-owner": "sync",
+          "x-optional-because": "Present only on remote-synced entries.",
+          "x-reader": "Never read by the widget."
+        }
+      }
+    }
+  }
+}

@@ -1,20 +1,13 @@
 import Foundation
 import WebKit
 
-/// R2-1: errors surfaced to `run()` callers before/without a usable
-/// navigation. `.backlogFull` is returned synchronously (via the caller's own
-/// completion) when the pre-navigation work queue is already at its cap — see
-/// `ClaudeWebSession.run`.
-enum ClaudeWebSessionError: LocalizedError {
-    case backlogFull
-
-    var errorDescription: String? {
-        switch self {
-        case .backlogFull:
-            return "claude.ai not reachable yet; request backlog full"
-        }
-    }
-}
+// R2-1's `ClaudeWebSessionError.backlogFull` — errors surfaced to `run()`
+// callers before/without a usable navigation — is now the transport-neutral
+// `ClaudeTransportError.backlogFull` (Transport.swift), so the client's
+// mapping isn't tied to this WebKit implementation. Behavior is unchanged:
+// `.backlogFull` is returned synchronously (via the caller's own completion)
+// when the pre-navigation work queue is already at its cap — see
+// `ClaudeWebSession.run`.
 
 /// Owns the single hidden WKWebView that ClaudeAPIClient runs all its
 /// fetch() calls inside. WKWebView's default (persistent) website
@@ -28,7 +21,7 @@ enum ClaudeWebSessionError: LocalizedError {
 /// spinning up a second hidden WKWebView/WebContent process just to reuse
 /// the same cookie jar. One hidden webview, one navigation lifecycle, N
 /// callers (each caller supplies its own fetch script via `run`).
-final class ClaudeWebSession: NSObject, WKNavigationDelegate {
+final class ClaudeWebSession: NSObject, WKNavigationDelegate, ClaudeScriptRunner {
     let webView: WKWebView
     private var didLoadBase = false
     private var pendingWork: [() -> Void] = []
@@ -145,7 +138,7 @@ final class ClaudeWebSession: NSObject, WKNavigationDelegate {
             // its caller's completion — see `maxPendingWork`). Fail on the main
             // queue, matching the normal completion hop below.
             guard pendingWork.count < Self.maxPendingWork else {
-                DispatchQueue.main.async { completion(.failure(ClaudeWebSessionError.backlogFull)) }
+                DispatchQueue.main.async { completion(.failure(ClaudeTransportError.backlogFull)) }
                 return
             }
             pendingWork.append { [weak self] in self?.run(script: script, completion: completion) }

@@ -55,18 +55,18 @@ final class ChatsFetcher {
             switch result {
             case .failure(.loggedOut):
                 self.model.isLoggedOut = true
-                NSLog("[ChatsFetcher] loggedOut")
+                CoreLog.warn("[ChatsFetcher] loggedOut")
                 self.onLoginNeeded()
             case .failure(let error):
                 // Release hygiene: error descriptions from ClaudeAPI are
                 // terse codes, never response bodies/account data.
                 self.model.lastError = error.errorDescription
-                NSLog("[ChatsFetcher] error=%@", error.errorDescription ?? "unknown")
+                CoreLog.error("[ChatsFetcher] error=\(error.errorDescription ?? "unknown")")
             case .success(let chats):
                 self.model.isLoggedOut = false
                 self.model.lastError = nil
                 self.model.apply(conversations: chats)
-                NSLog("[ChatsFetcher] fetched %d conversations", chats.count)
+                CoreLog.info("[ChatsFetcher] fetched \(chats.count) conversations")
             }
         }
     }
@@ -82,7 +82,7 @@ final class ChatsFetcher {
     /// header comment for why the cadences are split.
     func refreshRecentsOnly() {
         guard !recentsInFlight else {
-            NSLog("[ChatsFetcher] recents-only fetch skipped: previous fetch still in flight")
+            CoreLog.info("[ChatsFetcher] recents-only fetch skipped: previous fetch still in flight")
             return
         }
         recentsInFlight = true
@@ -93,13 +93,13 @@ final class ChatsFetcher {
             switch result {
             case .failure(.loggedOut):
                 self.model.isLoggedOut = true
-                NSLog("[ChatsFetcher] recents-only loggedOut")
+                CoreLog.warn("[ChatsFetcher] recents-only loggedOut")
                 self.onLoginNeeded()
             case .failure(let error):
                 // Deliberately does not touch model.lastError (that's
                 // chats' own state, unrelated to this endpoint) — a failure
                 // here is logged only.
-                NSLog("[ChatsFetcher] recents-only error=%@", error.errorDescription ?? "unknown")
+                CoreLog.error("[ChatsFetcher] recents-only error=\(error.errorDescription ?? "unknown")")
             case .success(let records):
                 // Status classification item: log the raw status combos
                 // actually coming back so ClaudeAPI's work-state mapping
@@ -109,13 +109,13 @@ final class ChatsFetcher {
                     "status=\(rec.statusRaw ?? "nil") worker=\(rec.workerStatusRaw ?? "nil")"
                 })
                 if !statusCombos.isEmpty {
-                    NSLog("[ChatsFetcher] cloud session status combos observed: %@", statusCombos.sorted().joined(separator: " | "))
+                    CoreLog.info("[ChatsFetcher] cloud session status combos observed: \(statusCombos.sorted().joined(separator: " | "))")
                 }
                 let localIds = self.localSessionIds()
                 let localTitles = self.localSessionTitles()
                 self.cloudSessions.apply(records: records, localIds: localIds, localTitles: localTitles,
                                          localStartDates: self.localStartDates())
-                NSLog("[ChatsFetcher] cloud sessions: %d raw, %d after local-id/title filter+cap (%d local ids, %d local titles known)", records.count, self.cloudSessions.sessions.count, localIds.count, localTitles.count)
+                CoreLog.info("[ChatsFetcher] cloud sessions: \(records.count) raw, \(self.cloudSessions.sessions.count) after local-id/title filter+cap (\(localIds.count) local ids, \(localTitles.count) local titles known)")
             }
         }
     }

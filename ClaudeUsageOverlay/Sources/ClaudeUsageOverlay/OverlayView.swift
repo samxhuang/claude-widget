@@ -603,6 +603,10 @@ struct OverlayView: View {
             estimatedPercent: planFit.budgetProjectedPct(w),
             resetText: planFit.budgetResetText(w, now: sessions.now),
             trailingCaption: caption)
+            // The dot's position depends on a setting (calendar days vs.
+            // weekdays only) that isn't visible on the bar — say which one
+            // produced this projection on hover.
+            .help(planFit.budgetTooltip(w))
     }
 
     // MARK: - Interrupted sessions
@@ -1410,17 +1414,17 @@ struct OverlayView: View {
     /// usage" (item 4a) without repeating "API value" on every row.
     @ViewBuilder
     private func tierGrid(_ tiers: [TierVerdict]) -> some View {
-        // Throttle-verdict daemon builds report projected cap-days/month per
-        // tier; the last column shows those (frequency is what viability is
-        // judged on now). Legacy plan_fit.json without throttle fields keeps
-        // the old projected-peaks column.
+        // Throttle-verdict daemon builds report projected lockout TIME per
+        // tier; the last column shows that (how long the tier would leave you
+        // unable to work is what viability is judged on now). Legacy
+        // plan_fit.json without throttle fields keeps the projected-peaks column.
         let anyThrottle = tiers.contains { $0.hasThrottleData }
         Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 3) {
             GridRow {
                 Text("Plan")
                 Text("Price").gridColumnAlignment(.trailing)
                 Text("× API").gridColumnAlignment(.trailing)
-                Text(anyThrottle ? "Cap d/mo" : "Peaks")
+                Text(anyThrottle ? "Capped/mo" : "Peaks")
             }
             .font(.system(size: 7.5, weight: .semibold))
             .foregroundColor(.white.opacity(0.4))

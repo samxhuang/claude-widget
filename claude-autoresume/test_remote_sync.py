@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +25,7 @@ import unittest
 from pathlib import Path
 
 import autoresume as ar
+import deploy_remote
 import remote_sync as rs
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -634,21 +634,20 @@ class TestWorkerTick(TempEnvMixin, unittest.TestCase):
 
 
 class TestDeployPayloadImports(unittest.TestCase):
-    """Finding 1 (empirical): the exact PAYLOAD_FILES set deploy_remote.sh ships
-    must be self-sufficient for `import autoresume` on a bare remote — nothing
-    else is on the remote's sys.path. autoresume.py imports remote_sync at
-    module top, so a payload omitting it crash-loops the remote daemon at import
+    """Finding 1 (empirical): the exact PAYLOAD_FILES set the deploy ships must
+    be self-sufficient for `import autoresume` on a bare remote — nothing else
+    is on the remote's sys.path. autoresume.py imports remote_sync at module
+    top, so a payload omitting it crash-loops the remote daemon at import
     before main(). We stage EXACTLY the deploy payload into a throwaway bin/ and
     confirm the import there; we also confirm the pre-fix set (no remote_sync.py)
     DID fail, so this test is meaningful, not vacuously green."""
 
     def _parse_payload_files(self):
-        """Read the PAYLOAD_FILES=(...) array straight out of deploy_remote.sh so
-        the test tracks the real deploy list rather than a hardcoded copy."""
-        text = (REPO_DIR / "deploy_remote.sh").read_text()
-        m = re.search(r"^PAYLOAD_FILES=\(([^)]*)\)", text, re.MULTILINE)
-        self.assertIsNotNone(m, "could not find PAYLOAD_FILES=(...) in deploy_remote.sh")
-        return m.group(1).split()
+        """The real deploy list, imported from deploy_remote.py's module-level
+        constant (it used to be regex-scraped out of deploy_remote.sh's bash
+        array; the .sh copy is kept in lockstep and that agreement is asserted
+        by test_deploy_remote.PayloadConstantTests)."""
+        return list(deploy_remote.PAYLOAD_FILES)
 
     def _stage_and_import(self, files):
         """Copy `files` into a temp bin/ (isolated from repo sys.path) and try
@@ -677,7 +676,7 @@ class TestDeployPayloadImports(unittest.TestCase):
 
     def test_deploy_payload_includes_remote_sync(self):
         self.assertIn("remote_sync.py", self._parse_payload_files(),
-                      "deploy_remote.sh PAYLOAD_FILES must ship remote_sync.py "
+                      "deploy PAYLOAD_FILES must ship remote_sync.py "
                       "(autoresume.py imports it at module top)")
 
     def test_full_payload_imports_cleanly(self):

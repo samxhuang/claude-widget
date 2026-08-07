@@ -37,6 +37,10 @@ echo "==> Installing daemon script to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR" "$STATE_DIR/logs"
 cp autoresume.py "$INSTALL_DIR/autoresume.py"
 chmod +x "$INSTALL_DIR/autoresume.py"
+# platform_compat.py: the OS seam (locks/paths/process table/spawn/atomic
+# replace). Top-level import of autoresume.py, usage_collector.py, plan_fit.py
+# and remote_ctl.py — the daemon will not start without it.
+cp platform_compat.py "$INSTALL_DIR/platform_compat.py"
 cp cowork_resume.py "$INSTALL_DIR/cowork_resume.py"
 cp usage_collector.py "$INSTALL_DIR/usage_collector.py"
 cp plan_fit.py "$INSTALL_DIR/plan_fit.py"
@@ -50,6 +54,12 @@ cp remote_ctl.py "$INSTALL_DIR/remote_ctl.py"
 chmod +x "$INSTALL_DIR/remote_ctl.py"
 cp deploy_remote.sh "$INSTALL_DIR/deploy_remote.sh"
 chmod +x "$INSTALL_DIR/deploy_remote.sh"
+# deploy_remote.py is the stdlib-Python port of deploy_remote.sh (same marker
+# protocol, no bash needed — see docs/windows-port-plan.md §1.4). Staged
+# ALONGSIDE the .sh, not replacing it: HostDeployer.swift still runs the shell
+# version, and the cutover waits on a real-remote verification.
+cp deploy_remote.py "$INSTALL_DIR/deploy_remote.py"
+chmod +x "$INSTALL_DIR/deploy_remote.py"
 cp autoresume.service.template "$INSTALL_DIR/autoresume.service.template"
 # remote_sync.py is authored by a parallel workstream (WS-4). Guard its copy so
 # install.sh still succeeds if run before that file lands; every other cp above

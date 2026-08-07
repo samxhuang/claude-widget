@@ -22,7 +22,9 @@ Schema (version 1):
         "weekly_usd":  <number|null>,   # null = no weekly budget bar
         "monthly_usd": <number|null>,   # null = no monthly budget bar
         "week_start":  "monday" | "sunday",
-        "timezone":    "local" | "utc"  # budget period boundary computation
+        "timezone":    "local" | "utc", # budget period boundary computation
+        "projection_basis": "calendar" | "weekdays"  # elapsed clock the
+                                        # spend projection extrapolates on
       },
       "remote_hosts": [
         {
@@ -51,6 +53,11 @@ CONFIG_FILENAME = "config.json"
 VALID_ACCOUNT_TYPES = {"max", "api"}
 VALID_WEEK_STARTS = {"monday", "sunday"}
 VALID_TIMEZONES = {"local", "utc"}
+# Which elapsed clock the budget spend projection extrapolates on. Duplicated
+# from plan_fit.BUDGET_PROJECTION_BASES on purpose — same rule as VALID_PLANS:
+# this module is imported by the daemon and deployed standalone, and must not
+# import plan_fit.
+VALID_PROJECTION_BASES = {"calendar", "weekdays"}
 
 # Canonical plan keys. Mirrors plan_fit.TIER_MULTIPLIERS' key set — kept as a
 # duplicate on purpose: this module must not import plan_fit (it is imported
@@ -80,6 +87,7 @@ def _default_config() -> dict:
             "monthly_usd": None,
             "week_start": "monday",
             "timezone": "local",
+            "projection_basis": "calendar",
         },
         "remote_hosts": [],
         "sessions": {"idle_retention_minutes": DEFAULT_IDLE_RETENTION_MINUTES},
@@ -194,6 +202,9 @@ def load_config_with_meta(state_dir: Path) -> tuple:
         timezone = budget.get("timezone")
         if isinstance(timezone, str) and timezone in VALID_TIMEZONES:
             cfg["budget"]["timezone"] = timezone
+        basis = budget.get("projection_basis")
+        if isinstance(basis, str) and basis in VALID_PROJECTION_BASES:
+            cfg["budget"]["projection_basis"] = basis
 
     hosts = raw.get("remote_hosts")
     if isinstance(hosts, list):

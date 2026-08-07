@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-widget.invalid/contracts/config.schema.json",
+  "title": "claude-autoresume config.json",
+  "description": "User settings at ~/.claude-autoresume/config.json: account type, dollar budgets, remote SSH hosts, and Sessions-list retention. On the Mac the widget's Settings window is the ONLY writer (read-modify-write under config.json.lock, tmp + replaceItemAt, unknown keys preserved); the Python side only ever reads, defensively, treating a missing or malformed file as the full default config. On a REMOTE host remote_ctl.py apply-config may additionally write - solely as a relay of the widget's sessions.idle_retention_minutes, same lock and atomic-write discipline, never touching any other key. The daemon itself never writes this file on any host. Because the sole writer only writes keys the user has actually touched, a real config.json is typically PARTIAL: every block below is optional and every reader must default it.",
+  "x-contract-version": 1,
+  "x-in-band-version": true,
+  "x-in-band-version-note": "This is the only one of the five formats with an in-band `version`. ConfigStore.mutate stamps version=1 on every write if absent. Nothing on either side actually gates behaviour on it yet - see the findings in README.md.",
+  "x-writers": [
+    "ClaudeUsageOverlay ConfigStore (Settings window) - sole writer on the Mac",
+    "claude-autoresume/remote_ctl.py apply-config - remote hosts only, sessions.idle_retention_minutes only"
+  ],
+  "x-readers": [
+    "claude-autoresume/autoresume_config.py load_config / load_config_with_meta (daemon, plan_fit, remote_sync)",
+    "ClaudeUsageOverlay ConfigStore.decode -> AppConfig"
+  ],
+  "type": "object",
+  "required": ["version"],
+  "additionalProperties": true,
+  "x-additional-properties-note": "Deliberately open. Unknown-key preservation is a stated design rule: hand-editing must keep working, and ConfigStore's read-modify-write round-trips keys it does not understand.",
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Schema version. Written by ConfigStore on every mutation. Read by the widget into AppConfig.version and then unused; never read by Python at all.",
+      "x-reader": "Both sides tolerate absence."
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Which billing arrangement the user is on. Drives whether the widget shows Max percentage bars or dollar budget bars, and which tier plan_fit rescales the observed utilization series from.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["max", "api"],
+          "description": "'max' = subscription (percentage bars). 'api' = metered API billing, which swaps the Max % bars for dollar budget bars fed from the plan_fit cost pipeline. Python falls back to 'max' for anything else.",
+          "x-reader": "The Swift decoder does NOT validate against this enum - it copies any string through. See findings F2-2."
+        },
+        "plan": {
+          "type": "string",
+          "enum": ["pro", "max_5x", "max_20x"],
+          "description": "Canonical plan key. Mirrors plan_fit.TIER_MULTIPLIERS' key set, duplicated in autoresume_config.VALID_PLANS on purpose (that module must not import plan_fit - it is deployed standalone to remote hosts). Anything non-canonical degrades to 'max_20x' AND sets load_config_with_meta's plan_from_file=False, so plan_fit does not record a transient config glitch as a real plan change (which would permanently truncate utilization history). Still used on 'api' accounts, for the tier-comparison ratio.",
+          "x-reader": "The Swift decoder does NOT validate against this enum. See findings F2-2."
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Dollar limits per calendar period. Null limit = that bar is not shown. Stored as JSON null rather than 0 so the daemon can distinguish 'unconfigured' from 'zero'.",
+      "properties": {
+        "weekly_usd": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "description": "Weekly dollar budget, or null for none. Python's _positive_number rejects non-finite, non-positive, and boolean values (a bool is not a number here) back to null. The widget rounds to cents on both write and read, so the displayed text round-trips to the stored value."
+        },
+        "monthly_usd": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "description": "Monthly dollar budget, or null for none. Same validation as weekly_usd."
+        },
+        "week_start": {
+          "type": "string",
+          "enum": ["monday", "sunday"],
+          "description": "Which weekday starts the weekly BUDGET period. Deliberately NOT the Max plan's rolling-7d window - this is a calendar week for spend accounting only."
+        },
+        "timezone": {
+          "type": "string",
+          "enum": ["local", "utc"],
+          "description": "Which timezone's midnight bounds a budget period. 'local' is DST-safe (each boundary is localized on its own date). NOTE: no code in this repo writes this key - ConfigStore explicitly never touches it - yet both readers consume it. See findings F2-5."
+        },
+        "projection_basis": {
+          "type": "string",
+          "enum": ["calendar", "weekdays"],
+          "description": "Which elapsed clock the budget spend projection extrapolates on. 'calendar' (default) counts every hour of the period. 'weekdays' counts only Mon-Fri hours, on BOTH sides of the spent/elapsed-fraction ratio, so a weekday-only worker is not projected as if the weekend were going to carry spend; weekend spend still counts toward spent_usd, it is just extrapolated over the remaining weekday time. Weekday-ness is judged in the same timezone as the period bounds. Applies to both the weekly and monthly windows."
+        }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Sessions-list behaviour.",
+      "properties": {
+        "idle_retention_minutes": {
+          "type": "number",
+          "minimum": 1,
+          "description": "How long an idle (never-rate-limited) session stays in the Sessions list before the daemon drops its state.json entry. Default 30, matching the historical hardcoded ACTIVE_WINDOW_MINUTES. BOTH sides clamp to 5-1440 on read, so an out-of-range hand-edit displays as what actually takes effect. This is also the one key the Mac relays to enabled remote hosts (one-way by design: the Mac always wins while the host is enabled)."
+        }
+      }
+    },
+    "remote_hosts": {
+      "type": "array",
+      "description": "Shape-C remote SSH hosts. The same stdlib daemon runs on each; remote_sync.py on the Mac merges their state in over ssh. Absent entirely when no host has ever been added.",
+      "items": { "$ref": "#/$defs/remoteHost" }
+    }
+  },
+  "$defs": {
+    "remoteHost": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name", "ssh"],
+      "description": "One remote host. Python's _clean_host DROPS any entry failing its checks (non-dict, blank/duplicate name, name containing ':', blank ssh) rather than raising; the Swift decoder keeps anything with a name and an ssh string. See findings F2-3.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^:]+$",
+          "description": "Unique host label. May NOT contain ':' because it is the state.json key prefix '<name>::<sid>'. Duplicates are dropped by Python (first wins)."
+        },
+        "ssh": {
+          "type": "string",
+          "minLength": 1,
+          "description": "'user@host' or a ~/.ssh/config alias. Whitespace-trimmed by Python."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the Mac syncs this host. DEFAULT MISMATCH: Python defaults a missing key to TRUE, the Swift decoder to FALSE. See findings F2-1."
+        },
+        "python": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Interpreter to invoke on the remote. Defaults to 'python3' on both sides. Remote boxes only ever get system python3 - the payload is hard-constrained to stdlib."
+        },
+        "state_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The remote's own state directory. Defaults to '~/.claude-autoresume' on both sides."
+        },
+        "poll_seconds": {
+          "type": "number",
+          "description": "Sync cadence for this host. Python coerces to int and replaces anything below MIN_HOST_POLL_SECONDS (10) with the default 30; the Swift decoder takes the value verbatim (default 30)."
+        },
+        "collect_usage": {
+          "type": "boolean",
+          "description": "Whether the hourly usage lane also pulls this host's token store into usage/remote/<host>_tokens_hourly.json, folding its cost in as a 'code_cli@<host>' surface. Defaults true on both sides."
+        },
+        "deployed_at": {
+          "type": ["string", "null"],
+          "description": "ISO8601 timestamp stamped by HostDeployer on a successful '@@OK' deploy. Informational only. Python coerces a non-string to null."
+        },
+        "deployed_version": {
+          "type": ["string", "null"],
+          "description": "Payload version stamped alongside deployed_at. Informational only. Python coerces a non-string to null."
+        }
+      }
+    }
+  }
+}

@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 import Darwin
 
 /// Unified per-row status classification, shared by locally-tracked (daemon,
@@ -132,14 +131,14 @@ struct SessionEntry: Identifiable, Equatable, Hashable {
 /// S1 in `withLock`), and the daemon can hold it while it scans transcripts —
 /// a blocking `flock` on the main thread would beachball the UI for that
 /// whole window. Results are published back on main.
-final class SessionsModel: ObservableObject {
-    @Published var sessions: [SessionEntry] = []
-    @Published var now: Date = Date()
+final class SessionsModel: Observable {
+    @Observed var sessions: [SessionEntry] = []
+    @Observed var now: Date = Date()
 
     private static let expandedDefaultsKey = "sessionsExpanded"
     /// Persisted across launches. Starts collapsed so the widget doesn't
     /// take over the screen before you've ever looked at it.
-    @Published var sessionsExpanded: Bool {
+    @Observed var sessionsExpanded: Bool {
         didSet { UserDefaults.standard.set(sessionsExpanded, forKey: Self.expandedDefaultsKey) }
     }
 
@@ -158,13 +157,14 @@ final class SessionsModel: ObservableObject {
         sessionsExpanded.toggle()
     }
 
-    init() {
+    override init() {
         self.sessionsExpanded = UserDefaults.standard.object(forKey: Self.expandedDefaultsKey) as? Bool ?? false
 
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude-autoresume")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.stateURL = dir.appendingPathComponent("state.json")
         self.lockURL = dir.appendingPathComponent("state.json.lock")
+        super.init()
     }
 
     func tick() {
@@ -356,7 +356,7 @@ final class SessionsModel: ObservableObject {
 
     /// See the dedupe comment in refresh(): known local CLI sessions' transcript
     /// creation times, published for CloudSessionsModel's created_at matching.
-    @Published var cliStartDates: [Date] = []
+    @Observed var cliStartDates: [Date] = []
     /// id -> transcript creation date; retained past the session's local drop
     /// for the cloud-echo lookback, then evicted (see the eviction loop in
     /// refresh()). In-memory only — a widget relaunch forgets recently-dropped
@@ -467,7 +467,7 @@ final class SessionsModel: ObservableObject {
         }
     }
 
-    /// S8: keeps the non-throwing, fire-and-forget signature but NSLogs each
+    /// S8: keeps the non-throwing, fire-and-forget signature but logs each
     /// distinct failure path (read / parse / entry-missing / serialize /
     /// write) so a toggle that silently reverts — because the write never
     /// landed — is at least diagnosable from Console.app.
@@ -475,21 +475,21 @@ final class SessionsModel: ObservableObject {
         withLock { [weak self] in
             guard let self = self else { return }
             guard let raw = try? Data(contentsOf: self.stateURL) else {
-                NSLog("[SessionsModel] mutate(%@): read failed", sessionId)
+                CoreLog.error("[SessionsModel] mutate(\(sessionId)): read failed")
                 return
             }
             guard var json = try? JSONSerialization.jsonObject(with: raw) as? [String: [String: Any]] else {
-                NSLog("[SessionsModel] mutate(%@): parse failed", sessionId)
+                CoreLog.error("[SessionsModel] mutate(\(sessionId)): parse failed")
                 return
             }
             guard var entry = json[sessionId] else {
-                NSLog("[SessionsModel] mutate(%@): entry missing", sessionId)
+                CoreLog.error("[SessionsModel] mutate(\(sessionId)): entry missing")
                 return
             }
             change(&entry)
             json[sessionId] = entry
             guard let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]) else {
-                NSLog("[SessionsModel] mutate(%@): serialize failed", sessionId)
+                CoreLog.error("[SessionsModel] mutate(\(sessionId)): serialize failed")
                 return
             }
             let tmpURL = self.stateURL.appendingPathExtension("tmp")
@@ -497,7 +497,7 @@ final class SessionsModel: ObservableObject {
                 try out.write(to: tmpURL)
                 _ = try FileManager.default.replaceItemAt(self.stateURL, withItemAt: tmpURL)
             } catch {
-                NSLog("[SessionsModel] mutate(%@): write failed: %@", sessionId, error.localizedDescription)
+                CoreLog.error("[SessionsModel] mutate(\(sessionId)): write failed: \(error.localizedDescription)")
             }
         }
     }

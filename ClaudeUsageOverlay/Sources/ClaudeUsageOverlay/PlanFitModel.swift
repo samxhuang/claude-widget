@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 
 /// One moving-average window from plan_fit.json's `moving_averages` object
 /// (keys "1d" / "7d" / "30d" / "90d"). `daysCovered` < `windowDays` means the
@@ -19,12 +18,29 @@ struct TierVerdict {
     var apiEquivRatio: Double?
     var projectedPeak7dUtil: Double?
     var projectedPeak5hUtil: Double?
-    /// Throttle-tolerance verdict fields (2026-07-19 daemon): projected
-    /// cap-hit days per 30-day month and the median projected peak across
-    /// those cap days. All nil when the deployed daemon predates the
-    /// throttle verdict — display falls back to the peak columns.
+    /// Throttle-tolerance verdict fields (2026-07-19 daemon; remeasured as
+    /// lockout TIME 2026-07-26). `cappedHours*` is the projected time per
+    /// 30-day month the tier would have left you unable to work; the
+    /// `throttleDays*` pair is the same quantity expressed in days (the field
+    /// name predates the switch — under the old daemon it counted days on
+    /// which a cap was touched, which over-charged a late-window overrun by
+    /// up to a whole day, and the rest of that week besides). `medianLockout*`
+    /// is how long a typical single lockout lasted. All nil when the deployed
+    /// daemon predates the throttle verdict — display falls back to the peak
+    /// columns.
     var throttleDays5hPerMonth: Double?
     var throttleDays7dPerMonth: Double?
+    var cappedHours5hPerMonth: Double?
+    var cappedHours7dPerMonth: Double?
+    /// Time locked out for EITHER reason — a union, not a sum: the 5h and 7d
+    /// lockouts overlap (both caps climb while you work), so adding them
+    /// double-counts. nil on daemons predating the aggregate; the fallback
+    /// below takes the larger of the two, which is the tightest bound
+    /// available without the union.
+    var cappedHoursAnyPerMonth: Double?
+    var medianLockoutAnyHours: Double?
+    var medianLockout5hHours: Double?
+    var medianLockout7dHours: Double?
     var medianThrottlePeak5hPct: Double?
     var medianThrottlePeak7dPct: Double?
     var viable: Bool
@@ -32,6 +48,17 @@ struct TierVerdict {
 
     var hasThrottleData: Bool {
         throttleDays5hPerMonth != nil || throttleDays7dPerMonth != nil
+            || cappedHours5hPerMonth != nil || cappedHours7dPerMonth != nil
+    }
+
+    /// Capped hours/month, falling back to the day-equivalent field when
+    /// reading a plan_fit.json written before the hours fields existed.
+    var cappedHours5h: Double? { cappedHours5hPerMonth ?? throttleDays5hPerMonth.map { $0 * 24 } }
+    var cappedHours7d: Double? { cappedHours7dPerMonth ?? throttleDays7dPerMonth.map { $0 * 24 } }
+    var cappedHoursAny: Double? {
+        if let any = cappedHoursAnyPerMonth { return any }
+        let both = [cappedHours5h, cappedHours7d].compactMap { $0 }
+        return both.max()
     }
 
     /// The backend's `viable` flag is authoritative. Under the throttle
@@ -69,6 +96,12 @@ struct BudgetWindow {
     /// Whether the spend total already folds in remote-host Claude Code usage
     /// (WS-6). Purely informational for the widget — display-only.
     var includesRemote: Bool
+    /// Which elapsed clock `projected*` were extrapolated on: `"calendar"`
+    /// (every hour of the period) or `"weekdays"` (Mon–Fri hours only).
+    /// Display-only, drives the bar's tooltip. A plan_fit.json predating this
+    /// key decodes to `"calendar"`, which is exactly how those files were
+    /// computed.
+    var projectionBasis: String = "calendar"
 }
 
 /// Parsed, defensively-decoded snapshot of ~/.claude-autoresume/usage/plan_fit.json.
@@ -115,8 +148,8 @@ struct PlanFitData {
 /// Reads ~/.claude-autoresume/usage/plan_fit.json — written hourly by the
 /// Python usage daemon — and republishes it for OverlayView's "Plan fit"
 /// section. Purely a reader: this widget never writes plan_fit.json.
-final class PlanFitModel: ObservableObject {
-    @Published var data: PlanFitData?
+final class PlanFitModel: Observable {
+    @Observed var data: PlanFitData?
 
     private let fileURL: URL
 
@@ -126,11 +159,12 @@ final class PlanFitModel: ObservableObject {
         "max_20x": "Max 20x"
     ]
 
-    init() {
+    override init() {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-autoresume")
             .appendingPathComponent("usage")
         self.fileURL = dir.appendingPathComponent("plan_fit.json")
+        super.init()
     }
 
     /// Re-reads plan_fit.json. Safe to call on a timer even though the
@@ -235,6 +269,12 @@ final class PlanFitModel: ObservableObject {
                         projectedPeak5hUtil: doubleValue(p["projected_peak_5h_util"]),
                         throttleDays5hPerMonth: doubleValue(p["throttle_days_5h_per_month"]),
                         throttleDays7dPerMonth: doubleValue(p["throttle_days_7d_per_month"]),
+                        cappedHours5hPerMonth: doubleValue(p["capped_hours_5h_per_month"]),
+                        cappedHours7dPerMonth: doubleValue(p["capped_hours_7d_per_month"]),
+                        cappedHoursAnyPerMonth: doubleValue(p["capped_hours_any_per_month"]),
+                        medianLockoutAnyHours: doubleValue(p["median_lockout_any_hours"]),
+                        medianLockout5hHours: doubleValue(p["median_lockout_5h_hours"]),
+                        medianLockout7dHours: doubleValue(p["median_lockout_7d_hours"]),
                         medianThrottlePeak5hPct: doubleValue(p["median_throttle_peak_5h_pct"]),
                         medianThrottlePeak7dPct: doubleValue(p["median_throttle_peak_7d_pct"]),
                         viable: p["viable"] as? Bool ?? true,
@@ -260,7 +300,8 @@ final class PlanFitModel: ObservableObject {
             projectedPct: doubleValue(b["projected_pct"]),
             periodStart: dateValue(b["period_start"]),
             periodEnd: dateValue(b["period_end"]),
-            includesRemote: b["includes_remote"] as? Bool ?? false
+            includesRemote: b["includes_remote"] as? Bool ?? false,
+            projectionBasis: (b["projection_basis"] as? String) == "weekdays" ? "weekdays" : "calendar"
         )
     }
 
@@ -343,30 +384,54 @@ final class PlanFitModel: ObservableObject {
         return "$\(Int(price))"
     }
 
-    /// "5h 0.4 · 7d 0" — projected cap-hit days per 30-day month for the
-    /// tier grid's last column. nil when the deployed daemon predates the
-    /// throttle verdict, so the caller can fall back to the legacy peaks
-    /// text instead of showing an empty cell.
+    /// "any 2.1d · 5h 40m · 7d 1.8d" — projected time per 30-day month the
+    /// tier would have spent locked out, for the tier grid's last column.
+    /// Leads with the union across both caps (what you'd actually lose) and
+    /// keeps the per-cap split, which is what says WHICH cap to act on. nil
+    /// when the deployed daemon predates the throttle verdict, so the caller
+    /// can fall back to the legacy peaks text instead of showing an empty cell.
     func capDaysText(_ tier: TierVerdict) -> String? {
         guard tier.hasThrottleData else { return nil }
-        func fmt(_ v: Double?) -> String {
-            guard let v = v else { return "—" }
-            return v == v.rounded() ? String(format: "%.0f", v) : String(format: "%.1f", v)
-        }
-        return "5h \(fmt(tier.throttleDays5hPerMonth)) · 7d \(fmt(tier.throttleDays7dPerMonth))"
+        return "any \(Self.lockoutText(tier.cappedHoursAny))"
+            + " · 5h \(Self.lockoutText(tier.cappedHours5h))"
+            + " · 7d \(Self.lockoutText(tier.cappedHours7d))"
     }
 
-    /// Tooltip for a throttle-verdict tier row: what the cap-day numbers
-    /// mean plus the all-time peaks (still worth seeing, just demoted from
-    /// deciding viability) and the typical cap-day severity.
+    /// A lockout duration in whatever unit stays legible in a narrow column:
+    /// days over a day, hours over an hour, minutes below that. Anything
+    /// under a minute a month is estimation noise and reads as a clean "0".
+    static func lockoutText(_ hours: Double?) -> String {
+        guard let hours = hours else { return "—" }
+        if hours < 1.0 / 60.0 { return "0" }
+        if hours >= 24 { return String(format: "%.1fd", hours / 24) }
+        if hours >= 1 { return String(format: "%.1fh", hours) }
+        return String(format: "%.0fm", hours * 60)
+    }
+
+    /// Tooltip for a throttle-verdict tier row: what the lockout numbers mean
+    /// plus the all-time peaks (still worth seeing, just demoted from
+    /// deciding viability), how long a typical single lockout runs, and how
+    /// deep into the cap it went.
     func capDaysHelpText(_ tier: TierVerdict, peaksText: String) -> String {
-        var lines = ["Projected days per month hitting the cap (5h / 7d windows)."]
+        var lines = ["Projected time per month unable to work — the tier's cap "
+                     + "reached, until that window resets."]
+        lines.append("\"any\" is time lost to either cap. It's a union, not a sum: "
+                     + "the 5h and 7d lockouts overlap.")
         lines.append("All-time projected peaks: \(peaksText)")
+        if let ep = tier.medianLockoutAnyHours {
+            lines.append(String(format: "A typical lockout lasts ~%@.", Self.lockoutText(ep)))
+        }
+        if let ep = tier.medianLockout5hHours {
+            lines.append(String(format: "A typical 5h lockout lasts ~%@.", Self.lockoutText(ep)))
+        }
+        if let ep = tier.medianLockout7dHours {
+            lines.append(String(format: "A typical 7d lockout lasts ~%@.", Self.lockoutText(ep)))
+        }
         if let sev = tier.medianThrottlePeak5hPct {
-            lines.append(String(format: "Typical 5h cap-day peaks near %.0f%% of cap.", sev))
+            lines.append(String(format: "5h usage while capped peaks near %.0f%% of cap.", sev))
         }
         if let sev = tier.medianThrottlePeak7dPct {
-            lines.append(String(format: "Typical 7d cap-day peaks near %.0f%% of cap.", sev))
+            lines.append(String(format: "7d usage while capped peaks near %.0f%% of cap.", sev))
         }
         return lines.joined(separator: "\n")
     }
@@ -410,6 +475,19 @@ final class PlanFitModel: ObservableObject {
     /// suppression.
     func budgetProjectedPct(_ w: BudgetWindow) -> Int? {
         w.projectedPct.map { Int($0.rounded()) }
+    }
+
+    /// Hover text for a budget bar: what the projection dot means and which
+    /// clock it was extrapolated on (config.json `budget.projection_basis`,
+    /// echoed into each window). The panel itself stays uncluttered — the
+    /// basis is a setting the user chose, so it belongs in the tooltip rather
+    /// than in another caption competing for the 280pt row.
+    func budgetTooltip(_ w: BudgetWindow) -> String {
+        let projected = w.projectedUsd.map { String(format: "$%.0f", $0) } ?? "—"
+        let basis = w.projectionBasis == "weekdays"
+            ? "Projecting over weekdays only (Mon–Fri): elapsed and remaining time both count weekday hours, so weekend days don't dilute the rate. Weekend spend still counts toward the total."
+            : "Projecting over every day of the period."
+        return "Spent \(budgetSpentText(w)) so far. The dot marks where spend lands at this rate: \(projected). \(basis) Change it in Settings → Account & Budget."
     }
 
     /// "resets in 3d 4h" from a period's `period_end`, reusing the same

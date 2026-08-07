@@ -1,28 +1,27 @@
 import Foundation
-import Combine
 import ClaudeAPI
 
 /// Holds the latest usage numbers pulled from claude.ai and formats them
 /// for display. `now` is ticked by a lightweight timer so the "resets in
 /// Xh Ym" labels count down live between network refreshes.
-final class UsageModel: ObservableObject {
-    @Published var sessionPercent: Int?
-    @Published var sessionResetsAt: Date?
+final class UsageModel: Observable {
+    @Observed var sessionPercent: Int?
+    @Observed var sessionResetsAt: Date?
 
-    @Published var weeklyPercent: Int?
-    @Published var weeklyResetsAt: Date?
+    @Observed var weeklyPercent: Int?
+    @Observed var weeklyResetsAt: Date?
 
-    @Published var isLoggedOut: Bool = false
-    @Published var lastError: String?
-    @Published var lastUpdated: Date?
+    @Observed var isLoggedOut: Bool = false
+    @Observed var lastError: String?
+    @Observed var lastUpdated: Date?
 
     /// The account's dollar Spend Limit straight from the usage API
     /// (Enterprise / spend-capped plans), or nil on plans without one (Max/
     /// Pro). This is the authoritative figure Claude Desktop's usage tab shows
     /// — displayed as-is, never reconstructed from local token cost.
-    @Published var spendLimit: SpendLimit?
+    @Observed var spendLimit: SpendLimit?
 
-    @Published var now: Date = Date()
+    @Observed var now: Date = Date()
 
     private static let sessionWindowDuration: TimeInterval = 5 * 3600
     private static let weeklyWindowDuration: TimeInterval = 7 * 24 * 3600

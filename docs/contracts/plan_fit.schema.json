@@ -1,0 +1,1063 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-widget.invalid/contracts/plan_fit.schema.json",
+  "title": "claude-autoresume usage/plan_fit.json",
+  "description": "The plan-fit analytics report at ~/.claude-autoresume/usage/plan_fit.json. Written whole, atomically (tmp + replace), by plan_fit.write_plan_fit on the daemon's hourly analytics lane; read by the widget's PlanFitModel (verdict + cost summary) and GraphModel (cost_series only). Single writer, single-ish reader, no lock. Almost every leaf is nullable: compute() tolerates missing or malformed store files and comes back all-null with a warning rather than raising, so 'the key is present but null' is the normal not-enough-data state and must never be conflated with 'the key is missing'.",
+  "x-contract-version": 1,
+  "x-in-band-version": false,
+  "x-in-band-version-note": "No version field. `generated_at` is the only provenance marker and no reader consumes it - the widget staleness-checks by file mtime instead.",
+  "x-writers": [
+    "claude-autoresume/plan_fit.py compute() / write_plan_fit()"
+  ],
+  "x-readers": [
+    "ClaudeUsageOverlay PlanFitModel.parse -> PlanFitData",
+    "ClaudeUsageOverlay GraphModel.parseCostSeries (cost_series only)"
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "generated_at",
+    "current_plan",
+    "account",
+    "budget",
+    "cost_series",
+    "moving_averages",
+    "monthly_run_rate",
+    "cost_peaks",
+    "utilization_observed",
+    "tier_projection",
+    "throttle_projection",
+    "verdict",
+    "totals",
+    "pricing_meta",
+    "assumptions",
+    "warnings"
+  ],
+  "properties": {
+    "generated_at": {
+      "type": "string",
+      "description": "ISO8601 UTC timestamp of this computation. Written every run; read by nobody.",
+      "x-reader": "unread"
+    },
+    "current_plan": {
+      "type": "string",
+      "enum": [
+        "pro",
+        "max_5x",
+        "max_20x"
+      ],
+      "description": "The plan the observed utilization series was MEASURED against, from config.json's account.plan. Every tier projection is a rescale relative to this, so getting it wrong scales the whole report by current/actual."
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "plan"
+      ],
+      "description": "Echo of config.json's account block, so the widget can decide between percentage bars and dollar budget bars without re-reading config.json.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "max",
+            "api"
+          ],
+          "description": "'api' switches the widget to dollar budget bars."
+        },
+        "plan": {
+          "type": "string",
+          "enum": [
+            "pro",
+            "max_5x",
+            "max_20x"
+          ],
+          "description": "Mirrors current_plan; kept for the API-tier comparison ratio."
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "weekly",
+        "monthly"
+      ],
+      "description": "Dollar budget windows. Emitted for EVERY account type - the widget decides whether to surface them. Each period is null when its limit is unconfigured in config.json.",
+      "properties": {
+        "weekly": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/budgetWindow"
+            }
+          ],
+          "description": "The weekly budget window, or JSON null when no weekly limit is configured. The widget decodes null as 'period unconfigured' and omits the bar entirely."
+        },
+        "monthly": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/budgetWindow"
+            }
+          ],
+          "description": "The monthly budget window, or JSON null when no monthly limit is configured."
+        }
+      }
+    },
+    "cost_series": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hourly",
+        "daily"
+      ],
+      "description": "Graph-ready API-equivalent cost. Keys are timestamps so the reader needs no knowledge of the bucketing rules. The two sub-objects use DIFFERENT key formats - see each.",
+      "properties": {
+        "hourly": {
+          "type": "object",
+          "description": "UTC hour-bucket ISO8601 timestamp (e.g. '2026-07-18T04:00:00+00:00') -> USD, rounded to 4dp. Pruned to a rolling ~35-day window; covers the widget's 24h / 7d / 1mo graph ranges.",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "daily": {
+          "type": "object",
+          "description": "UTC date 'YYYY-MM-DD' -> USD, rounded to 2dp. Retained forever; backs the 3mo graph range. The differing key format is why GraphModel carries a dedicated dailyKeyDate helper and a locale-fixed formatter.",
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+          },
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "moving_averages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "1d",
+        "7d",
+        "30d",
+        "90d"
+      ],
+      "description": "Dollars/day per window. The denominator is REAL elapsed time (fractional days from max(window start, first data point) to now), not the count of calendar days touched - day-counting quantized 1.33 days of history up to '2 covered days' and deflated the rate ~35%.",
+      "properties": {
+        "1d": {
+          "$ref": "#/$defs/movingAverage"
+        },
+        "7d": {
+          "$ref": "#/$defs/movingAverage"
+        },
+        "30d": {
+          "$ref": "#/$defs/movingAverage"
+        },
+        "90d": {
+          "$ref": "#/$defs/movingAverage"
+        }
+      }
+    },
+    "monthly_run_rate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value_usd_per_month",
+        "basis"
+      ],
+      "description": "The headline 'API equivalent $X/mo' figure.",
+      "properties": {
+        "value_usd_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Null when no window has any data yet."
+        },
+        "basis": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "1d",
+            "7d",
+            "30d",
+            "90d",
+            null
+          ],
+          "description": "Which moving-average window the run rate was extrapolated from. Prefers 7d, then falls back 90d -> 30d -> 1d. Null when none had data."
+        }
+      }
+    },
+    "cost_peaks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "one_hour",
+        "rolling_five_hour"
+      ],
+      "description": "Worst observed spend bursts, in API-equivalent dollars.",
+      "properties": {
+        "one_hour": {
+          "$ref": "#/$defs/costPeak"
+        },
+        "rolling_five_hour": {
+          "$ref": "#/$defs/costPeak"
+        }
+      }
+    },
+    "utilization_observed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "five_hour",
+        "seven_day"
+      ],
+      "description": "Peak and weighted-average utilization percentages ACTUALLY observed on the current plan, merged across the three snapshot tiers. Context for the report; no longer the basis of the viability verdict.",
+      "properties": {
+        "five_hour": {
+          "$ref": "#/$defs/observedWindow"
+        },
+        "seven_day": {
+          "$ref": "#/$defs/observedWindow"
+        }
+      }
+    },
+    "tier_projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pro",
+        "max_5x",
+        "max_20x"
+      ],
+      "description": "The observed percentages linearly rescaled onto every tier (factor = current tier's multiplier / target tier's multiplier). Retained as context only - `would_hit_cap` is NOT the viability verdict any more, since a >100% peak on a viable tier is now expected rather than an error.",
+      "properties": {
+        "pro": {
+          "$ref": "#/$defs/tierProjection"
+        },
+        "max_5x": {
+          "$ref": "#/$defs/tierProjection"
+        },
+        "max_20x": {
+          "$ref": "#/$defs/tierProjection"
+        }
+      },
+      "x-reader": "unread by the widget"
+    },
+    "throttle_projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pro",
+        "max_5x",
+        "max_20x"
+      ],
+      "description": "Per tier, how much TIME that tier would have left the user unable to work (2026-07-26: replaced the old cap-DAY counting, which charged a whole day for a cap hit in the window's last hour, and every remaining day of the week besides). The utilization series is re-expressed as time segments, rescaled per tier, and the portion at/over 100% is summed. The widget reads the flattened copies in verdict.plans rather than this block.",
+      "properties": {
+        "pro": {
+          "$ref": "#/$defs/tierLockout"
+        },
+        "max_5x": {
+          "$ref": "#/$defs/tierLockout"
+        },
+        "max_20x": {
+          "$ref": "#/$defs/tierLockout"
+        }
+      },
+      "x-reader": "unread by the widget"
+    },
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plans",
+        "recommendation",
+        "data_maturity",
+        "throttle_tolerance"
+      ],
+      "description": "The part the widget's Plan-fit tab actually renders.",
+      "properties": {
+        "plans": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pro",
+            "max_5x",
+            "max_20x"
+          ],
+          "properties": {
+            "pro": {
+              "$ref": "#/$defs/planVerdict"
+            },
+            "max_5x": {
+              "$ref": "#/$defs/planVerdict"
+            },
+            "max_20x": {
+              "$ref": "#/$defs/planVerdict"
+            }
+          },
+          "description": "One entry per canonical tier - the widget's tier grid, one row each. Keys are fixed: adding a tier is a contract change on both sides (Swift iterates a hardcoded list)."
+        },
+        "recommendation": {
+          "type": "string",
+          "description": "One succinct sentence, always peeking at the adjacent tier: one tier DOWN when the recommended tier fits, one tier UP when the current plan is over tolerance. Rendered verbatim - AppDelegate.planFitTextExtra() measures this live string with NSString boundingRect and grows the fixed panel height so it cannot clip."
+        },
+        "data_maturity": {
+          "type": "string",
+          "description": "'N/90 days collected' caption, with a 'treat as preliminary' qualifier under 7 days. Rendered verbatim, and measured for panel height alongside the recommendation."
+        },
+        "throttle_tolerance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "five_hour_hours_per_month",
+            "seven_day_hours_per_month",
+            "five_hour_days_per_month",
+            "seven_day_days_per_month"
+          ],
+          "description": "Surfaced so a consumer can explain what `viable` means without hardcoding the thresholds a second time. The HOURS pair are the real thresholds; the day-equivalents are kept for readers written in the cap-day era.",
+          "properties": {
+            "five_hour_hours_per_month": {
+              "type": "number",
+              "description": "Default 5 - one fully-capped rolling 5h window a month, which is the old 'at most 1 cap-day' intent stated honestly."
+            },
+            "seven_day_hours_per_month": {
+              "type": "number",
+              "description": "Default 2 - effectively none, with just enough headroom for a brief end-of-window overrun or bucket-boundary noise. A weekly-cap lockout is treated as disqualifying."
+            },
+            "five_hour_days_per_month": {
+              "type": "number",
+              "description": "Day-equivalent of five_hour_hours_per_month, kept only for readers written in the cap-day era. Not the threshold the verdict actually applies."
+            },
+            "seven_day_days_per_month": {
+              "type": "number",
+              "description": "Day-equivalent of seven_day_hours_per_month, kept only for readers written in the cap-day era."
+            }
+          }
+        }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "by_model",
+        "all_models_cost_usd"
+      ],
+      "description": "All-time token totals and API-equivalent cost, per model.",
+      "x-reader": "unread by the widget",
+      "properties": {
+        "by_model": {
+          "type": "object",
+          "description": "Model id -> totals. Keys are whatever model ids the transcripts carried; not an enum.",
+          "additionalProperties": {
+            "$ref": "#/$defs/modelTotals"
+          }
+        },
+        "all_models_cost_usd": {
+          "type": "number",
+          "description": "Sum of every model's cost_usd, 2dp."
+        }
+      }
+    },
+    "pricing_meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "override_active",
+        "cache_present",
+        "cache_fetched_at",
+        "cache_stale",
+        "bundled_as_of",
+        "sources_used"
+      ],
+      "description": "Provenance for the pricing chain, which resolves override file -> fetched LiteLLM cache (daily refresh) -> bundled defaults. That fallback order is a project hard constraint.",
+      "x-reader": "unread by the widget",
+      "properties": {
+        "override_active": {
+          "type": "boolean",
+          "description": "A user override file was found and used."
+        },
+        "cache_present": {
+          "type": "boolean",
+          "description": "A fetched LiteLLM pricing cache exists on disk."
+        },
+        "cache_fetched_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO8601 fetch time of that cache; null when absent."
+        },
+        "cache_stale": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The cache exists but is older than the daily refresh interval. NULL when there is no cache to judge - distinct from false, which means a cache exists and is fresh."
+        },
+        "bundled_as_of": {
+          "type": "string",
+          "description": "ISO8601 date the hardcoded fallback price table was last checked."
+        },
+        "sources_used": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Sorted set of which layers of the chain actually priced something this run."
+        }
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Human-readable caveats the report itself wants stated - including the documented lockout bias: projected 5h lockout is an UPPER BOUND because the series was measured on the current plan, where usage kept accruing past the point a cheaper tier would have cut it off. Weekly is unaffected (its window resets on a fixed schedule either way).",
+      "x-reader": "unread by the widget"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Problems compute() hit and swallowed - unreadable store files, a plan change truncating history, and so on. NOT surfaced anywhere in the UI; see findings F3-4.",
+      "x-reader": "unread by the widget"
+    }
+  },
+  "$defs": {
+    "budgetWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "limit_usd",
+        "spent_usd",
+        "pct",
+        "projected_usd",
+        "projected_pct",
+        "period_start",
+        "period_end",
+        "includes_remote",
+        "projection_basis"
+      ],
+      "properties": {
+        "limit_usd": {
+          "type": "number",
+          "description": "The configured limit, 2dp."
+        },
+        "spent_usd": {
+          "type": "number",
+          "description": "Sum of already-priced hourly cost buckets inside the current calendar period. A bucket straddling a period boundary can misattribute up to 1 hour of cost."
+        },
+        "pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "spent/limit as a percentage, 1dp."
+        },
+        "projected_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Linear extrapolation (spent / elapsed fraction). NULL in the period's first hour - too little elapsed to extrapolate, same 'no estimate yet' semantics as the widget's usage bars. Under projection_basis 'weekdays' both the elapsed time and the period length count Mon-Fri hours only, and the first-hour suppression is measured in weekday time too (a month opening on a Saturday reports no projection until an hour into Monday)."
+        },
+        "projected_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "projected/limit as a percentage. Null on the same first-hour rule."
+        },
+        "period_start": {
+          "type": "string",
+          "description": "ISO8601 UTC. The boundary is computed in config.json's budget.timezone, DST-safely, then expressed as UTC."
+        },
+        "period_end": {
+          "type": "string",
+          "description": "ISO8601 UTC, exclusive. Drives the widget's 'resets in 3d 4h' countdown."
+        },
+        "includes_remote": {
+          "type": "boolean",
+          "description": "True when at least one remote host's usage store was folded into the cost series this run. Display-only."
+        },
+        "projection_basis": {
+          "type": "string",
+          "enum": ["calendar", "weekdays"],
+          "description": "Echo of config.json's budget.projection_basis (defaulted and validated by plan_fit, so an unknown value arrives here as 'calendar'). Tells the widget which clock projected_usd/projected_pct were extrapolated on, for the bar's tooltip. Added after the first release of this block: an OLDER plan_fit.json omits it entirely and the widget reads that as 'calendar', which is what those files were computed with."
+        }
+      }
+    },
+    "movingAverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value_usd_per_day",
+        "days_covered",
+        "window_days"
+      ],
+      "properties": {
+        "value_usd_per_day": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "SUPPRESSED to null (not extrapolated) when under an hour has elapsed since the window's span start - this is what kills the fresh-store explosion where $2 in 10 minutes reads as $288/day, and the 1d window's spike just after 00:00 UTC."
+        },
+        "days_covered": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Integer count of calendar days in the window that have data. Keeps counting even while value_usd_per_day is suppressed, so the maturity captions ('2/7 days') still work."
+        },
+        "window_days": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The window's nominal width. Redundant with the key but read directly by the widget's caption builder."
+        }
+      }
+    },
+    "costPeak": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value_usd",
+        "at"
+      ],
+      "properties": {
+        "value_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Peak spend in that window, 2dp; null with no hourly data."
+        },
+        "at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO8601 UTC hour the peak ended. Unread by the widget."
+        }
+      }
+    },
+    "observedWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "peak_pct",
+        "peak_at",
+        "avg_pct"
+      ],
+      "properties": {
+        "peak_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Highest utilization percentage seen. Bucket rows contribute their `max`, which is preserved exactly through every compaction tier - never averaged away - precisely so this stays recoverable from old history."
+        },
+        "peak_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO8601 UTC of the peak. Unread by the widget."
+        },
+        "avg_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Sample-count-weighted mean (a bucket contributes avg x n). Unread by the widget."
+        }
+      }
+    },
+    "tierProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "peak_five_hour_pct",
+        "peak_seven_day_pct",
+        "avg_five_hour_pct",
+        "avg_seven_day_pct",
+        "would_hit_cap"
+      ],
+      "properties": {
+        "peak_five_hour_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Observed 5h peak rescaled onto this tier. Over 100% is EXPECTED on a viable tier now; it no longer disqualifies anything."
+        },
+        "peak_seven_day_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Observed weekly peak rescaled onto this tier."
+        },
+        "avg_five_hour_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Observed sample-weighted 5h average rescaled onto this tier."
+        },
+        "avg_seven_day_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Observed sample-weighted weekly average rescaled onto this tier."
+        },
+        "would_hit_cap": {
+          "type": "boolean",
+          "description": "Either projected peak exceeds 100%. LEGACY: this was the viability test before 2026-07-19; it let one monster session permanently veto every cheaper tier. Kept as context."
+        }
+      }
+    },
+    "lockoutStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hours_observed",
+        "days_observed",
+        "capped_hours",
+        "capped_hours_per_month",
+        "capped_days_per_month",
+        "throttle_days_per_month",
+        "cap_episodes",
+        "median_episode_hours",
+        "longest_episode_hours",
+        "days_with_cap",
+        "median_throttle_peak_pct"
+      ],
+      "description": "Lockout accounting for one cap dimension. Normalization is per OBSERVED time, not per calendar time, so stretches where the widget was not collecting do not dilute the rate.",
+      "properties": {
+        "hours_observed": {
+          "type": "number",
+          "description": "Wall-clock the series actually covered for this dimension. Holes wider than LOCKOUT_MAX_SAMPLE_GAP_SECONDS (widget or Mac off) count as neither observed nor locked-out."
+        },
+        "days_observed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct UTC days touched by observed coverage."
+        },
+        "capped_hours": {
+          "type": "number",
+          "description": "Raw observed hours at/over the cap, before normalization."
+        },
+        "capped_hours_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "THE honest unit: capped_hours / hours_observed x a 30-day month. NULL, not 0, when this dimension has no observed coverage at all - 'we cannot say' is deliberately distinct from 'no lockout'."
+        },
+        "capped_days_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "capped_hours_per_month / 24. A display convenience, not a count of days. NULL, not 0, when this dimension has no observed coverage at all - 'we cannot say' is deliberately distinct from 'no lockout'."
+        },
+        "throttle_days_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Identical value to capped_days_per_month. The name is inherited from the cap-day era and kept so older widget builds keep rendering the column; it now means days' WORTH of lockout, not days on which a cap was touched. NULL, not 0, when this dimension has no observed coverage at all - 'we cannot say' is deliberately distinct from 'no lockout'."
+        },
+        "cap_episodes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Contiguous runs of capped time. Broken by a segment under the cap, or by a coverage gap too long to bridge - a SHORT collection gap between two capped segments is missing data, not a recovery."
+        },
+        "median_episode_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median episode length - 'how long am I stuck when it happens'. Null with no episodes."
+        },
+        "longest_episode_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Worst single episode. Emitted but never read by the widget; see findings F3-3."
+        },
+        "days_with_cap": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct UTC days touched by any lockout. This IS the old cap-day count, demoted to context."
+        },
+        "median_throttle_peak_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median projected peak across capped segments: how deep into the cap a typical lockout went."
+        }
+      }
+    },
+    "anyCapStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hours_observed",
+        "days_observed",
+        "capped_hours",
+        "capped_hours_per_month",
+        "capped_days_per_month",
+        "throttle_days_per_month",
+        "cap_episodes",
+        "median_episode_hours",
+        "longest_episode_hours",
+        "days_with_cap",
+        "median_throttle_peak_pct",
+        "overlap_hours",
+        "five_hour_only_hours",
+        "seven_day_only_hours"
+      ],
+      "description": "lockoutStats for EITHER cap, plus the split that says which cap is binding. This is a UNION, not a sum: both caps climb while you work, so within a segment both crossings sit at its busy end (a nested-interval model - union = max(frac_5h, frac_7d), overlap = min(...)). Adding the dimensions double-counts heavily; on live data one tier read 87h + 644h but only 677h union.",
+      "properties": {
+        "hours_observed": {
+          "type": "number",
+          "description": "Wall-clock the series actually covered for this dimension. Holes wider than LOCKOUT_MAX_SAMPLE_GAP_SECONDS (widget or Mac off) count as neither observed nor locked-out."
+        },
+        "days_observed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct UTC days touched by observed coverage."
+        },
+        "capped_hours": {
+          "type": "number",
+          "description": "Raw observed hours at/over the cap, before normalization."
+        },
+        "capped_hours_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": " NULL, not 0, when this dimension has no observed coverage at all - 'we cannot say' is deliberately distinct from 'no lockout'."
+        },
+        "capped_days_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": " NULL, not 0, when this dimension has no observed coverage at all - 'we cannot say' is deliberately distinct from 'no lockout'."
+        },
+        "throttle_days_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": " NULL, not 0, when this dimension has no observed coverage at all - 'we cannot say' is deliberately distinct from 'no lockout'."
+        },
+        "cap_episodes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Contiguous runs of capped time. Broken by a segment under the cap, or by a coverage gap too long to bridge - a SHORT collection gap between two capped segments is missing data, not a recovery."
+        },
+        "median_episode_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median episode length - 'how long am I stuck when it happens'. Null with no episodes."
+        },
+        "longest_episode_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Worst single episode. Emitted but never read by the widget; see findings F3-3."
+        },
+        "days_with_cap": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct UTC days touched by any lockout. This IS the old cap-day count, demoted to context."
+        },
+        "median_throttle_peak_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median projected peak across capped segments: how deep into the cap a typical lockout went."
+        },
+        "overlap_hours": {
+          "type": "number",
+          "description": "Time BOTH caps were hit, under the nested-interval model."
+        },
+        "five_hour_only_hours": {
+          "type": "number",
+          "description": "Lockout attributable to the 5h cap alone. Feeds the recommendation's '(5h cap)' tag."
+        },
+        "seven_day_only_hours": {
+          "type": "number",
+          "description": "Lockout attributable to the weekly cap alone. Feeds the '(weekly cap)' tag."
+        }
+      }
+    },
+    "tierLockout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "five_hour",
+        "seven_day",
+        "any_cap"
+      ],
+      "properties": {
+        "five_hour": {
+          "$ref": "#/$defs/lockoutStats"
+        },
+        "seven_day": {
+          "$ref": "#/$defs/lockoutStats"
+        },
+        "any_cap": {
+          "$ref": "#/$defs/anyCapStats"
+        }
+      }
+    },
+    "planVerdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "price_usd",
+        "api_equiv_ratio",
+        "projected_peak_7d_util",
+        "projected_peak_5h_util",
+        "capped_hours_5h_per_month",
+        "capped_hours_7d_per_month",
+        "capped_hours_any_per_month",
+        "throttle_days_any_per_month",
+        "median_lockout_any_hours",
+        "longest_lockout_any_hours",
+        "throttle_days_5h_per_month",
+        "throttle_days_7d_per_month",
+        "median_lockout_5h_hours",
+        "median_lockout_7d_hours",
+        "longest_lockout_5h_hours",
+        "longest_lockout_7d_hours",
+        "median_throttle_peak_5h_pct",
+        "median_throttle_peak_7d_pct",
+        "price_delta_vs_current_usd",
+        "viable",
+        "has_peak_data"
+      ],
+      "description": "One row of the widget's tier grid: throttle_projection flattened, plus pricing. Every field here is a copy of something in throttle_projection - the flattening exists so the widget never has to walk that nested block.",
+      "properties": {
+        "price_usd": {
+          "type": "number",
+          "description": "List price per month."
+        },
+        "api_equiv_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "monthly_run_rate / price - 'this tier is worth N x its price at your usage'. Rendered as the grid's 'x API' column. Null with no run rate."
+        },
+        "projected_peak_7d_util": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "All-time projected weekly peak. Context only now."
+        },
+        "projected_peak_5h_util": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "All-time projected 5h peak. Context only now."
+        },
+        "capped_hours_5h_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Projected hours/month locked out by the 5h cap on this tier. UPPER BOUND: the series was measured on the current plan, where usage kept accruing past the point a cheaper tier would have cut it off."
+        },
+        "capped_hours_7d_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Projected hours/month locked out by the weekly cap on this tier. Unbiased - the weekly window resets on a fixed schedule either way."
+        },
+        "capped_hours_any_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "The union figure - what you would actually lose. Leads the grid's 'Capped/mo' cell."
+        },
+        "throttle_days_any_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Day-equivalent of capped_hours_any_per_month."
+        },
+        "median_lockout_any_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median length of a single lockout from either cap - 'how long am I stuck when it happens'. Shown in the tier-grid tooltip."
+        },
+        "longest_lockout_any_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Unread by the widget."
+        },
+        "throttle_days_5h_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Day-equivalent. Name predates the hours switch; the widget uses it as the fallback when capped_hours_* is absent (older daemon)."
+        },
+        "throttle_days_7d_per_month": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Day-equivalent of capped_hours_7d_per_month. Same legacy naming as the 5h field."
+        },
+        "median_lockout_5h_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median length of a single 5h-cap lockout. Shown in the tier-grid tooltip."
+        },
+        "median_lockout_7d_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median length of a single weekly-cap lockout. Shown in the tier-grid tooltip."
+        },
+        "longest_lockout_5h_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Unread by the widget."
+        },
+        "longest_lockout_7d_hours": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Unread by the widget."
+        },
+        "median_throttle_peak_5h_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median projected 5h peak across capped segments - how deep into the cap a typical lockout went. Shown in the tooltip as 'usage while capped peaks near N%'."
+        },
+        "median_throttle_peak_7d_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Median projected weekly peak across capped segments."
+        },
+        "price_delta_vs_current_usd": {
+          "type": "number",
+          "description": "price_usd minus the current plan's price. Negative = a saving. Drives the recommendation's phrasing."
+        },
+        "viable": {
+          "type": "boolean",
+          "description": "Within BOTH hour tolerances (verdict.throttle_tolerance). Authoritative: TierVerdict.isFlagged trusts it whenever any throttle field is present, because a >100% projected peak on a viable tier is now expected. WARNING: the Swift decoder defaults a missing `viable` to TRUE - it fails open. See findings F3-2."
+        },
+        "has_peak_data": {
+          "type": "boolean",
+          "description": "At least one projected peak was computable. When no tier has peak data the recommendation says so instead of guessing."
+        }
+      }
+    },
+    "modelTotals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "output",
+        "cache_write",
+        "cache_read",
+        "web_searches",
+        "messages",
+        "cost_usd",
+        "pricing_sources"
+      ],
+      "properties": {
+        "input": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "All-time uncached input tokens attributed to this model."
+        },
+        "output": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "All-time output tokens."
+        },
+        "cache_write": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "All-time cache-creation tokens (priced differently from plain input)."
+        },
+        "cache_read": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "All-time cache-read tokens (the cheapest class; usually the largest count)."
+        },
+        "web_searches": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "All-time server-side web search calls, which are priced per call rather than per token."
+        },
+        "messages": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Deduped message count - transcripts repeat a message under (message.id, requestId), so only the first occurrence is folded in."
+        },
+        "cost_usd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "API-equivalent cost of the above at the resolved rates, 2dp. This - not any subscription price - is what the tier comparison ratios divide by."
+        },
+        "pricing_sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Which layers of the pricing chain priced this model."
+        }
+      }
+    }
+  }
+}

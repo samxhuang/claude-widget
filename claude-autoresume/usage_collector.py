@@ -113,22 +113,25 @@ through every tier, never averaged away.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import platform_compat  # The ONE OS seam: locks, paths, atomic replace
+
 # ---------------------------------------------------------------------------
 # Config (mirrors autoresume.py's constants where the source is the same)
 # ---------------------------------------------------------------------------
 
-HOME = Path.home()
-PROJECTS_DIR = HOME / ".claude" / "projects"
-COWORK_SESSIONS_DIR = HOME / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+HOME = platform_compat.home()
+PROJECTS_DIR = platform_compat.projects_dir()
+# None on platforms with no known Cowork directory — _iter_cowork_files()
+# treats that as "no Cowork files", same as a nonexistent path.
+COWORK_SESSIONS_DIR = platform_compat.cowork_sessions_dir()
 
-DEFAULT_STATE_DIR = HOME / ".claude-autoresume"
+DEFAULT_STATE_DIR = platform_compat.state_dir()
 USAGE_SUBDIR = "usage"
 TOKENS_FILENAME = "tokens_hourly.json"
 COLLECT_LOCK_FILENAME = "usage_collect.lock"
@@ -204,13 +207,13 @@ def snapshots_lock_path(state_dir: Path) -> Path:
 def _atomic_write_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    tmp.replace(path)
+    platform_compat.replace_with_retry(tmp, path)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text)
-    tmp.replace(path)
+    platform_compat.replace_with_retry(tmp, path)
 
 
 class _CollectLock:
@@ -218,20 +221,20 @@ class _CollectLock:
     concurrent invocation (e.g. a daemon poll and a manual CLI run
     overlapping) without corrupting tokens_hourly.json — but this
     deliberately does NOT touch autoresume.py's state.json.lock; that lock
-    is for the shared session state file, this store is collector-private."""
+    is for the shared session state file, this store is collector-private.
+
+    The primitive is platform_compat.FileLock (flock(LOCK_EX) on POSIX,
+    LockFileEx on Windows)."""
 
     def __init__(self, state_dir: Path):
-        self._path = usage_dir(state_dir) / COLLECT_LOCK_FILENAME
-        self._fh = None
+        self._lock = platform_compat.FileLock(usage_dir(state_dir) / COLLECT_LOCK_FILENAME)
 
     def __enter__(self):
-        self._fh = open(self._path, "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        self._lock.__enter__()
         return self
 
     def __exit__(self, *exc):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        self._lock.__exit__(*exc)
 
 
 class _SnapshotsLock:
@@ -241,20 +244,19 @@ class _SnapshotsLock:
     takes it around stage 1 (raw -> 15m) so an append can't be lost between
     the compactor's read and its rename. Held for as short a window as
     possible — stage 2 (15m -> 1h) touches only compactor-private files and
-    stays OUTSIDE this lock."""
+    stays OUTSIDE this lock. Primitive: platform_compat.FileLock — the same
+    byte-0 exclusive lock the widget takes, flock on POSIX / LockFileEx on
+    Windows. Both sides must always agree on the primitive AND the path."""
 
     def __init__(self, state_dir: Path):
-        self._path = snapshots_lock_path(state_dir)
-        self._fh = None
+        self._lock = platform_compat.FileLock(snapshots_lock_path(state_dir))
 
     def __enter__(self):
-        self._fh = open(self._path, "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        self._lock.__enter__()
         return self
 
     def __exit__(self, *exc):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        self._lock.__exit__(*exc)
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +329,11 @@ def _iter_code_cli_files(projects_dir: Path):
                     yield sub_path
 
 
-def _iter_cowork_files(cowork_dir: Path):
-    if not cowork_dir.is_dir():
+def _iter_cowork_files(cowork_dir: Path | None):
+    # None => no known Cowork directory on this platform (see
+    # platform_compat.cowork_sessions_dir); yields nothing, same as a
+    # nonexistent path did before.
+    if cowork_dir is None or not cowork_dir.is_dir():
         return
     yield from sorted(cowork_dir.rglob("audit.jsonl"))
 

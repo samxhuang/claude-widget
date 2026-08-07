@@ -291,7 +291,9 @@ picking up new work so you don't re-diagnose the same things.
 5. **Throttle-tolerance plan-fit verdict (replaces peak-based viability).**
    A tier's `viable` flag no longer means "the all-time projected peak never
    crossed 100%" (one monster session permanently vetoed cheaper tiers). It
-   now counts **projected cap-days**: per-UTC-day peak utilization
+   now counts **projected cap-days** — superseded 2026-07-26 by projected
+   lockout TIME, see the section below; the rest of this entry still
+   describes the plumbing. Per-UTC-day peak utilization
    (`_daily_peaks` — per-day maxima survive bucket compaction, unlike
    percentiles) rescaled per tier, days ≥100% counted and normalized to a
    30-day month (`_tier_throttle`), viable when within tolerance
@@ -372,6 +374,207 @@ bundle binary swapped for --validate-api; daemon NOT yet redeployed** — run
 starts writing scoped_limits.json. Until both run, existing already-vanished
 Fable sessions won't retroactively reappear (their transcripts are long out
 of window); the fix catches *future* Fable caps while they're still fresh.
+
+## Plan-fit: cap-days → lockout TIME (2026-07-26)
+
+The throttle verdict's unit was wrong, and wrong in the aggressive
+direction. Counting UTC days whose projected peak touched 100% charged a
+whole day for a cap hit in the last hour of a window, and — because a
+weekly window's utilization stays over the line until it resets — charged
+every remaining day of that week too, so a single early-week overrun read
+as "capped ~30 d/mo". The metric now measures what it always meant: **how
+much time the tier would leave you unable to work**.
+
+- `_utilization_segments(points)` re-expresses the merged snapshot series
+  as time segments — raw sample pairs (interval between them, endpoints as
+  the range), compacted buckets (nominal 15m/1h span, min/max as the range,
+  coverage capped at `n * LOCKOUT_SAMPLE_NOMINAL_SECONDS` so a sparse
+  bucket isn't credited a full hour). Holes wider than
+  `LOCKOUT_MAX_SAMPLE_GAP_SECONDS` (widget/Mac off) count as neither
+  observed nor locked-out time.
+- `_above_cap_fraction(low, high)` interpolates linearly across the
+  crossing — for a raw pair that IS interpolation between samples; for a
+  bucket it's the only defensible read from min/max alone.
+- Segments carry BOTH dimensions (`ranges: {dim: (low, high)}`) rather than
+  being built per-dimension, which is what makes the "either cap" aggregate
+  a real union. `_tier_lockout` emits a third block, `any_cap`: union =
+  `max(frac_5h, frac_7d)` per segment, overlap = `min(...)`, under a
+  nested-interval model (both caps climb while you work, so within a segment
+  both crossings sit at its busy end). Adding the two dimensions would
+  double-count heavily — on live data Max 5x reads 87h + 644h but only 677h
+  union. The block also carries `overlap_hours` + `<dim>_only_hours` so a
+  consumer can name the binding cap; `_brief_capped_time` uses that for the
+  recommendation's "(weekly cap)" / "(5h cap)" / "(5h + weekly caps)" tag.
+- `_tier_lockout(segments, plan)` (replaces `_daily_peaks` +
+  `_tier_throttle`) rescales each segment per tier and sums capped time.
+  Emits `capped_hours_per_month` (the honest unit),
+  `capped_days_per_month`, episode stats (`cap_episodes`,
+  `median_episode_hours`, `longest_episode_hours` — "how long am I stuck
+  when it happens"), `days_with_cap` (the old cap-day count, demoted to
+  context) and `median_throttle_peak_pct`.
+- Tolerances are hours/month now: `THROTTLE_TOLERANCE_5H_HOURS_PER_MONTH`
+  = 5 (one fully-capped rolling window a month — the old "1 cap-day"
+  intent stated honestly), `..._7D_...` = 2 (effectively none, with
+  headroom for a brief end-of-window overrun / bucket-boundary noise).
+  Day-equivalents stay in `verdict.throttle_tolerance` for old readers.
+- Documented bias: the series was measured on the CURRENT plan, where
+  usage kept accruing past the point a cheaper tier would have cut it off,
+  so projected **5h** lockout is an upper bound. Weekly is unaffected (the
+  window resets on a fixed schedule either way).
+- `verdict.plans` gains `capped_hours_{5h,7d,any}_per_month` +
+  `median_lockout_*` / `longest_lockout_*`; `throttle_days_*` keeps its
+  name (older widget builds read it) but now means days' WORTH of lockout.
+  Widget column renamed "Cap d/mo" → "Capped/mo", cell is
+  "any 28d · 5h 3.6d · 7d 27d" (auto-unit via `PlanFitModel.lockoutText`:
+  2.1d / 40m / 0), tooltip explains the union and typical lockout length.
+  Recommendation strings say "locked out ~X (weekly cap)", not
+  "capped N d/mo". The cell width was measured against the fixed 280pt
+  panel (238pt of 256pt available at the widest realistic values) — check
+  it again before adding a fourth number to that column.
+- Tests: `LockoutVerdictTests` in test_plan_fit.py (86 in that file),
+  headline cases
+  `test_weekly_cap_hit_late_charges_only_the_time_left_in_the_window`
+  and `test_either_cap_is_a_union_not_a_sum`.
+
+## Windows-port foundation (2026-07-26) — no Windows code ships yet
+
+Planning + platform-decoupling groundwork for a Windows port. **Nothing
+Windows-specific is live**; every change below is behavior-preserving on
+macOS and was accepted only on that basis. Plans: `docs/windows-port-plan.md`
+(phases, blockers, Phase-0 recon table R1-R8) and `docs/swift-windows-audit.md`
+(API inventory, toolchain status, verdict, 45-min Windows spike script in
+§6.3). Chosen direction is **Path 3**: shared Swift core + native UI per
+platform — but read the audit's §6.1 verdict first, which finds the
+economics marginal and the shareable core smaller than the file list
+suggests (~800-1,000 of 2,076 lines are the expensive-to-duplicate part).
+
+**Decided, and load-bearing:** `ClaudeAPI` is split at the **transport/decode
+line, not the WebSession file boundary**. `Client.swift` is not an HTTP
+client — ~120 of its lines are JavaScript run inside an authenticated
+WebView, and on Windows that WebView lives in C# above the FFI. Sharing it
+as-written forces a bidirectional FFI carrying JS source. Don't build that.
+Share DTOs + decoders; keep the fetch loop native per platform.
+
+What landed:
+
+1. **`claude-autoresume/platform_compat.py`** — the daemon's one OS seam
+   (`FileLock`, path resolvers, `process_snapshot`, `spawn_detached`,
+   `replace_with_retry`, `tool_child_markers`). POSIX branches are literal
+   lifts of what they replaced. Windows branches exist but are unverified;
+   every unknown is a single named constant tagged `# RECON-UNVERIFIED (Rn)`
+   against the plan's recon table. **`platform_compat.py` is now a
+   top-level import of autoresume/usage_collector/plan_fit/remote_ctl, so it
+   MUST stay in `PAYLOAD_FILES`** (both deploy scripts) or the remote daemon
+   crash-loops at import — same trap `remote_sync.py` already guards.
+   `remote_ctl.py` now imports it: a deliberate exception to its
+   "standalone" rule, because a re-typed lock primitive diverges silently
+   and breaks cross-process exclusion by construction.
+2. **`docs/contracts/` + `claude-autoresume/contracts.py`** — JSON Schemas
+   for the five on-disk formats, a pure-stdlib validator, and round-trip
+   tests that run the REAL writers. Surfaced 24 drift findings (see
+   `docs/contracts/README.md`); the structural one is **F0-1: four of five
+   formats have no version field**, so every reader compensates with silent
+   defaults and "old build" is indistinguishable from "garbage". Fix that
+   before any third reader exists. Confirmed instances:
+   `autoresume_config.py:123` defaults host `enabled` **True** while
+   `ConfigStore.swift:402` defaults it **false**; `PlanFitModel.swift:274`
+   reads `viable ?? true` (a truncated verdict marks every tier viable);
+   `SessionsModel.swift:201` reads `status ?? "active"`.
+3. **`deploy_remote.py`** — stdlib port of `deploy_remote.sh`, **not yet
+   wired up** (`HostDeployer.swift` still runs `/bin/bash`; no reachable
+   test host). Marker equivalence is proven by running BOTH scripts against
+   identical fake `ssh`/`scp` and byte-diffing stdout. Five latent bugs in
+   the shell version are reproduced faithfully, not fixed — documented in
+   `docs/windows-port-plan.md` §1.4.
+4. **Combine removed from the model layer** — `Observation.swift` provides
+   `Observable` + `@Observed` (36 conversions across 7 files). **View code
+   changed zero lines.** Two invariants a future edit must not break: the
+   setter fires `objectWillChange` BEFORE `stored` updates
+   (`AppDelegate.swift:322` depends on willSet ordering), and the projection
+   is a **`CurrentValueSubject`, not `PassthroughSubject`**, because
+   `@Published` replays the current value to each new subscriber and
+   `AppDelegate.swift:325` relies on that to seed the "Show Sessions" menu
+   check state at launch. `HostDeployer.swift` still uses Combine on purpose
+   (Apple-only `Process`/ssh code).
+5. **`ClaudeAPI/JSONValue.swift`** — typed accessors replacing 23 unguarded
+   `as?` scalar casts that worked only via ObjC bridging (two of them,
+   `Client.swift` `loggedOut`/`ok`, gate every API response). Measured, not
+   assumed: on Darwin `1 as? Bool` is `true` and `0 as? Bool` is `false`, so
+   `jsonBool` accepting 0/1 is PARITY — "strict booleans only" would have
+   been a silent narrowing. Boolean-ness is discriminated by
+   `CFGetTypeID == CFBooleanGetTypeID`, since a JSON `true` also casts to
+   `Int` 1 and a naive `as? Bool` guard would discard real 0/1 percents.
+6. **`ClaudeAPI/Transport.swift`** — `ClaudeScriptRunner` protocol;
+   `ClaudeAPIClient` no longer constructs `ClaudeWebSession` concretely.
+   `ClaudeWebSessionError` → transport-neutral `ClaudeTransportError`.
+   First unit tests for this client ever (`Tests/ClaudeAPITests`, 34 tests,
+   swift-testing — this Mac has CLT only, no Xcode, so use
+   `ClaudeUsageOverlay/run_tests.command`, not bare `swift test`).
+7. **`GraphModel` UTC** — five `TimeZone(identifier: "UTC") ?? .current`
+   fallbacks (which would have put LOCAL time into UTC-keyed bucket math)
+   replaced with an arithmetic `TimeZone(secondsFromGMT: 0)!`. No bucket-key
+   math changed. **`CoreLog.swift`** replaces 16 `NSLog` sites and passes the
+   message as an argument, not a format string.
+
+Test baseline is now **384 Python** (7 files: autoresume 63, plan_fit 88,
+remote_sync 54, usage_collector 26, deploy_remote 48, platform_compat 31,
+contracts 74) plus **34 Swift**. Earlier numbers in this file ("79 Python
+tests", "63 total", "86 green") are per-file counts, not repo-wide.
+
+**Deploy status: NOTHING redeployed this session.** The daemon changed
+substantially — run `claude-autoresume/install.sh`. The widget changed —
+run `ClaudeUsageOverlay/build_and_run.command`. Until both run, the live
+daemon and widget are the pre-session builds.
+
+## Budget projection basis: calendar days vs. weekdays (2026-08-06)
+
+The API-mode budget bars already carried a projection dot (weekly AND
+monthly — `budgetRow` passes `budgetProjectedPct` for both), but the
+elapsed fraction it extrapolates on was always wall-clock calendar time.
+For a weekday-only workload that reads low all week and sags further every
+weekend: the numerator keeps the weekday spend, the denominator keeps
+adding days that were never going to carry any.
+
+New config key `budget.projection_basis` = `"calendar"` (default, exactly
+the old behavior) | `"weekdays"`, applying to BOTH windows:
+
+- `plan_fit.py`: `_budget_tz_helpers` factored out of
+  `_budget_period_bounds` (period bounds and weekday-ness must be judged in
+  the same timezone — the DST-safe per-date localization is unchanged, just
+  moved); `_weekday_seconds(start, end, tzname)` intersects the interval
+  with Mon–Fri calendar dates; `_budget_window` picks the elapsed/total pair
+  off the basis and echoes `projection_basis` into the window (contract C2 —
+  a NEW required field in `budgetWindow`; older files lacking it read as
+  "calendar", which is what they were computed with). Weekend spend still
+  counts toward `spent_usd` — only the extrapolation changes.
+  `BUDGET_PROJECTION_MIN_ELAPSED_SECONDS` is measured in whichever clock is
+  in use, so a month opening on a Saturday (Aug 2026) reports no projection
+  until an hour into Monday rather than dividing by a near-zero denominator.
+- `autoresume_config.py`: `VALID_PROJECTION_BASES` (duplicated from
+  plan_fit's tuple on purpose — same standalone-deploy rule as
+  `VALID_PLANS`); anything else degrades to "calendar".
+  `_plan_fit_config_inputs` in autoresume.py includes the key, so changing
+  it rewrites plan_fit.json within one poll instead of at the hourly cadence.
+- Widget: `AppConfig.projectionBasis` + a "Project spend over" picker in
+  Settings → Account & Budget (Every day / Weekdays only), written through
+  the same per-field touched/untouched resolution as the other budget
+  fields. `BudgetWindow.projectionBasis` feeds a new `.help()` on each
+  budget bar saying which clock produced the dot — the setting isn't
+  visible on the 280pt row, and the dot's position is meaningless without it.
+
+Tests: `BudgetProjectionBasisTests` in test_plan_fit.py (6, incl. the
+weekend-freeze and the Saturday-open suppression cases) + basis validation
+in test_autoresume.py and the config schema in test_contracts.py. Baseline
+is now **393 Python** (autoresume 65, plan_fit 94, remote_sync 54,
+usage_collector 26, deploy_remote 48, platform_compat 31, contracts 75)
+plus **34 Swift**; `swift build -c release` and the API-boundary check are
+clean.
+
+**Deploy status: still NOTHING redeployed** — this session's changes stack
+on top of the undeployed Windows-port-foundation session. Both
+`claude-autoresume/install.sh` and
+`ClaudeUsageOverlay/build_and_run.command` are needed, and the option only
+does anything on an `account.type == "api"` config (this Mac's is `max`).
 
 ## Open threads / things a future session might reasonably pick up
 

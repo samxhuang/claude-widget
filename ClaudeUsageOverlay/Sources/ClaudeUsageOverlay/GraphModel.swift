@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 
 /// Which top-level content the panel shows below the header.
 enum PanelTab: String {
@@ -93,36 +92,56 @@ struct CostBucket: Identifiable {
 /// plan_fit.json's `cost_series`, and republishes downsampled per-period
 /// series for GraphView. Purely a reader — same spirit as PlanFitModel /
 /// SessionsModel, this widget never writes any of these files.
-final class GraphModel: ObservableObject {
+final class GraphModel: Observable {
     private static let tabDefaultsKey = "panelTab"
     private static let periodDefaultsKey = "graphPeriod"
 
-    @Published var selectedTab: PanelTab {
+    /// The single UTC zone every bucket-key calendar/formatter below uses.
+    ///
+    /// Windows-port seam (docs/swift-windows-audit.md §1.4). These sites used
+    /// to read `TimeZone(identifier: "UTC") ?? .current`, and the *fallback*
+    /// was the landmine: `TimeZone.current` silently substitutes local time
+    /// into UTC-keyed bucket math, so every daily/hourly key would shift by
+    /// the local offset and the widget would look up `"2026-07-25"` for what
+    /// the daemon wrote as `"2026-07-26"` — a $0 or off-by-one-day cost chart
+    /// with no error anywhere. `TimeZone.current` is also actively buggy off
+    /// Darwin (returns GMT on non-English Windows installs; concurrent use
+    /// with `Calendar.current` corrupts the heap on Windows 11), and
+    /// `refresh()` does parse work on a global queue while the main thread
+    /// formats.
+    ///
+    /// The force-unwrap is safe unconditionally: `TimeZone(secondsFromGMT:)`
+    /// constructs its zone arithmetically, with no tz-database or ICU lookup
+    /// to fail, and an offset of 0 is always in range. That is the point of
+    /// using it rather than an identifier lookup with a fallback.
+    private static let utc = TimeZone(secondsFromGMT: 0)!
+
+    @Observed var selectedTab: PanelTab {
         didSet { UserDefaults.standard.set(selectedTab.rawValue, forKey: Self.tabDefaultsKey) }
     }
-    @Published var period: GraphPeriod {
+    @Observed var period: GraphPeriod {
         didSet {
             UserDefaults.standard.set(period.rawValue, forKey: Self.periodDefaultsKey)
             recompute()
         }
     }
 
-    @Published var utilBuckets: [UtilBucket] = []
-    @Published var costBuckets: [CostBucket] = []
-    @Published var periodStart: Date = Date()
-    @Published var periodEnd: Date = Date()
-    @Published var latestFiveHour: Double?
-    @Published var latestSevenDay: Double?
+    @Observed var utilBuckets: [UtilBucket] = []
+    @Observed var costBuckets: [CostBucket] = []
+    @Observed var periodStart: Date = Date()
+    @Observed var periodEnd: Date = Date()
+    @Observed var latestFiveHour: Double?
+    @Observed var latestSevenDay: Double?
     /// Muted "collecting since Jul 18" note shown when the earliest known
     /// data point covers less than half the selected period.
-    @Published var coverageNote: String?
+    @Observed var coverageNote: String?
     /// Header readout for the cost chart: the summed API-equivalent cost of
     /// the buckets actually plotted ("measured"), plus a linear full-period
     /// estimate when the cost data doesn't span the whole selected period
     /// (collection only started 2026-07-18, so the wider periods are partial
     /// for a while). e.g. "$18.42" (full coverage) or "$18.42 · est $210"
     /// (partial). nil when there's no cost data at all in the period.
-    @Published var costSummary: String?
+    @Observed var costSummary: String?
 
     private let usageDir: URL
     private var lastToggleAt: Date = .distantPast
@@ -145,13 +164,14 @@ final class GraphModel: ObservableObject {
         var sevenMax: Double?
     }
 
-    init() {
+    override init() {
         self.selectedTab = UserDefaults.standard.string(forKey: Self.tabDefaultsKey).flatMap(PanelTab.init) ?? .main
         self.period = UserDefaults.standard.string(forKey: Self.periodDefaultsKey).flatMap(GraphPeriod.init) ?? .day
 
         self.usageDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-autoresume")
             .appendingPathComponent("usage")
+        super.init()
     }
 
     /// Debounced the same way Sessions/Chats/PlanFit's toggles are — a click
@@ -234,7 +254,7 @@ final class GraphModel: ObservableObject {
             // would read $0.
             let fmt = Self.utcDailyKeyFormatter()
             var cal = Calendar(identifier: .gregorian)
-            cal.timeZone = TimeZone(identifier: "UTC") ?? .current
+            cal.timeZone = Self.utc
             let firstKey = fmt.string(from: cal.startOfDay(for: start))
             measuredCost = dailyCost.filter { $0.key >= firstKey }.values.reduce(0, +)
         } else {
@@ -245,7 +265,7 @@ final class GraphModel: ObservableObject {
             // Counting the boundary hour whole is the deliberate parallel of
             // the 3mo boundary-day-counted-whole semantics above.
             var cal = Calendar(identifier: .gregorian)
-            cal.timeZone = TimeZone(identifier: "UTC") ?? .current
+            cal.timeZone = Self.utc
             let comps = cal.dateComponents([.year, .month, .day, .hour], from: start)
             let hourFloor = cal.date(from: comps) ?? start
             measuredCost = hourlyCost
@@ -324,9 +344,9 @@ final class GraphModel: ObservableObject {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC") ?? .current
+        cal.timeZone = Self.utc
         f.calendar = cal
-        f.timeZone = TimeZone(identifier: "UTC")
+        f.timeZone = Self.utc
         f.dateFormat = "yyyy-MM-dd"
         return f
     }
@@ -512,7 +532,7 @@ final class GraphModel: ObservableObject {
         let stepHours = max(1, Int(ceil(Double(totalHours) / 300.0)))
 
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC") ?? .current
+        cal.timeZone = Self.utc
         let comps = cal.dateComponents([.year, .month, .day, .hour], from: start)
         var t = cal.date(from: comps) ?? start
 
@@ -540,7 +560,7 @@ final class GraphModel: ObservableObject {
     private static func dailyCostBuckets(start: Date, end: Date, daily: [String: Double]) -> [CostBucket] {
         guard end > start else { return [] }
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC") ?? .current
+        cal.timeZone = Self.utc
         // R2-6: same daemon-key formatter as the 3mo sum/dailyKeyDate — a
         // bare formatter's keys wouldn't match daily[...] under a
         // non-Gregorian system calendar and every bar would read $0.

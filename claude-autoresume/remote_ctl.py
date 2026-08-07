@@ -10,8 +10,13 @@ call and a remote poll cycle can never interleave and lose an update.
 Deliberately standalone: it does NOT import autoresume.py. The daemon runs
 under the system python3 via systemd/nohup with no pip deps, and this script
 must run in that same bare-stdlib environment on Linux and macOS, python3>=3.9.
-It reimplements the flock + atomic tmp+rename write on purpose rather than
-sharing code, so the deployed payload stays a flat set of files.
+It reimplements the state/config read-modify-write logic on purpose rather than
+sharing autoresume.py's, so the deployed payload stays a flat set of files.
+
+The one exception is `platform_compat` (also stdlib-only, also in the deploy
+payload): the file-lock and atomic-replace PRIMITIVES must be bit-identical to
+the daemon's or the cross-process locking protocol is broken by construction,
+so they come from the shared OS seam rather than being re-typed here.
 
 Commands (stdout is machine-readable JSON, one object, on success):
   dump            -> {"v":1,"now":<epoch float>,"state":{...},
@@ -44,12 +49,13 @@ applies to nothing (0). Only keys present in each incoming entry are touched;
 entries are never created and no other fields are modified.
 """
 
-import fcntl
 import json
 import os
 import sys
 import time
 from pathlib import Path
+
+import platform_compat  # The ONE OS seam: FileLock + replace_with_retry
 
 # Keys the Mac is allowed to push back into the remote state. Everything else
 # in state.json is remote-daemon-owned and must be left untouched.
@@ -69,7 +75,10 @@ def state_dir() -> Path:
     override = os.environ.get("AUTORESUME_STATE_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".claude-autoresume"
+    # NOTE: the daemon deliberately does NOT honor AUTORESUME_STATE_DIR (its
+    # STATE_DIR is platform_compat.state_dir() flat), so the override lives
+    # here and only here. Keep that asymmetry.
+    return platform_compat.state_dir()
 
 
 def state_file() -> Path:
@@ -94,17 +103,17 @@ def config_lock_file() -> Path:
 
 class StateLock:
     """Exclusive lock shared with the remote daemon's StateLock — same path,
-    same semantics — so reads/writes here serialize against poll cycles."""
+    same primitive (platform_compat.FileLock), same semantics — so reads/writes
+    here serialize against poll cycles."""
 
     def __enter__(self):
         state_dir().mkdir(parents=True, exist_ok=True)
-        self._fh = open(lock_file(), "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        self._lock = platform_compat.FileLock(lock_file())
+        self._lock.__enter__()
         return self
 
     def __exit__(self, *exc):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        self._lock.__exit__(*exc)
 
 
 def load_state() -> dict:
@@ -127,23 +136,22 @@ def save_state(state: dict) -> None:
     d.mkdir(parents=True, exist_ok=True)
     tmp = state_file().with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(state_file())
+    platform_compat.replace_with_retry(tmp, state_file())
 
 
 class ConfigLock:
-    """Exclusive flock on config.json.lock — the same lock discipline the
+    """Exclusive lock on config.json.lock — the same lock discipline the
     Mac's widget uses around its config.json writes, so an apply-config here
     can never interleave with any other config writer on this host."""
 
     def __enter__(self):
         state_dir().mkdir(parents=True, exist_ok=True)
-        self._fh = open(config_lock_file(), "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        self._lock = platform_compat.FileLock(config_lock_file())
+        self._lock.__enter__()
         return self
 
     def __exit__(self, *exc):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        self._lock.__exit__(*exc)
 
 
 def _load_raw_config() -> dict:
@@ -282,7 +290,7 @@ def cmd_apply_config() -> int:
         d.mkdir(parents=True, exist_ok=True)
         tmp = config_file().with_suffix(".json.tmp")
         tmp.write_text(json.dumps(config, indent=2))
-        tmp.replace(config_file())
+        platform_compat.replace_with_retry(tmp, config_file())
 
     json.dump({"ok": True}, sys.stdout)
     sys.stdout.write("\n")

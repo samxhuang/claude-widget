@@ -69,6 +69,7 @@ from pathlib import Path
 
 import autoresume          # StateLock / load_state / save_state / log / STATE_DIR
 import autoresume_config   # load_config / config_mtime
+import platform_compat     # replace_with_retry (the OS seam)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -531,7 +532,11 @@ def fetch_host_usage(host, state_dir, transport):
         out_path = out_dir / f"{host['name']}_tokens_hourly.json"
         tmp = out_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(tokens, indent=2))
-        tmp.replace(out_path)
+        # Routed through the OS seam like every other atomic write in the
+        # daemon: on Windows a concurrent reader (or Defender) makes the
+        # replace fail intermittently with ERROR_SHARING_VIOLATION, which a
+        # bare os.replace surfaces as a spurious write failure.
+        platform_compat.replace_with_retry(tmp, out_path)
     except OSError as e:
         autoresume.log(f"remote-sync: {host['name']} usage write failed: {e!r}")
         return False

@@ -10,7 +10,10 @@ import Foundation
 /// Threading: all completions fire on the main queue (WebSession already
 /// guarantees this for the JS bridge; the mapping here stays on that hop).
 public final class ClaudeAPIClient {
-    private let session: ClaudeWebSession
+    /// The script transport (§1.10). Held as the protocol, not the concrete
+    /// WKWebView session, so this client can be exercised without a live
+    /// webview — see `ClaudeScriptRunner` in Transport.swift.
+    private let session: ClaudeScriptRunner
 
     /// Validator/debug hook: when set, each successful call also hands over
     /// the raw decoded response (label, JSON object) BEFORE normalization.
@@ -19,8 +22,17 @@ public final class ClaudeAPIClient {
     /// dir. Never wire this up in the normal app path.
     public var debugRawHandler: ((String, Any) -> Void)?
 
-    public init() {
-        self.session = ClaudeWebSession()
+    /// The normal app path: the shared hidden authenticated WKWebView.
+    /// (Kept as a distinct initializer rather than a defaulted argument so
+    /// the WebKit-backed transport stays internal to this module.)
+    public convenience init() {
+        self.init(session: ClaudeWebSession())
+    }
+
+    /// Injects a transport — tests (a fake runner returning canned JSON) and
+    /// any future non-WebKit host. No existing call site needs to change.
+    public init(session: ClaudeScriptRunner) {
+        self.session = session
     }
 
     // MARK: - Public calls
@@ -46,7 +58,7 @@ public final class ClaudeAPIClient {
             case .failure(let err):
                 completion(.failure(err))
             case .success(let dict):
-                guard let usage = dict["usage"] as? [String: Any] else {
+                guard let usage = jsonObject(dict["usage"]) else {
                     completion(.failure(.unexpectedShape(endpoint: "usage", detail: "usage_missing_payload")))
                     return
                 }
@@ -96,17 +108,17 @@ public final class ClaudeAPIClient {
             case .failure(let err):
                 completion(.failure(err))
             case .success(let dict):
-                guard let chats = dict["chats"] as? [[String: Any]] else {
+                guard let chats = jsonObjectArray(dict["chats"]) else {
                     completion(.failure(.unexpectedShape(endpoint: "chats", detail: "chats_missing_payload")))
                     return
                 }
                 if let raw = dict["raw"] { self?.debugRawHandler?("chat_conversations", raw) }
                 let parsed = chats.compactMap { item -> ChatConversation? in
-                    guard let id = item["uuid"] as? String, !id.isEmpty else { return nil }
+                    guard let id = jsonString(item["uuid"]), !id.isEmpty else { return nil }
                     return ChatConversation(
                         id: id,
-                        title: item["name"] as? String ?? "",
-                        updatedAt: Self.parseISODate(item["updated_at"] as? String)
+                        title: jsonString(item["name"]) ?? "",
+                        updatedAt: Self.parseISODate(jsonString(item["updated_at"]))
                     )
                 }
                 completion(.success(parsed))
@@ -161,20 +173,20 @@ public final class ClaudeAPIClient {
             case .failure(let err):
                 completion(.failure(err))
             case .success(let dict):
-                guard let raw = dict["cloudSessions"] as? [[String: Any]] else {
+                guard let raw = jsonObjectArray(dict["cloudSessions"]) else {
                     completion(.failure(.unexpectedShape(endpoint: "recents", detail: "recents_missing_payload")))
                     return
                 }
                 if let rawList = dict["raw"] { self?.debugRawHandler?("recents", rawList) }
                 let records = raw.compactMap { item -> CloudSessionRecord? in
-                    guard let id = item["id"] as? String, !id.isEmpty else { return nil }
-                    let statusRaw = item["status"] as? String
-                    let workerStatusRaw = item["worker_status"] as? String
+                    guard let id = jsonString(item["id"]), !id.isEmpty else { return nil }
+                    let statusRaw = jsonString(item["status"])
+                    let workerStatusRaw = jsonString(item["worker_status"])
                     return CloudSessionRecord(
                         id: id,
-                        title: item["title"] as? String ?? "",
-                        updatedAt: Self.parseISODate(item["updated_at"] as? String),
-                        createdAt: Self.parseISODate(item["created_at"] as? String),
+                        title: jsonString(item["title"]) ?? "",
+                        updatedAt: Self.parseISODate(jsonString(item["updated_at"])),
+                        createdAt: Self.parseISODate(jsonString(item["created_at"])),
                         isArchived: statusRaw?.trimmingCharacters(in: .whitespaces).lowercased() == "archived",
                         workState: Self.mapWorkState(status: statusRaw, workerStatus: workerStatusRaw),
                         statusRaw: statusRaw,
@@ -232,24 +244,29 @@ public final class ClaudeAPIClient {
     private static func envelope(result: Result<Any, Error>, endpoint: String) -> Result<[String: Any], ClaudeAPIError> {
         switch result {
         case .failure(let error):
-            if case ClaudeWebSessionError.backlogFull = error {
+            // Transport-neutral (§1.10): any runner can signal a full
+            // backlog, not just the WKWebView one.
+            if case ClaudeTransportError.backlogFull = error {
                 return .failure(.backlogFull)
             }
             return .failure(.transport(error.localizedDescription))
         case .success(let value):
-            guard let dict = value as? [String: Any] else {
+            guard let dict = jsonObject(value) else {
                 return .failure(.unexpectedShape(endpoint: endpoint, detail: "\(endpoint)_not_a_dict"))
             }
-            if let loggedOut = dict["loggedOut"] as? Bool, loggedOut {
+            // jsonBool, not `as? Bool`: this gates EVERY response, and the
+            // cast only works on Darwin (audit §1.3). Semantics unchanged —
+            // a missing key or a non-boolean still yields nil.
+            if let loggedOut = jsonBool(dict["loggedOut"]), loggedOut {
                 return .failure(.loggedOut)
             }
-            if let err = dict["error"] as? String {
+            if let err = jsonString(dict["error"]) {
                 if let (name, status) = parseHTTPErrorCode(err) {
                     return .failure(.http(endpoint: name, status: status))
                 }
                 return .failure(.unexpectedShape(endpoint: endpoint, detail: err))
             }
-            guard let ok = dict["ok"] as? Bool, ok else {
+            guard let ok = jsonBool(dict["ok"]), ok else {
                 return .failure(.unexpectedShape(endpoint: endpoint, detail: "\(endpoint)_bad_envelope"))
             }
             return .success(dict)
@@ -265,18 +282,20 @@ public final class ClaudeAPIClient {
 
     private static func decodeUsage(_ usage: [String: Any]) -> UsageReport {
         func window(_ dict: [String: Any]?) -> UsageWindow {
-            let utilization = dict?["utilization"] as? NSNumber
-            let resetsRaw = dict?["resets_at"] as? String
+            let utilizationRaw = dict?["utilization"]
+            let resetsRaw = jsonString(dict?["resets_at"])
             return UsageWindow(
-                percent: utilization?.intValue,
+                percent: jsonInt(utilizationRaw),
                 resetsAt: parseISODate(resetsRaw),
-                utilizationRaw: utilization,
+                // Stays an NSNumber: SnapshotLogger writes it verbatim into
+                // the widget's frozen snapshots.jsonl format.
+                utilizationRaw: jsonNumber(utilizationRaw),
                 resetsAtRaw: resetsRaw
             )
         }
         return UsageReport(
-            session: window(usage["five_hour"] as? [String: Any]),
-            weekly: window(usage["seven_day"] as? [String: Any]),
+            session: window(jsonObject(usage["five_hour"])),
+            weekly: window(jsonObject(usage["seven_day"])),
             scopedLimits: decodeScopedLimits(usage["limits"]),
             spendLimit: decodeSpendLimit(usage["spend"], usage["extra_usage"]),
             rawJSON: usage
@@ -295,15 +314,15 @@ public final class ClaudeAPIClient {
     /// omelette_promotional, …) are volatile internal codenames and ignored.
     /// See CONTRACT.md and Models.SpendLimit.
     private static func decodeSpendLimit(_ spendRaw: Any?, _ extraRaw: Any?) -> SpendLimit? {
-        let spend = spendRaw as? [String: Any]
-        let extra = extraRaw as? [String: Any]
+        let spend = jsonObject(spendRaw)
+        let extra = jsonObject(extraRaw)
 
         func money(_ dict: [String: Any]?, _ key: String) -> (minor: Int, exp: Int, cur: String)? {
-            guard let m = dict?[key] as? [String: Any],
-                  let minor = (m["amount_minor"] as? NSNumber)?.intValue else { return nil }
+            guard let m = jsonObject(dict?[key]),
+                  let minor = jsonInt(m["amount_minor"]) else { return nil }
             return (minor,
-                    (m["exponent"] as? NSNumber)?.intValue ?? 2,
-                    (m["currency"] as? String) ?? "USD")
+                    jsonInt(m["exponent"]) ?? 2,
+                    jsonString(m["currency"]) ?? "USD")
         }
 
         if let used = money(spend, "used"), let limit = money(spend, "limit") {
@@ -312,23 +331,23 @@ public final class ClaudeAPIClient {
                 limitMinor: limit.minor,
                 exponent: limit.exp,
                 currency: limit.cur,
-                utilizationPercent: (extra?["utilization"] as? NSNumber)?.doubleValue,
-                enabled: (spend?["enabled"] as? Bool) ?? true,
-                severity: spend?["severity"] as? String
+                utilizationPercent: jsonDouble(extra?["utilization"]),
+                enabled: jsonBool(spend?["enabled"]) ?? true,
+                severity: jsonString(spend?["severity"])
             )
         }
 
         // Fallback: the flat extra_usage shape (same numbers).
         if let extra,
-           let usedC = (extra["used_credits"] as? NSNumber)?.intValue,
-           let monthly = (extra["monthly_limit"] as? NSNumber)?.intValue {
+           let usedC = jsonInt(extra["used_credits"]),
+           let monthly = jsonInt(extra["monthly_limit"]) {
             return SpendLimit(
                 spentMinor: usedC,
                 limitMinor: monthly,
-                exponent: (extra["decimal_places"] as? NSNumber)?.intValue ?? 2,
-                currency: (extra["currency"] as? String) ?? "USD",
-                utilizationPercent: (extra["utilization"] as? NSNumber)?.doubleValue,
-                enabled: (extra["is_enabled"] as? Bool) ?? true,
+                exponent: jsonInt(extra["decimal_places"]) ?? 2,
+                currency: jsonString(extra["currency"]) ?? "USD",
+                utilizationPercent: jsonDouble(extra["utilization"]),
+                enabled: jsonBool(extra["is_enabled"]) ?? true,
                 severity: nil
             )
         }
@@ -345,20 +364,20 @@ public final class ClaudeAPIClient {
     /// scope are dropped (not our concern here); a completely absent/oddly
     /// shaped array yields an empty list, never a crash.
     private static func decodeScopedLimits(_ raw: Any?) -> [ScopedLimit] {
-        guard let items = raw as? [[String: Any]] else { return [] }
+        guard let items = jsonObjectArray(raw) else { return [] }
         return items.compactMap { item -> ScopedLimit? in
-            guard let scope = item["scope"] as? [String: Any],
-                  let model = scope["model"] as? [String: Any] else { return nil }
-            let display = (model["display_name"] as? String)?.trimmingCharacters(in: .whitespaces)
+            guard let scope = jsonObject(item["scope"]),
+                  let model = jsonObject(scope["model"]) else { return nil }
+            let display = jsonString(model["display_name"])?.trimmingCharacters(in: .whitespaces)
             guard let display, !display.isEmpty else { return nil }
-            let resetsRaw = item["resets_at"] as? String
+            let resetsRaw = jsonString(item["resets_at"])
             return ScopedLimit(
                 modelDisplayName: display,
-                modelID: model["id"] as? String,
+                modelID: jsonString(model["id"]),
                 resetsAt: parseISODate(resetsRaw),
-                percent: (item["percent"] as? NSNumber)?.intValue,
-                severity: item["severity"] as? String,
-                isActive: (item["is_active"] as? Bool) ?? false,
+                percent: jsonInt(item["percent"]),
+                severity: jsonString(item["severity"]),
+                isActive: jsonBool(item["is_active"]) ?? false,
                 resetsAtRaw: resetsRaw
             )
         }

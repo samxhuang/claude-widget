@@ -88,7 +88,7 @@ final class ScopedLimitLogger {
         } catch {
             // Best-effort: on failure leave any previous scoped_limits.json in
             // place (a stale-but-valid reset is better than none).
-            NSLog("ScopedLimitLogger write failed: \(error.localizedDescription)")
+            CoreLog.error("ScopedLimitLogger write failed: \(error.localizedDescription)")
         }
     }
 }

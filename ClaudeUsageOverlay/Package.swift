@@ -22,6 +22,21 @@ let package = Package(
             name: "ClaudeUsageOverlay",
             dependencies: ["ClaudeAPI"],
             path: "Sources/ClaudeUsageOverlay"
+        ),
+        // Unit tests for the ClaudeAPI module. ClaudeAPIClient became
+        // testable when its transport was abstracted behind
+        // ClaudeScriptRunner (audit §1.10) — these drive every decode and
+        // error path through a fake runner returning canned JSON, with no
+        // webview and no network. The app target has no test target: it is
+        // AppKit/SwiftUI and out of scope here.
+        //
+        // Run them with ./run_tests.command — these use swift-testing, and a
+        // bare `swift test` only works if full Xcode is installed (see that
+        // script's header for the Command-Line-Tools workaround).
+        .testTarget(
+            name: "ClaudeAPITests",
+            dependencies: ["ClaudeAPI"],
+            path: "Tests/ClaudeAPITests"
         )
     ]
 )

@@ -13,7 +13,7 @@ import json
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -309,26 +309,60 @@ class TierRescalingTests(TempStateDirTestCase):
         self.assertAlmostEqual(observed["five_hour"]["peak_pct"], 50.0, places=1)
         self.assertAlmostEqual(observed["five_hour"]["avg_pct"], 50.0, places=1)
 
-    def test_daily_peaks_merge_raw_and_bucket_by_utc_day(self):
+    def test_segments_cover_raw_pairs_and_bucket_spans(self):
+        # Raw samples 2 min apart -> one segment spanning the pair (120s);
+        # the trailing sample gets a nominal 120s of its own. An hourly
+        # bucket contributes its span, capped by n * nominal sample width.
         raw = [
             {"ts": "2026-07-18T10:00:00+00:00", "five_hour": {"utilization": 50}, "seven_day": {"utilization": 10}},
-            {"ts": "2026-07-18T14:00:00+00:00", "five_hour": {"utilization": 70}, "seven_day": {"utilization": 12}},
+            {"ts": "2026-07-18T10:02:00+00:00", "five_hour": {"utilization": 70}, "seven_day": {"utilization": 12}},
         ]
         buckets = [
-            {"ts_start": "2026-07-10T03:00:00+00:00", "n": 5,
-             "five_hour": {"min": 0, "max": 30, "avg": 15, "last": 20},
+            {"ts_start": "2026-07-10T03:00:00+00:00", "n": 30,
+             "five_hour": {"min": 10, "max": 30, "avg": 15, "last": 20},
              "seven_day": {"min": 0, "max": 8, "avg": 4, "last": 5}},
-            {"ts_start": "2026-07-10T09:00:00+00:00", "n": 5,
+            {"ts_start": "2026-07-10T09:00:00+00:00", "n": 5,   # sparse hour
              "five_hour": {"min": 0, "max": 45, "avg": 20, "last": 25},
              "seven_day": {"min": 0, "max": 6, "avg": 3, "last": 4}},
         ]
-        points = plan_fit._merge_utilization_points(raw, [], buckets)
-        peaks = plan_fit._daily_peaks(points)
-        from datetime import date
-        self.assertAlmostEqual(peaks["five_hour"][date(2026, 7, 18)], 70.0)
-        self.assertAlmostEqual(peaks["five_hour"][date(2026, 7, 10)], 45.0)
-        self.assertAlmostEqual(peaks["seven_day"][date(2026, 7, 18)], 12.0)
-        self.assertAlmostEqual(peaks["seven_day"][date(2026, 7, 10)], 8.0)
+        segs = plan_fit._utilization_segments(
+            plan_fit._merge_utilization_points(raw, [], buckets))
+        by_start = {s["start"].isoformat(): s for s in segs}
+        pair = by_start["2026-07-18T10:00:00+00:00"]
+        self.assertEqual(pair["seconds"], 120.0)
+        self.assertEqual(pair["ranges"]["five_hour"], (50.0, 70.0))
+        # Both dimensions ride on the SAME segment — that's what makes the
+        # "either cap" union measurable instead of a double-count.
+        self.assertEqual(pair["ranges"]["seven_day"], (10.0, 12.0))
+        # Trailing raw sample: nominal coverage, flat value.
+        tail = by_start["2026-07-18T10:02:00+00:00"]
+        self.assertEqual(tail["seconds"], float(plan_fit.LOCKOUT_SAMPLE_NOMINAL_SECONDS))
+        self.assertEqual(tail["ranges"]["five_hour"], (70.0, 70.0))
+        full_hour = by_start["2026-07-10T03:00:00+00:00"]
+        self.assertEqual(full_hour["seconds"], 3600.0)
+        self.assertEqual(full_hour["ranges"]["five_hour"], (10.0, 30.0))
+        sparse_hour = by_start["2026-07-10T09:00:00+00:00"]
+        self.assertEqual(sparse_hour["seconds"], 600.0, "5 samples -> 10 min of coverage, not an hour")
+
+    def test_segments_exclude_collection_gaps(self):
+        # A 6-hour hole (widget/Mac off) is neither observed time nor lockout
+        # time: the sample before it only carries its nominal width.
+        raw = [
+            {"ts": "2026-07-18T10:00:00+00:00", "five_hour": {"utilization": 50}},
+            {"ts": "2026-07-18T16:00:00+00:00", "five_hour": {"utilization": 50}},
+        ]
+        segs = plan_fit._utilization_segments(
+            plan_fit._merge_utilization_points(raw, [], []))
+        self.assertEqual(sum(s["seconds"] for s in segs),
+                         2 * plan_fit.LOCKOUT_SAMPLE_NOMINAL_SECONDS)
+
+    def test_above_cap_fraction_interpolates_the_crossing(self):
+        f = plan_fit._above_cap_fraction
+        self.assertEqual(f(120.0, 180.0), 1.0)
+        self.assertEqual(f(10.0, 90.0), 0.0)
+        self.assertAlmostEqual(f(80.0, 120.0), 0.5)   # crossing at the midpoint
+        self.assertAlmostEqual(f(0.0, 400.0), 0.75)
+        self.assertEqual(f(100.0, 100.0), 1.0)
 
     def test_no_snapshots_gives_null_utilization_and_warning(self):
         _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
@@ -341,125 +375,278 @@ class TierRescalingTests(TempStateDirTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Throttle-tolerance verdict (cap-days/month, not all-time peak)
+# Lockout verdict (time unable to work, not cap-days touched)
 # ---------------------------------------------------------------------------
 
-class ThrottleVerdictTests(TempStateDirTestCase):
-    """Viability is cap-day frequency within tolerance (5h: <=1/month, 7d:
-    0/month), so one outlier day can no longer permanently veto a cheaper
-    tier — but frequent throttling still does."""
+class LockoutVerdictTests(TempStateDirTestCase):
+    """Viability is projected LOCKOUT TIME within tolerance (5h: <=5h/month,
+    7d: <=2h/month). Hitting a cap late in its window costs only the time
+    left until that window resets — the old metric charged the whole UTC day
+    (and every later day of the same week), which is what made a single
+    late-week overrun read as "capped ~30 d/mo"."""
 
-    def _write_days(self, day_rows):
-        """day_rows: list of (iso_day, max_5h_pct, max_7d_pct) — one hourly
-        bucket per day, observed against max_20x (the default plan)."""
+    def _write_hours(self, start: datetime, series: list):
+        """series: list of (five_hour_pct, seven_day_pct), one FLAT hourly
+        bucket per entry starting at `start` (min == max, so each hour is
+        unambiguously either wholly capped or wholly clear). Observed against
+        max_20x unless the test overrides config."""
         rows = [{
-            "ts_start": f"{day}T12:00:00+00:00", "n": 30,
-            "five_hour": {"min": 0, "max": p5, "avg": p5 / 2, "last": p5},
-            "seven_day": {"min": 0, "max": p7, "avg": p7 / 2, "last": p7},
-        } for day, p5, p7 in day_rows]
+            "ts_start": (start + timedelta(hours=i)).isoformat(), "n": 30,
+            "five_hour": {"min": p5, "max": p5, "avg": p5, "last": p5},
+            "seven_day": {"min": p7, "max": p7, "avg": p7, "last": p7},
+        } for i, (p5, p7) in enumerate(series)]
         _write_jsonl(self.usage_dir / "snapshots_1h.jsonl", rows)
         _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
 
-    @staticmethod
-    def _june_days(n=30):
-        return [f"2026-06-{d:02d}" for d in range(1, n + 1)]
+    NOW = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    WEEK_START = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc)
 
-    def test_single_outlier_day_no_longer_vetoes_cheaper_tier(self):
-        # 29 quiet days (2% of Max 20x -> 40% of Pro) + 1 monster day
-        # (30% -> 600% of Pro): exactly 1 projected cap-day in 30 observed
-        # days = 1.0/month, within the 5h tolerance -> Pro is viable even
-        # though its all-time projected peak is 600%.
-        days = self._june_days()
-        self._write_days([(d, 30 if i == 0 else 2, 1) for i, d in enumerate(days)])
-        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+    def test_weekly_cap_hit_late_charges_only_the_time_left_in_the_window(self):
+        # The headline case. One 7-day window (168 observed hours): weekly
+        # utilization sits at 4% of Max 20x (= 80% of Pro) until the last 12
+        # hours, when it reaches 6% (= 120% of Pro). Pro would have been
+        # locked out for those 12 hours and no longer — not for the day, and
+        # not for the week.
+        week = [(1, 4)] * 156 + [(1, 6)] * 12
+        self._write_hours(self.WEEK_START, week)
+        result = plan_fit.compute(self.state_dir, self.NOW)
+
+        pro7d = result["throttle_projection"]["pro"]["seven_day"]
+        self.assertAlmostEqual(pro7d["hours_observed"], 168.0)
+        self.assertAlmostEqual(pro7d["capped_hours"], 12.0)
+        self.assertLess(pro7d["capped_hours"], 24.0, "a partial day is not a whole day")
+        self.assertEqual(pro7d["cap_episodes"], 1)
+        self.assertAlmostEqual(pro7d["median_episode_hours"], 12.0)
+        self.assertAlmostEqual(pro7d["longest_episode_hours"], 12.0)
+        # 12h of every 168h observed -> 51.4h per 30-day month (2.1 days'
+        # worth), not the 7 days the old day-counting metric charged.
+        self.assertAlmostEqual(pro7d["capped_hours_per_month"], 51.43, places=1)
+        self.assertAlmostEqual(pro7d["capped_days_per_month"], 2.14, places=1)
+        self.assertEqual(pro7d["days_with_cap"], 1)
+        self.assertAlmostEqual(pro7d["median_throttle_peak_pct"], 120.0)
 
         pro = result["verdict"]["plans"]["pro"]
-        self.assertTrue(pro["viable"])
-        self.assertAlmostEqual(pro["throttle_days_5h_per_month"], 1.0)
-        self.assertAlmostEqual(pro["median_throttle_peak_5h_pct"], 600.0)
-        self.assertEqual(pro["price_delta_vs_current_usd"], -180)
-        # The peak is still reported as context and still exceeds 100%.
-        self.assertGreater(result["tier_projection"]["pro"]["peak_five_hour_pct"], 100)
-        rec = result["verdict"]["recommendation"]
-        self.assertIn("Pro fits", rec)
-        self.assertIn("save $180/mo", rec)
+        self.assertAlmostEqual(pro["capped_hours_7d_per_month"], 51.43, places=1)
+        self.assertFalse(pro["viable"], "51h/mo locked out is far over the 2h/mo 7d tolerance")
+        self.assertIn("locked out", result["verdict"]["recommendation"])
 
-    def test_frequent_cap_days_still_disqualify(self):
-        # 10 of 30 days at 30% of Max 20x: Pro projects 600% (cap-day) and
-        # Max 5x projects 120% (cap-day) on each -> 10/month >> tolerance.
-        days = self._june_days()
-        self._write_days([(d, 30 if i < 10 else 2, 1) for i, d in enumerate(days)])
-        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+    def test_brief_five_hour_lockout_stays_within_tolerance(self):
+        # 30 days of observation with a single 2-hour 5h-window overrun
+        # (30% of Max 20x -> 120% of Max 5x): 2h per 720h observed = 2h/month,
+        # inside the 5h tolerance, so Max 5x stays viable.
+        month = [(6, 1)] * 720
+        month[300] = (30, 1)
+        month[301] = (30, 1)
+        self._write_hours(self.WEEK_START, month)
+        result = plan_fit.compute(self.state_dir, self.NOW)
 
-        v = result["verdict"]["plans"]
-        self.assertFalse(v["pro"]["viable"])
-        self.assertFalse(v["max_5x"]["viable"])
-        self.assertTrue(v["max_20x"]["viable"])
-        self.assertAlmostEqual(v["pro"]["throttle_days_5h_per_month"], 10.0)
-        rec = result["verdict"]["recommendation"]
-        self.assertIn("Your current plan", rec)
-        # Current fits -> the recommendation peeks one tier down.
-        self.assertIn("A tier down, Max 5x", rec)
+        m5 = result["throttle_projection"]["max_5x"]["five_hour"]
+        self.assertAlmostEqual(m5["capped_hours"], 2.0)
+        self.assertAlmostEqual(m5["capped_hours_per_month"], 2.0, places=1)
+        self.assertEqual(m5["cap_episodes"], 1)
+        self.assertTrue(result["verdict"]["plans"]["max_5x"]["viable"])
+        # Still reported as context: the projected peak is well over 100%.
+        self.assertGreater(result["tier_projection"]["max_5x"]["peak_five_hour_pct"], 100)
 
-    def test_single_seven_day_cap_day_disqualifies(self):
-        # 7d tolerance is zero: one day whose 7d peak projects to 120% of
-        # Pro's weekly cap kills Pro even though its 5h profile is clean.
-        days = self._june_days()
-        self._write_days([(d, 2, 6 if i == 15 else 1) for i, d in enumerate(days)])
-        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+    def test_repeated_five_hour_lockouts_disqualify(self):
+        # Same 30 days, but a 3-hour overrun every day: 90h/month locked out,
+        # way past the 5h/month tolerance.
+        month = [(6, 1)] * 720
+        for day in range(30):
+            for h in range(3):
+                month[day * 24 + 10 + h] = (30, 1)
+        self._write_hours(self.WEEK_START, month)
+        result = plan_fit.compute(self.state_dir, self.NOW)
 
-        v = result["verdict"]["plans"]
-        self.assertFalse(v["pro"]["viable"])
-        self.assertAlmostEqual(v["pro"]["throttle_days_7d_per_month"], 1.0)
-        self.assertIsNone(v["pro"]["median_throttle_peak_5h_pct"])
-        # 6% * 4 = 24% of Max 5x's weekly cap -> fine there.
-        self.assertTrue(v["max_5x"]["viable"])
-        self.assertIn("Max 5x", result["verdict"]["recommendation"])
+        m5 = result["throttle_projection"]["max_5x"]["five_hour"]
+        self.assertAlmostEqual(m5["capped_hours"], 90.0)
+        self.assertEqual(m5["cap_episodes"], 30)
+        self.assertAlmostEqual(m5["median_episode_hours"], 3.0)
+        self.assertEqual(m5["days_with_cap"], 30)
+        self.assertFalse(result["verdict"]["plans"]["max_5x"]["viable"])
+        self.assertTrue(result["verdict"]["plans"]["max_20x"]["viable"])
 
-    def test_median_severity_over_cap_days(self):
-        # Pro cap-day peaks 600 / 400 / 200 -> median 400.
-        days = self._june_days()
-        peaks = {0: 30, 1: 20, 2: 10}  # % of Max 20x -> x20 on Pro
-        self._write_days([(d, peaks.get(i, 2), 1) for i, d in enumerate(days)])
-        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
-        pro = result["verdict"]["plans"]["pro"]
-        self.assertAlmostEqual(pro["median_throttle_peak_5h_pct"], 400.0)
-        self.assertAlmostEqual(pro["throttle_days_5h_per_month"], 3.0)
-        self.assertFalse(pro["viable"])  # 3/month > 1/month tolerance
+    def test_permanent_overrun_reads_as_fully_locked_out(self):
+        # 30% of Max 20x sustained = 600% of Pro: Pro would never have been
+        # usable at all -> 100% of observed time locked out (720h/month).
+        self._write_hours(self.WEEK_START, [(30, 1)] * 48)
+        result = plan_fit.compute(self.state_dir, self.NOW)
 
-    def test_no_tier_viable_mentions_max_20x_cap_days(self):
-        # Hitting the Max 20x cap (100%) most days: even the top tier is
-        # over tolerance, and the recommendation says so in cap-day terms.
-        days = self._june_days(10)
-        self._write_days([(d, 100, 1) for d in days])
-        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+        pro = result["throttle_projection"]["pro"]["five_hour"]
+        self.assertAlmostEqual(pro["capped_hours"], 48.0)
+        self.assertAlmostEqual(pro["capped_hours_per_month"], plan_fit.HOURS_PER_MONTH, places=1)
+        self.assertAlmostEqual(pro["median_throttle_peak_pct"], 600.0)
+        self.assertFalse(result["verdict"]["plans"]["pro"]["viable"])
+
+    def test_gap_in_collection_is_neither_observed_nor_locked_out(self):
+        # Two hours of capped usage, then a two-day hole with no snapshots,
+        # then two clear hours. The hole must not inflate observed time (which
+        # would dilute the rate) nor be assumed still locked out.
+        rows = []
+        for i in range(2):
+            ts = (self.WEEK_START + timedelta(hours=i)).isoformat()
+            rows.append({"ts_start": ts, "n": 30,
+                         "five_hour": {"min": 30, "max": 30, "avg": 30, "last": 30},
+                         "seven_day": {"min": 1, "max": 1, "avg": 1, "last": 1}})
+        for i in range(2):
+            ts = (self.WEEK_START + timedelta(days=2, hours=i)).isoformat()
+            rows.append({"ts_start": ts, "n": 30,
+                         "five_hour": {"min": 1, "max": 1, "avg": 1, "last": 1},
+                         "seven_day": {"min": 1, "max": 1, "avg": 1, "last": 1}})
+        _write_jsonl(self.usage_dir / "snapshots_1h.jsonl", rows)
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+        result = plan_fit.compute(self.state_dir, self.NOW)
+
+        pro = result["throttle_projection"]["pro"]["five_hour"]
+        self.assertAlmostEqual(pro["hours_observed"], 4.0, msg="the 46h hole is not observed time")
+        self.assertAlmostEqual(pro["capped_hours"], 2.0)
+        self.assertEqual(pro["cap_episodes"], 1, "the hole ends the episode")
+
+    def test_either_cap_is_a_union_not_a_sum(self):
+        # One day, observed against Max 20x, projected onto Pro (x20):
+        #   h0-h9   clear
+        #   h10-h13 5h cap only   (6% -> 120% of Pro's 5h cap)
+        #   h14-h15 BOTH caps     (6% / 6% -> 120% / 120%)
+        #   h16-h17 7d cap only   (6% -> 120% of Pro's weekly cap)
+        # 5h capped 6h, 7d capped 4h — but they overlap for 2h, so "either"
+        # is 8h, not 10h.
+        day = [(2, 1)] * 24
+        for h in range(10, 14):
+            day[h] = (6, 1)
+        for h in range(14, 16):
+            day[h] = (6, 6)
+        for h in range(16, 18):
+            day[h] = (2, 6)
+        self._write_hours(self.WEEK_START, day)
+        result = plan_fit.compute(self.state_dir, self.NOW)
+
+        pro = result["throttle_projection"]["pro"]
+        self.assertAlmostEqual(pro["five_hour"]["capped_hours"], 6.0)
+        self.assertAlmostEqual(pro["seven_day"]["capped_hours"], 4.0)
+        any_cap = pro["any_cap"]
+        self.assertAlmostEqual(any_cap["capped_hours"], 8.0, msg="union, not the 10h sum")
+        self.assertAlmostEqual(any_cap["overlap_hours"], 2.0)
+        self.assertAlmostEqual(any_cap["five_hour_only_hours"], 4.0)
+        self.assertAlmostEqual(any_cap["seven_day_only_hours"], 2.0)
+        # h10-h17 is one continuous stretch of being unable to work.
+        self.assertEqual(any_cap["cap_episodes"], 1)
+        self.assertAlmostEqual(any_cap["median_episode_hours"], 8.0)
+
+        plan = result["verdict"]["plans"]["pro"]
+        self.assertAlmostEqual(plan["capped_hours_any_per_month"],
+                               8.0 / 24.0 * plan_fit.HOURS_PER_MONTH, places=1)
+        self.assertLess(plan["capped_hours_any_per_month"],
+                        plan["capped_hours_5h_per_month"] + plan["capped_hours_7d_per_month"])
+
+    def test_recommendation_names_the_binding_cap(self):
+        # Weekly-dominated: 5h clean, weekly over -> "(weekly cap)".
+        week = [(1, 4)] * 156 + [(1, 6)] * 12
+        self._write_hours(self.WEEK_START, week)
+        result = plan_fit.compute(self.state_dir, self.NOW)
+        self.assertIn("(weekly cap)", result["verdict"]["recommendation"])
+
+        # 5h-dominated: three hours a day over the 5h cap, weekly clean.
+        month = [(6, 1)] * 720
+        for day in range(30):
+            for h in range(3):
+                month[day * 24 + 10 + h] = (30, 1)
+        self._write_hours(self.WEEK_START, month)
+        result = plan_fit.compute(self.state_dir, self.NOW)
+        m5 = result["verdict"]["plans"]["max_5x"]
+        self.assertEqual(m5["capped_hours_any_per_month"], m5["capped_hours_5h_per_month"])
+        self.assertIn("(5h cap)", result["verdict"]["recommendation"])
+
+    def test_short_collection_gap_does_not_split_one_lockout_into_two(self):
+        # Capped, then 8 hours with no snapshots (Mac asleep), then still
+        # capped. Nothing released during the hole — utilization only drops
+        # when its window resets, and a reset would show as a low value
+        # afterwards — so this is ONE episode, not two. The gap itself is
+        # still never counted as locked time.
+        rows = []
+        for i in range(4):
+            ts = (self.WEEK_START + timedelta(hours=i)).isoformat()
+            rows.append({"ts_start": ts, "n": 30,
+                         "five_hour": {"min": 30, "max": 30, "avg": 30, "last": 30},
+                         "seven_day": {"min": 1, "max": 1, "avg": 1, "last": 1}})
+        for i in range(4):
+            ts = (self.WEEK_START + timedelta(hours=12 + i)).isoformat()
+            rows.append({"ts_start": ts, "n": 30,
+                         "five_hour": {"min": 30, "max": 30, "avg": 30, "last": 30},
+                         "seven_day": {"min": 1, "max": 1, "avg": 1, "last": 1}})
+        _write_jsonl(self.usage_dir / "snapshots_1h.jsonl", rows)
+        _write_json(self.usage_dir / "tokens_hourly.json", _tokens_hourly({}))
+        result = plan_fit.compute(self.state_dir, self.NOW)
+
+        pro = result["throttle_projection"]["pro"]["five_hour"]
+        self.assertEqual(pro["cap_episodes"], 1)
+        self.assertAlmostEqual(pro["capped_hours"], 8.0, msg="the 8h hole is not locked time")
+        self.assertAlmostEqual(pro["median_episode_hours"], 8.0)
+
+    def test_recovery_between_lockouts_does_split_them(self):
+        # Same shape, but the series comes back UNDER the cap in between —
+        # a real recovery, so two episodes.
+        series = [(30, 1)] * 4 + [(2, 1)] * 4 + [(30, 1)] * 4
+        self._write_hours(self.WEEK_START, series)
+        result = plan_fit.compute(self.state_dir, self.NOW)
+        pro = result["throttle_projection"]["pro"]["five_hour"]
+        self.assertEqual(pro["cap_episodes"], 2)
+        self.assertAlmostEqual(pro["median_episode_hours"], 4.0)
+
+    def test_clean_tier_reports_zero_lockout(self):
+        self._write_hours(self.WEEK_START, [(2, 1)] * 48)
+        result = plan_fit.compute(self.state_dir, self.NOW)
+        m20 = result["throttle_projection"]["max_20x"]
+        self.assertEqual(m20["five_hour"]["capped_hours"], 0.0)
+        self.assertEqual(m20["five_hour"]["cap_episodes"], 0)
+        self.assertIsNone(m20["five_hour"]["median_throttle_peak_pct"])
+        self.assertTrue(result["verdict"]["plans"]["max_20x"]["viable"])
+        self.assertIn("no projected lockout", result["verdict"]["recommendation"])
+
+    def test_no_tier_viable_mentions_max_20x_lockout(self):
+        # Sitting at the Max 20x cap: even the top tier is over tolerance.
+        self._write_hours(self.WEEK_START, [(100, 1)] * 48)
+        result = plan_fit.compute(self.state_dir, self.NOW)
         v = result["verdict"]
         self.assertFalse(v["plans"]["max_20x"]["viable"])
         self.assertIn("Even Max 20x", v["recommendation"])
-        self.assertIn("d/mo", v["recommendation"])
+        self.assertIn("locked out", v["recommendation"])
 
     def test_tolerance_block_present(self):
-        self._write_days([("2026-06-01", 2, 1)])
-        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+        self._write_hours(self.WEEK_START, [(2, 1)])
+        result = plan_fit.compute(self.state_dir, self.NOW)
         tol = result["verdict"]["throttle_tolerance"]
-        self.assertEqual(tol["five_hour_days_per_month"], plan_fit.THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH)
-        self.assertEqual(tol["seven_day_days_per_month"], plan_fit.THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH)
+        self.assertEqual(tol["five_hour_hours_per_month"],
+                         plan_fit.THROTTLE_TOLERANCE_5H_HOURS_PER_MONTH)
+        self.assertEqual(tol["seven_day_hours_per_month"],
+                         plan_fit.THROTTLE_TOLERANCE_7D_HOURS_PER_MONTH)
+        # Day-equivalents stay in the payload for older widget builds.
+        self.assertAlmostEqual(tol["five_hour_days_per_month"],
+                               plan_fit.THROTTLE_TOLERANCE_5H_HOURS_PER_MONTH / 24.0, places=3)
+
+    def test_capped_time_formatting_picks_a_readable_unit(self):
+        self.assertIsNone(plan_fit._fmt_capped_time(None))
+        self.assertIsNone(plan_fit._fmt_capped_time(0))
+        self.assertIsNone(plan_fit._fmt_capped_time(0.001), "sub-minute is noise, not a lockout")
+        self.assertEqual(plan_fit._fmt_capped_time(0.5), "~30m/mo")
+        self.assertEqual(plan_fit._fmt_capped_time(4.0), "~4.0h/mo")
+        self.assertEqual(plan_fit._fmt_capped_time(51.43), "~2.1 d/mo")
 
     def test_upgrade_recommendation_prices_the_difference(self):
-        # Current plan Pro, usage that needs Max 5x: recommendation should
-        # phrase the upgrade cost, not "savings".
-        days = self._june_days()
-        # Observed against Pro: 50% of Pro's 5h cap on 10 days -> Pro fine?
-        # No: we need Pro NOT viable -> days at/over 100% of Pro. Use 100%.
-        self._write_days([(d, 100 if i < 10 else 10, 1) for i, d in enumerate(days)])
+        # Current plan Pro, usage that pins Pro's 5h cap for 3h a day:
+        # recommendation phrases the upgrade cost, not "savings".
+        month = [(10, 1)] * 720
+        for day in range(30):
+            for h in range(3):
+                month[day * 24 + 10 + h] = (100, 1)
+        self._write_hours(self.WEEK_START, month)
         _write_json(self.state_dir / "config.json",
                     _config(account={"type": "max", "plan": "pro"}))
-        result = plan_fit.compute(self.state_dir, datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc))
+        result = plan_fit.compute(self.state_dir, self.NOW)
         v = result["verdict"]
         self.assertFalse(v["plans"]["pro"]["viable"])
         # 100% of Pro = 20% of Max 5x -> viable there.
         self.assertTrue(v["plans"]["max_5x"]["viable"])
-        self.assertIn("Your current plan, Pro, would be capped", v["recommendation"])
+        self.assertIn("Your current plan, Pro, would be locked out", v["recommendation"])
         self.assertIn("Max 5x fits", v["recommendation"])
         self.assertIn("for $80/mo more", v["recommendation"])
 
@@ -1082,7 +1269,10 @@ class BudgetPeriodBoundsTests(unittest.TestCase):
         self.assertTrue(27.9 <= span_days <= 31.1, span_days)
 
 
-class BudgetBlockTests(TempStateDirTestCase):
+class _BudgetComputeMixin:
+    """Shared budget fixtures. A mixin rather than a base class so the basis
+    tests below don't re-run BudgetBlockTests' cases as inherited ones."""
+
     # opus cost per hour = input_tok * 5 / 1e6, priced by the bundled chain.
     def _hour_cost(self, hour_key: str, cost_usd: float) -> dict:
         input_tok = int(cost_usd * 1_000_000 / 5)
@@ -1094,6 +1284,8 @@ class BudgetBlockTests(TempStateDirTestCase):
             _write_json(self.state_dir / "config.json", _config(account=account, budget=budget))
         return plan_fit.compute(self.state_dir, now)
 
+
+class BudgetBlockTests(_BudgetComputeMixin, TempStateDirTestCase):
     def test_none_budget_both_windows_null(self):
         result = self._compute({}, budget={"weekly_usd": None, "monthly_usd": None,
                                             "week_start": "monday", "timezone": "utc"},
@@ -1201,6 +1393,123 @@ class BudgetBlockTests(TempStateDirTestCase):
         m = result["budget"]["monthly"]
         self.assertAlmostEqual(m["spent_usd"], 20.0, places=2)
         self.assertEqual(m["period_start"], "2026-07-01T00:00:00+00:00")
+
+
+# ---------------------------------------------------------------------------
+# Budget projection basis (calendar days vs. weekdays only)
+# ---------------------------------------------------------------------------
+
+class BudgetProjectionBasisTests(_BudgetComputeMixin, TempStateDirTestCase):
+    """`budget.projection_basis` picks which elapsed clock the spend
+    projection extrapolates on. Calendar dates used below (UTC timezone, so
+    the weekday split needs no local-tz reasoning):
+
+        July 2026 opens on a Wednesday and holds 23 weekdays of 31 days.
+        August 2026 opens on a Saturday.
+    """
+
+    def _basis_budget(self, basis, monthly=1000.0, weekly=None):
+        return {"weekly_usd": weekly, "monthly_usd": monthly,
+                "week_start": "monday", "timezone": "utc",
+                "projection_basis": basis}
+
+    def test_weekday_seconds_counts_only_monday_to_friday(self):
+        july_start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        august_start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        self.assertAlmostEqual(
+            plan_fit._weekday_seconds(july_start, august_start, "utc"),
+            23 * 86400.0, places=3)
+        # A single weekend day contributes nothing; a partial weekday does.
+        sat = datetime(2026, 7, 4, tzinfo=timezone.utc)
+        sun_end = datetime(2026, 7, 6, tzinfo=timezone.utc)
+        self.assertEqual(plan_fit._weekday_seconds(sat, sun_end, "utc"), 0.0)
+        self.assertAlmostEqual(
+            plan_fit._weekday_seconds(datetime(2026, 7, 6, tzinfo=timezone.utc),
+                                      datetime(2026, 7, 6, 6, tzinfo=timezone.utc), "utc"),
+            6 * 3600.0, places=3)
+        # Empty / inverted intervals are zero, never negative.
+        self.assertEqual(plan_fit._weekday_seconds(sun_end, sat, "utc"), 0.0)
+
+    def test_weekdays_basis_projects_higher_than_calendar_early_in_the_month(self):
+        # $100 spent on Wed 07-01; now Mon 07-06 12:00.
+        #   calendar: 5.5 of 31 days elapsed  -> $100 / (5.5/31)  = $563.64
+        #   weekdays: 3.5 of 23 weekdays      -> $100 / (3.5/23)  = $657.14
+        hours = self._hour_cost("2026-07-01T09", 100.0)
+        now = datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)
+        cal = self._compute(hours, budget=self._basis_budget("calendar"), now=now)
+        wd = self._compute(hours, budget=self._basis_budget("weekdays"), now=now)
+        self.assertAlmostEqual(cal["budget"]["monthly"]["projected_usd"], 563.64, places=1)
+        self.assertAlmostEqual(wd["budget"]["monthly"]["projected_usd"], 657.14, places=1)
+        # Spend itself is basis-independent — only the extrapolation changes.
+        self.assertAlmostEqual(wd["budget"]["monthly"]["spent_usd"],
+                               cal["budget"]["monthly"]["spent_usd"], places=2)
+        self.assertEqual(cal["budget"]["monthly"]["projection_basis"], "calendar")
+        self.assertEqual(wd["budget"]["monthly"]["projection_basis"], "weekdays")
+
+    def test_weekdays_basis_holds_steady_across_the_weekend(self):
+        """The whole point of the option: a weekend that carries no work must
+        not drag the projection down, so Saturday and Sunday report the same
+        number Friday closed at."""
+        hours = self._hour_cost("2026-07-01T09", 100.0)
+        budget = self._basis_budget("weekdays")
+        sat = self._compute(hours, budget=budget,
+                            now=datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc))
+        sun = self._compute(hours, budget=budget,
+                            now=datetime(2026, 7, 12, 18, 0, tzinfo=timezone.utc))
+        # 8 weekdays elapsed (07-01..03, 07-06..10) of 23 -> $287.50.
+        self.assertAlmostEqual(sat["budget"]["monthly"]["projected_usd"], 287.50, places=2)
+        self.assertEqual(sun["budget"]["monthly"]["projected_usd"],
+                         sat["budget"]["monthly"]["projected_usd"])
+        # Calendar basis, by contrast, keeps diluting over the same weekend.
+        cal_sat = self._compute(hours, budget=self._basis_budget("calendar"),
+                                now=datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc))
+        cal_sun = self._compute(hours, budget=self._basis_budget("calendar"),
+                                now=datetime(2026, 7, 12, 18, 0, tzinfo=timezone.utc))
+        self.assertLess(cal_sun["budget"]["monthly"]["projected_usd"],
+                        cal_sat["budget"]["monthly"]["projected_usd"])
+
+    def test_weekdays_basis_suppresses_projection_until_a_weekday_hour_elapses(self):
+        """August 2026 opens on a Saturday: 36 calendar hours in, no weekday
+        time has elapsed, so there is no rate to extrapolate from — null,
+        exactly like the first-hour rule, rather than a divide-by-tiny blowup."""
+        hours = self._hour_cost("2026-08-01T09", 25.0)
+        sat_noon = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+        wd = self._compute(hours, budget=self._basis_budget("weekdays"), now=sat_noon)
+        m = wd["budget"]["monthly"]
+        self.assertIsNone(m["projected_usd"])
+        self.assertIsNone(m["projected_pct"])
+        self.assertAlmostEqual(m["spent_usd"], 25.0, places=2)  # weekend spend still counts
+        # Same instant on the calendar basis does project.
+        cal = self._compute(hours, budget=self._basis_budget("calendar"), now=sat_noon)
+        self.assertIsNotNone(cal["budget"]["monthly"]["projected_usd"])
+        # An hour into Monday it starts projecting.
+        mon = self._compute(hours, budget=self._basis_budget("weekdays"),
+                            now=datetime(2026, 8, 3, 1, 30, tzinfo=timezone.utc))
+        self.assertIsNotNone(mon["budget"]["monthly"]["projected_usd"])
+
+    def test_weekly_window_honors_the_same_basis(self):
+        # Week Mon 07-13 .. Sun 07-19 (5 weekdays); now Wed 07-15 12:00 =
+        # 2.5 of 5 weekdays -> $10 spent projects to $20.
+        hours = self._hour_cost("2026-07-13T09", 10.0)
+        result = self._compute(hours, budget=self._basis_budget("weekdays", monthly=None, weekly=200.0),
+                               now=datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc))
+        w = result["budget"]["weekly"]
+        self.assertAlmostEqual(w["projected_usd"], 20.0, places=2)
+        self.assertEqual(w["projection_basis"], "weekdays")
+
+    def test_missing_or_unknown_basis_falls_back_to_calendar(self):
+        hours = self._hour_cost("2026-07-01T09", 100.0)
+        now = datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)
+        # Key absent entirely (a config written before this option existed).
+        legacy = self._compute(hours, budget={"weekly_usd": None, "monthly_usd": 1000.0,
+                                              "week_start": "monday", "timezone": "utc"},
+                               now=now)
+        # Garbage value — echoed back as the basis actually used, not as-is.
+        junk = self._compute(hours, budget=self._basis_budget("business-days"), now=now)
+        for result in (legacy, junk):
+            m = result["budget"]["monthly"]
+            self.assertEqual(m["projection_basis"], "calendar")
+            self.assertAlmostEqual(m["projected_usd"], 563.64, places=1)
 
 
 # ---------------------------------------------------------------------------

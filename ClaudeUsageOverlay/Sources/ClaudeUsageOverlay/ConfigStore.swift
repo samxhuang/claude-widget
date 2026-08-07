@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 import Darwin
 
 /// One remote host entry from config.json's `remote_hosts` array (contract
@@ -44,6 +43,11 @@ struct AppConfig: Equatable {
     var monthlyUsd: Double?
     var weekStart: String = "monday"
     var timezone: String = "local"
+    /// Which elapsed clock the budget spend projection extrapolates on:
+    /// `"calendar"` (every hour of the period) or `"weekdays"` (Mon–Fri hours
+    /// only, on both sides of the ratio). Default matches the Python reader's,
+    /// so a config predating this key behaves exactly as before.
+    var projectionBasis: String = "calendar"
     var remoteHosts: [RemoteHostConfig] = []
     /// How long an idle session stays in the Sessions list before the daemon
     /// drops it (config.json `sessions.idle_retention_minutes`; daemon clamps
@@ -66,9 +70,9 @@ struct AppConfig: Equatable {
 /// write racing a daemon read would then lock different inodes and exclude
 /// nothing. All locked I/O runs off the main thread on a private serial
 /// queue, published back on main, same as SessionsModel post-audit.
-final class ConfigStore: ObservableObject {
+final class ConfigStore: Observable {
     /// The current decoded config, republished on main after every load/write.
-    @Published var config = AppConfig()
+    @Observed var config = AppConfig()
 
     private let configURL: URL
     private let lockURL: URL
@@ -85,13 +89,14 @@ final class ConfigStore: ObservableObject {
     /// on the widget's periodic refresh. Nil until the first load.
     private var lastLoadedMtime: Date?
 
-    init() {
+    override init() {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-autoresume")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.configURL = dir.appendingPathComponent("config.json")
         self.lockURL = dir.appendingPathComponent("config.json.lock")
         self.tmpURL = configURL.appendingPathExtension("tmp")
+        super.init()
         load()
     }
 
@@ -158,6 +163,8 @@ final class ConfigStore: ObservableObject {
         var weeklyUsd: Double?
         var monthlyUsd: Double?
         var weekStart: String
+        /// "calendar" | "weekdays" — see AppConfig.projectionBasis.
+        var projectionBasis: String
     }
 
     /// Account type/plan AND budget block, written in ONE locked
@@ -201,6 +208,10 @@ final class ConfigStore: ObservableObject {
             }
             if edited.weekStart != seeded.weekStart {
                 budget["week_start"] = edited.weekStart
+                budgetTouched = true
+            }
+            if edited.projectionBasis != seeded.projectionBasis {
+                budget["projection_basis"] = edited.projectionBasis
                 budgetTouched = true
             }
             if budgetTouched { root["budget"] = budget }
@@ -310,14 +321,14 @@ final class ConfigStore: ObservableObject {
     /// Atomic tmp + replaceItemAt write. Called only while holding the lock.
     private func writeRaw(_ root: [String: Any]) {
         guard let out = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) else {
-            NSLog("[ConfigStore] serialize failed")
+            CoreLog.error("[ConfigStore] serialize failed")
             return
         }
         do {
             try out.write(to: tmpURL)
             _ = try FileManager.default.replaceItemAt(configURL, withItemAt: tmpURL)
         } catch {
-            NSLog("[ConfigStore] write failed: %@", error.localizedDescription)
+            CoreLog.error("[ConfigStore] write failed: \(error.localizedDescription)")
         }
     }
 
@@ -382,6 +393,7 @@ final class ConfigStore: ObservableObject {
             c.monthlyUsd = sanitizedBudget((budget["monthly_usd"] as? NSNumber)?.doubleValue)
             if let ws = budget["week_start"] as? String { c.weekStart = ws }
             if let tz = budget["timezone"] as? String { c.timezone = tz }
+            if let basis = budget["projection_basis"] as? String { c.projectionBasis = basis }
         }
         if let sessions = root["sessions"] as? [String: Any],
            let retention = (sessions["idle_retention_minutes"] as? NSNumber)?.intValue {

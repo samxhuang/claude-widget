@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 import ClaudeAPI
 
 /// One cloud-only Cowork/Code session surfaced via claude.ai's `/recents`
@@ -39,24 +38,24 @@ struct CloudSessionEntry: Identifiable, Equatable, Hashable {
 /// ChatsFetcher.swift. Purely a reader/republisher, same spirit as
 /// PlanFitModel/GraphModel: this widget never writes anything back to
 /// claude.ai for these.
-final class CloudSessionsModel: ObservableObject {
+final class CloudSessionsModel: Observable {
     /// Newest-first, capped to `displayCap` (see apply below). Use
     /// `totalCount` for the full pre-cap count (e.g. the section badge).
-    @Published var sessions: [CloudSessionEntry] = []
+    @Observed var sessions: [CloudSessionEntry] = []
     /// Full count of cloud sessions after id/title filtering but before the
     /// display cap — 13 rows of mostly day-old sessions was clutter, so the
     /// visible list is capped while the badge can still show how many exist.
-    @Published var totalCount: Int = 0
+    @Observed var totalCount: Int = 0
     /// Status classification item: per-workStatus counts across the full
     /// (pre-display-cap) filtered list, for the Sessions section header's
     /// combined "N running · N input · N done" breakdown — computed over
     /// the same set `totalCount` is, not just the capped `sessions` array,
     /// so a needs-input session doesn't silently drop out of the count just
     /// because it scrolled past the display cap.
-    @Published var runningCount: Int = 0
-    @Published var needsInputCount: Int = 0
-    @Published var idleCount: Int = 0
-    @Published var now: Date = Date()
+    @Observed var runningCount: Int = 0
+    @Observed var needsInputCount: Int = 0
+    @Observed var idleCount: Int = 0
+    @Observed var now: Date = Date()
 
     /// The fixed-height ScrollView (see OverlayView/SectionLayout) absorbs
     /// overflow fine for a handful of rows, but 13 mostly-day-old sessions

@@ -914,6 +914,24 @@ class TestConfigPlanCanonicalization(unittest.TestCase):
         for bad in (None, 20, True, ["max_20x"]):
             self.assertEqual(self._plan_for(bad), acfg.DEFAULT_PLAN)
 
+    def _basis_for(self, value):
+        import autoresume_config as acfg
+        budget = {"weekly_usd": None, "monthly_usd": 100.0}
+        if value is not ...:
+            budget["projection_basis"] = value
+        (self.state_dir / "config.json").write_text(
+            json.dumps({"version": 1, "budget": budget}))
+        return acfg.load_config(self.state_dir)["budget"]["projection_basis"]
+
+    def test_valid_projection_bases_accepted(self):
+        for basis in ("calendar", "weekdays"):
+            self.assertEqual(self._basis_for(basis), basis)
+
+    def test_unknown_or_missing_projection_basis_defaults_to_calendar(self):
+        # ... = key absent (a config written before the option existed).
+        for bad in (..., "business_days", "Weekdays", None, 5, True):
+            self.assertEqual(self._basis_for(bad), "calendar")
+
 
 # ---------------------------------------------------------------------------
 # Sidecar activity mtime must see Workflow-nested agent transcripts

@@ -114,6 +114,15 @@ private enum AccountChoice: String, CaseIterable, Identifiable {
 // the daemon actually honors rather than offering all seven.
 private let weekdayOptions = ["monday", "sunday"]
 
+/// Which elapsed clock the budget bars' projection dot extrapolates on
+/// (config.json `budget.projection_basis`; the daemon's plan_fit validates
+/// against the same two values and falls back to "calendar"). Same rationale
+/// as weekdayOptions: offer only what the daemon honors.
+private let projectionBasisOptions: [(String, String)] = [
+    ("calendar", "Every day"),
+    ("weekdays", "Weekdays only"),
+]
+
 // MARK: - Sessions
 
 /// How long an idle session stays in the Sessions list before the daemon
@@ -177,6 +186,7 @@ struct AccountBudgetSection: View {
     @State private var weeklyText: String = ""
     @State private var monthlyText: String = ""
     @State private var weekStart: String = "monday"
+    @State private var projectionBasis: String = "calendar"
     @State private var seeded = false
     /// Snapshot of the section-owned config fields as this section last
     /// seeded them or wrote them via Apply. Fields now buffer locally until
@@ -194,6 +204,7 @@ struct AccountBudgetSection: View {
         let weeklyUsd: Double?
         let monthlyUsd: Double?
         let weekStart: String
+        let projectionBasis: String
     }
 
     private func snapshot(of c: AppConfig) -> SectionSnapshot {
@@ -201,8 +212,16 @@ struct AccountBudgetSection: View {
             choice: AccountChoice.from(config: c),
             weeklyUsd: c.weeklyUsd,
             monthlyUsd: c.monthlyUsd,
-            weekStart: weekdayOptions.contains(c.weekStart) ? c.weekStart : "monday"
+            weekStart: weekdayOptions.contains(c.weekStart) ? c.weekStart : "monday",
+            projectionBasis: Self.validBasis(c.projectionBasis)
         )
+    }
+
+    /// Same fallback the daemon applies: anything outside the two supported
+    /// values (old/hand-edited config) displays and re-saves as "calendar",
+    /// so the Picker always has a matching tag rather than rendering blank.
+    private static func validBasis(_ raw: String) -> String {
+        projectionBasisOptions.contains { $0.0 == raw } ? raw : "calendar"
     }
 
     private var weeklyValid: Bool { Self.isValidBudget(weeklyText) }
@@ -220,7 +239,8 @@ struct AccountBudgetSection: View {
             choice: accountChoice,
             weeklyUsd: Self.isBlank(weeklyText) ? nil : Self.parseBudget(weeklyText),
             monthlyUsd: Self.isBlank(monthlyText) ? nil : Self.parseBudget(monthlyText),
-            weekStart: weekStart
+            weekStart: weekStart,
+            projectionBasis: projectionBasis
         )
     }
 
@@ -283,6 +303,17 @@ struct AccountBudgetSection: View {
                     .labelsHidden()
                     .frame(width: 140)
                 }
+                GridRow {
+                    Text("Project spend over")
+                    Picker("", selection: $projectionBasis) {
+                        ForEach(projectionBasisOptions, id: \.0) { value, label in
+                            Text(label).tag(value)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 140)
+                    .help("Which days the projection dot on the budget bars extrapolates over. \"Weekdays only\" divides by Mon–Fri time on both sides, so a weekday-only workload isn't projected as if the weekend would carry spend. Weekend spend still counts toward the total either way.")
+                }
             }
 
             Text(accountChoice == .api
@@ -343,6 +374,7 @@ struct AccountBudgetSection: View {
         // back to monday for any other stored value (old/hand-edited config) so
         // the Picker has a matching tag rather than rendering blank.
         weekStart = weekdayOptions.contains(c.weekStart) ? c.weekStart : "monday"
+        projectionBasis = Self.validBasis(c.projectionBasis)
         lastSyncedSnapshot = snapshot(of: c)
     }
 
@@ -389,7 +421,7 @@ struct AccountBudgetSection: View {
         return ConfigStore.AccountBudgetFields(
             accountType: type, accountPlan: plan,
             weeklyUsd: s.weeklyUsd, monthlyUsd: s.monthlyUsd,
-            weekStart: s.weekStart)
+            weekStart: s.weekStart, projectionBasis: s.projectionBasis)
     }
 
     /// Budget-field text → Double, tolerant of whitespace and the user's

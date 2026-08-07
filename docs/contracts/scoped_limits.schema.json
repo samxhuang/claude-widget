@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-widget.invalid/contracts/scoped_limits.schema.json",
+  "title": "claude-autoresume usage/scoped_limits.json",
+  "description": "The widget -> daemon relay of ACTIVE per-model usage caps (e.g. the weekly Fable limit), at ~/.claude-autoresume/usage/scoped_limits.json.\n\nWhy it exists: the daemon is pure-stdlib and cannot reach claude.ai, and a CLI transcript that hits a per-model cap records only a plain 429 (isApiErrorMessage / apiErrorStatus 429, model '<synthetic>') with NO reset time of its own - the reset lives solely on the usage page. The widget already fetches usage, so it drops the active caps here and the daemon arms a model-limited session against the relayed reset.\n\nConcurrency: single writer (the widget's ScopedLimitLogger), single reader (the daemon). Written with Data.write(.atomic), i.e. auxiliary file + rename, so the reader sees either the old inode or the new one, never a partial file. No cross-process flock is needed or taken - unlike snapshots.jsonl, nothing else ever writes here.\n\nSemantics: this file is a FULL-STATE snapshot rewritten on every usage fetch, not a log. An empty `limits` array is meaningful - it means a cap just reset and there is nothing to wait on.",
+  "x-contract-version": 1,
+  "x-in-band-version": false,
+  "x-in-band-version-note": "No version field. `updated_at` is present but no reader consumes it, so the daemon has no staleness check on a relayed reset - see findings F5-3.",
+  "x-writers": ["ClaudeUsageOverlay ScopedLimitLogger.buildPayload (from UsageFetcher, every successful usage fetch)"],
+  "x-readers": ["claude-autoresume/autoresume.py load_scoped_limits -> scoped_limit_reset / reconcile_scoped_limit_resets"],
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["updated_at", "limits"],
+  "properties": {
+    "updated_at": {
+      "type": "string",
+      "description": "ISO8601 with offset, from Swift's ISO8601DateFormatter([.withInternetDateTime]) - when this relay was written. WRITE-ONLY: no reader consumes it."
+    },
+    "limits": {
+      "type": "array",
+      "description": "The currently-ACTIVE per-model caps only. The widget filters on isActive before writing, which is why the daemon's loader does no is_active filtering of its own - an invariant that is not representable in the file itself and must not be broken silently on either side.",
+      "items": { "$ref": "#/$defs/scopedLimit" }
+    }
+  },
+  "$defs": {
+    "scopedLimit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_display_name", "model_id", "resets_at", "percent", "severity"],
+      "description": "One active model-scoped cap. These field names are the WIDGET'S OWN relay format, frozen here independently of whatever the claude.ai API renames itself to - the typed values come from the ClaudeAPI module, which is the only place allowed to know raw API field names.",
+      "properties": {
+        "model_display_name": {
+          "type": "string",
+          "description": "Human-facing model family name, e.g. 'Fable'. The daemon's primary match key: normalize_model_token folds this and a transcript model id onto the same family token ('claude-fable-5' <-> 'Fable')."
+        },
+        "model_id": {
+          "type": ["string", "null"],
+          "description": "Concrete model id when the API supplies one, else null. Used by the daemon only as a FALLBACK match key when model_display_name is empty."
+        },
+        "resets_at": {
+          "type": ["string", "null"],
+          "description": "When this cap's window rolls. The whole point of the file: a limit whose reset is unparseable or null is skipped by the daemon's loader, so the model-limited session stays visible as 'waiting' but is not armed for auto-resume until a later relay supplies one. parse_reset_timestamp also normalizes stringified epoch-milliseconds, which an earlier bug parsed as year ~57000."
+        },
+        "percent": {
+          "type": ["number", "null"],
+          "description": "How much of the cap is consumed. WRITE-ONLY: the daemon never reads it."
+        },
+        "severity": {
+          "type": ["string", "null"],
+          "description": "The API's own severity label (e.g. 'critical'). WRITE-ONLY: the daemon never reads it."
+        }
+      }
+    }
+  }
+}

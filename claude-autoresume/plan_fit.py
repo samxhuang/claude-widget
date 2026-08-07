@@ -55,14 +55,15 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import platform_compat  # The ONE OS seam: home-derived paths + atomic replace
 from autoresume_config import load_config, load_config_with_meta  # stdlib-only sibling; account/budget config (C1)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-HOME = Path.home()
-DEFAULT_STATE_DIR = HOME / ".claude-autoresume"
+HOME = platform_compat.home()
+DEFAULT_STATE_DIR = platform_compat.state_dir()
 
 CURRENT_PLAN = "max_20x"  # default only; the live plan is config["account"]["plan"] (see autoresume_config)
 TIER_MULTIPLIERS = {"pro": 1, "max_5x": 5, "max_20x": 20}
@@ -70,31 +71,90 @@ TIER_PRICE_USD = {"pro": 20, "max_5x": 100, "max_20x": 200}
 TIER_ORDER = ("pro", "max_5x", "max_20x")  # cheapest first
 
 ROLLING_WINDOW_HOURS = 5
+# The two server-reported utilization windows, in snapshot-store field order.
+UTILIZATION_DIMS = ("five_hour", "seven_day")
 MA_WINDOWS_DAYS = (1, 7, 30, 90)
 # 30 (not the 30.44 calendar-month average) so "monthly run rate" and the
 # widget Graph tab's 1mo period estimate — a literal 30-day window — quote the
 # same pace against the same month definition instead of disagreeing by 1.5%.
 MONTHLY_RUN_RATE_DAYS = 30.0
 
-# Throttle-tolerance verdict (2026-07-19). Tier viability used to be "the
-# all-time projected peak never crossed 100%", which let a single monster
-# session permanently veto a cheaper tier no matter how unrepresentative it
-# was. It is now frequency + severity based: the utilization series is grouped
-# into UTC days, each day's peak is projected onto each tier (same linear
-# rescale as _tier_projection), and the days that would have hit the cap
-# (>= THROTTLE_CAP_PCT) are counted and normalized to a 30-day month. A tier
-# is viable when that cap-day frequency stays within tolerance. The 5h
-# default tolerates ~1 cap-day/month (a capped 5h window is a wait of at most
-# a few hours); the 7d default tolerates none — blowing the weekly cap can
-# lock work out for days, so even the "fair" metric treats it as
-# disqualifying. All-time peaks are still reported for context; they just no
-# longer decide viability on their own.
+# Throttle-tolerance verdict (2026-07-19, remeasured as lockout TIME
+# 2026-07-26). Tier viability used to be "the all-time projected peak never
+# crossed 100%", which let a single monster session permanently veto a cheaper
+# tier. That became a cap-DAY count: project each UTC day's peak onto the tier,
+# count the days whose peak reached the cap. That over-counted badly, because a
+# day is not the unit anyone is actually deprived in: blowing the weekly cap at
+# hour 20 of a 7-day window means ~4h locked out, but the day still counted
+# whole — and every subsequent day of that week counted whole too, so a single
+# late-week overrun could read as "capped 30 d/mo".
+#
+# The metric is now the thing it always meant: HOW MUCH TIME the tier would
+# have left you unable to work. The utilization series is walked as time
+# segments (see _utilization_segments); each segment's endpoints are rescaled
+# onto the tier and the fraction of the segment sitting at/over
+# THROTTLE_CAP_PCT is accumulated (linear interpolation across the crossing —
+# _above_cap_fraction). The total is normalized to a 30-day month and reported
+# both as hours/month and as its day-equivalent. A weekly cap hit 4h before
+# reset therefore scores 4h, not 1-7 days; a 5h window that recovers after
+# 40 minutes scores 40 minutes.
+#
+# Tolerances are in HOURS/month accordingly. 5h: ~5h — one fully-capped
+# rolling window a month, the previous "1 cap-day" intent stated honestly.
+# 7d: 2h — effectively "none", with just enough headroom that a brief
+# end-of-window overrun (or estimation noise at a bucket boundary) doesn't
+# disqualify a tier outright; a real weekly lockout runs for days and blows
+# past this immediately.
+#
+# Known bias, deliberately left conservative: the observed series was measured
+# on the CURRENT plan, where nothing stopped the user from consuming more. On a
+# cheaper tier the lockout itself would have suppressed that extra consumption,
+# so the rescaled series stays above the cap slightly longer than reality —
+# the estimate is an upper bound on 5h lockout time. Weekly (fixed-window,
+# server-side reset) is unaffected: the series drops at the reset either way.
 THROTTLE_CAP_PCT = 100.0
-THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH = 1.0
-THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH = 0.0
+THROTTLE_TOLERANCE_5H_HOURS_PER_MONTH = 5.0
+THROTTLE_TOLERANCE_7D_HOURS_PER_MONTH = 2.0
+# Legacy day-equivalents of the tolerances above; still emitted in
+# verdict.throttle_tolerance so an older widget build keeps rendering.
+THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH = THROTTLE_TOLERANCE_5H_HOURS_PER_MONTH / 24.0
+THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH = THROTTLE_TOLERANCE_7D_HOURS_PER_MONTH / 24.0
+
+# Time-coverage model for the lockout walk. Snapshot rows are written by the
+# widget every ~2 minutes while it runs; a longer hole means the widget (or the
+# Mac) was off, which is neither observed time nor lockout time — those holes
+# are excluded from both numerator and denominator rather than being assumed
+# to continue whatever state preceded them.
+LOCKOUT_MAX_SAMPLE_GAP_SECONDS = 15 * 60
+LOCKOUT_SAMPLE_NOMINAL_SECONDS = 120  # coverage credited to a sample with no usable successor
+# An episode is one continuous stretch of being unable to work. A collection
+# gap is not evidence that the lockout ended: if the series is still over the
+# cap when collection resumes, nothing released in between (utilization only
+# drops when its window resets, and a reset inside the gap would show as a low
+# value afterwards). So a gap with capped segments on BOTH sides bridges rather
+# than splitting the episode — otherwise an overnight gap turns one 5-day
+# lockout into five, and the median episode length reads as a fraction of the
+# real one. Beyond this bound too much is unobserved to claim continuity. Only
+# episode COUNT/length is affected: gap time is never counted as locked time.
+LOCKOUT_EPISODE_BRIDGE_SECONDS = 12 * 3600
+BUCKET_SPAN_SECONDS = {"15m": 15 * 60, "1h": 3600}
+HOURS_PER_MONTH = MONTHLY_RUN_RATE_DAYS * 24
 
 # Budget (API-account dollar limits) — see _budget_block / autoresume_config C1.
 BUDGET_PROJECTION_MIN_ELAPSED_SECONDS = 3600  # suppress linear projection in a period's first hour
+
+# How the budget projection measures "how far through the period are we".
+#   "calendar" — every hour of the period counts (the original behavior).
+#   "weekdays" — only Mon–Fri hours count, on BOTH sides of the ratio, so a
+#                weekday-only worker's month isn't projected as if the two
+#                weekend days it contains were going to carry spend. Weekend
+#                spend still counts toward `spent_usd` (it's real money); it
+#                just gets extrapolated over the remaining WEEKDAY time.
+# The weekday/weekend split is judged in the same timezone as the period
+# bounds (budget.timezone), so a Friday-evening UTC hour is a Friday hour for
+# a local-time user in the Americas too.
+BUDGET_PROJECTION_BASES = ("calendar", "weekdays")
+DEFAULT_BUDGET_PROJECTION_BASIS = "calendar"
 
 # Minimum elapsed time before a moving-average window reports a $/day value.
 # Semantics chosen: SUPPRESS (value null) rather than floor the denominator —
@@ -369,7 +429,7 @@ def refresh_pricing(state_dir: Path = DEFAULT_STATE_DIR) -> dict:
         usage_dir.mkdir(parents=True, exist_ok=True)
         tmp = usage_dir / "pricing_cache.json.tmp"
         tmp.write_text(json.dumps(payload, indent=2))
-        tmp.replace(usage_dir / "pricing_cache.json")
+        platform_compat.replace_with_retry(tmp, usage_dir / "pricing_cache.json")
     except OSError as e:
         return {"ok": False, "error": f"fetched OK but failed to write cache: {e}"}
 
@@ -790,7 +850,11 @@ def _merge_utilization_points(raw_rows: list, bucket15_rows: list, bucket1h_rows
     older than that, then 1h buckets for anything older still. Each
     returned point is either {"kind": "raw", "ts": dt, "five_hour": val|None,
     "seven_day": val|None} or {"kind": "bucket", "ts_start": dt, "n": int,
-    "five_hour": {...}|None, "seven_day": {...}|None}."""
+    "span_seconds": int, "five_hour": {...}|None, "seven_day": {...}|None}.
+
+    `span_seconds` is the bucket's nominal width (15m or 1h, from which store
+    it came) — the lockout walk needs to know how much wall-clock a bucket
+    stands for, which the row itself doesn't record."""
     points: list[dict] = []
     covered_start: datetime | None = None
 
@@ -810,7 +874,7 @@ def _merge_utilization_points(raw_rows: list, bucket15_rows: list, bucket1h_rows
         points.extend(raw_points)
         covered_start = min(p["ts"] for p in raw_points)
 
-    def _bucket_points(rows):
+    def _bucket_points(rows, span_seconds):
         parsed = []
         for row in rows:
             ts_start = _parse_iso(row.get("ts_start"))
@@ -820,16 +884,19 @@ def _merge_utilization_points(raw_rows: list, bucket15_rows: list, bucket1h_rows
             n = n if isinstance(n, (int, float)) and n > 0 else 1
             fh = row.get("five_hour") if isinstance(row.get("five_hour"), dict) else None
             sd = row.get("seven_day") if isinstance(row.get("seven_day"), dict) else None
-            parsed.append({"kind": "bucket", "ts_start": ts_start, "n": n, "five_hour": fh, "seven_day": sd})
+            parsed.append({"kind": "bucket", "ts_start": ts_start, "n": n,
+                           "span_seconds": span_seconds, "five_hour": fh, "seven_day": sd})
         return parsed
 
-    kept_15m = [p for p in _bucket_points(bucket15_rows) if covered_start is None or p["ts_start"] < covered_start]
+    kept_15m = [p for p in _bucket_points(bucket15_rows, BUCKET_SPAN_SECONDS["15m"])
+                if covered_start is None or p["ts_start"] < covered_start]
     if kept_15m:
         points.extend(kept_15m)
         oldest_15m = min(p["ts_start"] for p in kept_15m)
         covered_start = oldest_15m if covered_start is None else min(covered_start, oldest_15m)
 
-    kept_1h = [p for p in _bucket_points(bucket1h_rows) if covered_start is None or p["ts_start"] < covered_start]
+    kept_1h = [p for p in _bucket_points(bucket1h_rows, BUCKET_SPAN_SECONDS["1h"])
+               if covered_start is None or p["ts_start"] < covered_start]
     points.extend(kept_1h)
 
     return points
@@ -873,74 +940,269 @@ def _utilization_observed(points: list[dict]) -> dict:
     return result
 
 
-def _daily_peaks(points: list[dict]) -> dict:
-    """Per-UTC-day peak utilization for each dimension, from the merged point
-    series: {"five_hour": {date: pct}, "seven_day": {date: pct}}.
-
-    Days are the unit the throttle verdict counts in ("how many days a month
-    would this plan have capped me"): a runaway session inflates exactly one
-    day instead of dominating an all-time peak. Per-day maxima also survive
-    snapshot compaction — 15m/1h buckets keep `max`, so a day's peak stays
-    recoverable long after raw rows are pruned, unlike a full-distribution
-    percentile. Bucket points never straddle days (ts_start is at most
-    hour-floored)."""
-    result: dict = {"five_hour": {}, "seven_day": {}}
-    for p in points:
-        day = _point_ts(p).date()
-        for dim in ("five_hour", "seven_day"):
-            if p["kind"] == "raw":
-                val = p[dim]
-            else:
-                d = p[dim]
-                val = d.get("max") if d else None
-            if isinstance(val, (int, float)):
-                cur = result[dim].get(day)
-                if cur is None or float(val) > cur:
-                    result[dim][day] = float(val)
-    return result
-
-
 def _median(values: list) -> float:
     s = sorted(values)
     mid = len(s) // 2
     return float(s[mid]) if len(s) % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
-def _tier_throttle(daily_peaks: dict, current_plan: str = CURRENT_PLAN) -> dict:
-    """Cap-day frequency + severity per tier, from per-day peak utilization.
+def _utilization_segments(points: list[dict]) -> list[dict]:
+    """The merged point series re-expressed as time segments, time-ordered:
+    [{"start", "end", "seconds", "ranges": {dim: (low, high)}}, ...].
 
-    For each tier and dimension: project every observed day's peak onto the
-    tier and count the days at/over THROTTLE_CAP_PCT. `throttle_days_per_month`
-    normalizes the count to a 30-day month (rounded for display; _verdict
-    recomputes the exact rate from throttle_days/days_observed for the
-    tolerance comparison). `median_throttle_peak_pct` is the median projected
-    peak across the cap days — how bad a *typical* cap day was: ~105% means a
-    short wait near the window's edge, 300% means locked out most of the day.
-    """
+    A segment is a stretch of wall-clock the series actually observed, plus
+    the utilization range each dimension spanned over it. Both dimensions live
+    on the SAME segment (they come off the same snapshot rows) — that is what
+    makes the "either cap" union measurable rather than a double-count. Two
+    sources:
+
+    * Consecutive RAW samples ~2 minutes apart: the segment is the interval
+      between them, `low`/`high` the two endpoint values. Utilization moves
+      continuously between samples, so linear interpolation across the pair is
+      the natural read (a sample with no usable successor — series end, or a
+      gap wider than LOCKOUT_MAX_SAMPLE_GAP_SECONDS — instead gets a flat
+      LOCKOUT_SAMPLE_NOMINAL_SECONDS of its own value).
+    * A compacted BUCKET (15m/1h): the segment is the bucket's nominal span,
+      `low`/`high` its min/max. Buckets preserve min/max exactly through every
+      compaction tier, which is what makes lockout time still recoverable from
+      history whose raw rows are long gone. Coverage is capped at
+      n * LOCKOUT_SAMPLE_NOMINAL_SECONDS so a bucket holding two samples out of
+      a possible thirty contributes ~4 minutes of observed time, not an hour.
+
+    A dimension missing from a point (or from either end of a raw pair) is
+    simply absent from that segment's `ranges`, so per-dimension coverage is
+    tracked independently even though the segments are shared.
+
+    Segments never overlap: _merge_utilization_points hands out raw points and
+    buckets over disjoint stretches of time."""
+    segments: list[dict] = []
+    max_gap = timedelta(seconds=LOCKOUT_MAX_SAMPLE_GAP_SECONDS)
+    nominal = timedelta(seconds=LOCKOUT_SAMPLE_NOMINAL_SECONDS)
+
+    raw = sorted((p for p in points if p["kind"] == "raw"), key=lambda p: p["ts"])
+    for i, p in enumerate(raw):
+        nxt = raw[i + 1] if i + 1 < len(raw) else None
+        paired = nxt is not None and timedelta(0) < (nxt["ts"] - p["ts"]) <= max_gap
+        ranges = {}
+        for dim in UTILIZATION_DIMS:
+            val = p[dim]
+            if not isinstance(val, (int, float)):
+                continue
+            if paired:
+                nxt_val = nxt[dim]
+                if not isinstance(nxt_val, (int, float)):
+                    continue
+                ranges[dim] = (float(min(val, nxt_val)), float(max(val, nxt_val)))
+            else:
+                ranges[dim] = (float(val), float(val))
+        if not ranges:
+            continue
+        if paired:
+            segments.append({"start": p["ts"], "end": nxt["ts"],
+                             "seconds": (nxt["ts"] - p["ts"]).total_seconds(),
+                             "ranges": ranges})
+        elif nxt is None or (nxt["ts"] - p["ts"]) > max_gap:
+            segments.append({"start": p["ts"], "end": p["ts"] + nominal,
+                             "seconds": float(LOCKOUT_SAMPLE_NOMINAL_SECONDS),
+                             "ranges": ranges})
+
+    for p in points:
+        if p["kind"] != "bucket":
+            continue
+        ranges = {}
+        for dim in UTILIZATION_DIMS:
+            stats = p[dim]
+            if not stats:
+                continue
+            hi = stats.get("max")
+            if not isinstance(hi, (int, float)):
+                continue
+            lo = stats.get("min")
+            if not isinstance(lo, (int, float)):
+                # Pre-min bucket rows (or a partial stat): avg is the best
+                # low-end anchor available; failing that the bucket collapses
+                # to its max, which reads as "at the max the whole time".
+                lo = stats.get("avg")
+                if not isinstance(lo, (int, float)):
+                    lo = hi
+            ranges[dim] = (float(min(lo, hi)), float(hi))
+        if not ranges:
+            continue
+        span = p.get("span_seconds") or BUCKET_SPAN_SECONDS["1h"]
+        segments.append({
+            "start": p["ts_start"], "end": p["ts_start"] + timedelta(seconds=span),
+            "seconds": min(float(span), float(p["n"]) * LOCKOUT_SAMPLE_NOMINAL_SECONDS),
+            "ranges": ranges,
+        })
+
+    segments.sort(key=lambda s: s["start"])
+    return segments
+
+
+def _above_cap_fraction(low: float, high: float, cap: float = THROTTLE_CAP_PCT) -> float:
+    """Fraction of a segment spent at/over `cap`, from its utilization range.
+
+    Linear across the crossing: for a raw pair that IS the interpolation
+    between the two samples; for a bucket it assumes the value swept its
+    min..max range at a steady rate, which is the only defensible read from
+    min/max alone. Both degenerate correctly — a flat segment is 0 or 1."""
+    if high < cap:
+        return 0.0
+    if low >= cap:
+        return 1.0
+    if high <= low:
+        return 1.0 if high >= cap else 0.0
+    return (high - cap) / (high - low)
+
+
+def _empty_lockout_stats() -> dict:
+    return {
+        "hours_observed": 0.0,
+        "days_observed": 0,
+        "capped_hours": 0.0,
+        "capped_hours_per_month": None,
+        "capped_days_per_month": None,
+        "throttle_days_per_month": None,  # legacy alias (see _verdict)
+        "cap_episodes": 0,
+        "median_episode_hours": None,
+        "longest_episode_hours": None,
+        "days_with_cap": 0,
+        "median_throttle_peak_pct": None,
+    }
+
+
+def _walk_lockout(segments: list[dict], fraction_of, peak_of) -> dict:
+    """Accumulates capped time over `segments`. `fraction_of(seg)` returns the
+    portion of a segment spent capped (None when the segment can't speak to
+    this dimension at all — excluded from observed time too); `peak_of(seg)`
+    the projected peak to record for severity."""
+    observed = 0.0
+    capped = 0.0
+    peaks: list[float] = []
+    episodes: list[float] = []
+    current_episode = 0.0
+    prev_end: datetime | None = None
+    capped_days = set()
+    observed_days = set()
+
+    for s in segments:
+        frac = fraction_of(s)
+        if frac is None:
+            continue
+        observed += s["seconds"]
+        observed_days.add(s["start"].date())
+        seconds = s["seconds"] * frac
+        # A gap only ends an episode if it's too long to bridge (see
+        # LOCKOUT_EPISODE_BRIDGE_SECONDS) — a short collection gap between two
+        # capped segments is missing data, not a recovery.
+        gap = (prev_end is None or
+               (s["start"] - prev_end).total_seconds() > LOCKOUT_EPISODE_BRIDGE_SECONDS)
+        if seconds > 0:
+            capped += seconds
+            peaks.append(peak_of(s))
+            capped_days.add(s["start"].date())
+            if current_episode > 0 and not gap:
+                current_episode += seconds
+            else:
+                if current_episode > 0:
+                    episodes.append(current_episode)
+                current_episode = seconds
+        elif current_episode > 0:
+            episodes.append(current_episode)
+            current_episode = 0.0
+        prev_end = s["end"]
+    if current_episode > 0:
+        episodes.append(current_episode)
+
+    if observed <= 0:
+        return _empty_lockout_stats()
+
+    hours_per_month = capped / observed * HOURS_PER_MONTH
+    return {
+        "hours_observed": round(observed / 3600.0, 2),
+        "days_observed": len(observed_days),
+        "capped_hours": round(capped / 3600.0, 2),
+        "capped_hours_per_month": round(hours_per_month, 2),
+        "capped_days_per_month": round(hours_per_month / 24.0, 2),
+        "throttle_days_per_month": round(hours_per_month / 24.0, 2),
+        "cap_episodes": len(episodes),
+        "median_episode_hours": round(_median(episodes) / 3600.0, 2) if episodes else None,
+        "longest_episode_hours": round(max(episodes) / 3600.0, 2) if episodes else None,
+        "days_with_cap": len(capped_days),
+        "median_throttle_peak_pct": round(_median(peaks), 1) if peaks else None,
+    }
+
+
+def _tier_lockout(segments: list[dict], current_plan: str = CURRENT_PLAN) -> dict:
+    """Per tier: how much TIME the tier would have spent capped, for each
+    window ("five_hour" / "seven_day") and for EITHER window ("any_cap").
+
+    Every segment's endpoints are rescaled onto the tier (the same linear
+    multiplier-ratio rescale as _tier_projection) and the portion of the
+    segment sitting at/over the cap is accumulated. Reported both ways —
+    `capped_hours_per_month` is the honest unit, `capped_days_per_month` its
+    day-equivalent for the widget's column — plus episode stats, which are
+    what actually answer "how long am I stuck when it happens":
+
+    * `cap_episodes` / `median_episode_hours` / `longest_episode_hours` —
+      contiguous runs of capped time (broken by a segment under the cap or by
+      a coverage gap).
+    * `days_with_cap` — distinct UTC days touched by any lockout. This is the
+      old cap-day count, demoted to context.
+    * `median_throttle_peak_pct` — median projected peak across capped
+      segments: how deep into the cap a typical lockout went.
+
+    "any_cap" is a UNION, not a sum: the two caps are usually hit at the same
+    time (both climb while you work, so within a segment both crossings sit at
+    its busy end), which is modelled as nested intervals — union =
+    max(frac_5h, frac_7d), overlap = min(frac_5h, frac_7d). Adding the two
+    dimensions would double-count that overlap, typically by a lot. The block
+    also carries `overlap_hours` and the `*_only_hours` split so a consumer can
+    say WHICH cap is doing the locking out.
+
+    Normalization is per observed time, not per calendar time, so periods when
+    the widget wasn't collecting don't dilute the rate."""
     current_mult = float(TIER_MULTIPLIERS.get(current_plan, TIER_MULTIPLIERS[CURRENT_PLAN]))
     out: dict = {}
     for tier, mult in TIER_MULTIPLIERS.items():
         factor = current_mult / mult
+
+        def _frac(seg, dim, _factor=factor):
+            rng = seg["ranges"].get(dim)
+            if rng is None:
+                return None
+            return _above_cap_fraction(rng[0] * _factor, rng[1] * _factor)
+
+        def _peak(seg, dim, _factor=factor):
+            return seg["ranges"][dim][1] * _factor
+
         tier_out: dict = {}
-        for dim in ("five_hour", "seven_day"):
-            peaks = daily_peaks.get(dim) or {}
-            days_observed = len(peaks)
-            if days_observed == 0:
-                tier_out[dim] = {
-                    "days_observed": 0,
-                    "throttle_days": 0,
-                    "throttle_days_per_month": None,
-                    "median_throttle_peak_pct": None,
-                }
-                continue
-            over = [v * factor for v in peaks.values() if v * factor >= THROTTLE_CAP_PCT]
-            per_month = len(over) / days_observed * MONTHLY_RUN_RATE_DAYS
-            tier_out[dim] = {
-                "days_observed": days_observed,
-                "throttle_days": len(over),
-                "throttle_days_per_month": round(per_month, 1),
-                "median_throttle_peak_pct": round(_median(over), 1) if over else None,
-            }
+        for dim in UTILIZATION_DIMS:
+            tier_out[dim] = _walk_lockout(
+                segments,
+                lambda s, _d=dim: _frac(s, _d),
+                lambda s, _d=dim: _peak(s, _d),
+            )
+
+        def _any_frac(seg):
+            fracs = [f for f in (_frac(seg, d) for d in UTILIZATION_DIMS) if f is not None]
+            return max(fracs) if fracs else None
+
+        def _any_peak(seg):
+            return max(_peak(seg, d) for d in UTILIZATION_DIMS if d in seg["ranges"])
+
+        any_cap = _walk_lockout(segments, _any_frac, _any_peak)
+        # Overlap under the nested-interval model: time BOTH caps were hit.
+        overlap = 0.0
+        for s in segments:
+            fracs = [f for f in (_frac(s, d) for d in UTILIZATION_DIMS) if f is not None]
+            if len(fracs) == len(UTILIZATION_DIMS):
+                overlap += s["seconds"] * min(fracs)
+        any_cap["overlap_hours"] = round(overlap / 3600.0, 2)
+        for dim in UTILIZATION_DIMS:
+            any_cap[f"{dim}_only_hours"] = round(
+                max(0.0, tier_out[dim]["capped_hours"] - overlap / 3600.0), 2)
+        tier_out["any_cap"] = any_cap
         out[tier] = tier_out
     return out
 
@@ -1157,32 +1419,57 @@ def _tier_projection(observed: dict, current_plan: str = CURRENT_PLAN) -> dict:
 SHORT_TIER_NAME = {"pro": "Pro", "max_5x": "Max 5x", "max_20x": "Max 20x"}
 
 
-def _brief_cap_days(plan_entry: dict) -> str | None:
-    """Compact cap-day summary — "~15 d/mo (5h) + ~30 d/mo (7d)" — or None
-    when the plan projects no cap-days at all."""
-    parts = []
-    t5 = plan_entry["throttle_days_5h_per_month"]
-    t7 = plan_entry["throttle_days_7d_per_month"]
-    if t5:
-        parts.append(f"~{t5:g} d/mo (5h)")
-    if t7:
-        parts.append(f"~{t7:g} d/mo (7d)")
-    return " + ".join(parts) if parts else None
+def _fmt_capped_time(hours: float | None) -> str | None:
+    """"~3.2 d/mo" / "~5h/mo" / "~40m/mo" — capped time in whatever unit reads
+    naturally at that magnitude. None for no (or negligible) lockout: under a
+    minute a month is estimation noise, not a deprivation worth naming."""
+    if not hours or hours < 1 / 60.0:
+        return None
+    if hours >= 24:
+        return f"~{hours / 24.0:.1f} d/mo"
+    if hours >= 1:
+        return f"~{hours:.1f}h/mo"
+    return f"~{round(hours * 60)}m/mo"
+
+
+def _brief_capped_time(plan_entry: dict) -> str | None:
+    """Compact capped-time summary — "~3.2 d/mo (weekly cap)" — or None when
+    the plan projects no lockout at all.
+
+    Leads with the union across both caps (the 5h and 7d lockouts overlap, so
+    the two can't be added) and names whichever cap is actually responsible,
+    since that's the actionable half: a 5h-driven lockout means "spread the day
+    out", a weekly one means "the plan is too small"."""
+    total = plan_entry.get("capped_hours_any_per_month")
+    if total is None:
+        total = max((h for h in (plan_entry["capped_hours_5h_per_month"],
+                                 plan_entry["capped_hours_7d_per_month"]) if h is not None),
+                    default=None)
+    text = _fmt_capped_time(total)
+    if text is None:
+        return None
+    h5 = plan_entry["capped_hours_5h_per_month"] or 0.0
+    h7 = plan_entry["capped_hours_7d_per_month"] or 0.0
+    if h7 >= 0.7 * total and h5 < 0.3 * total:
+        return f"{text} (weekly cap)"
+    if h5 >= 0.7 * total and h7 < 0.3 * total:
+        return f"{text} (5h cap)"
+    return f"{text} (5h + weekly caps)"
 
 
 def _tier_down_peek(plans: dict, tier: str) -> str:
     """One sentence on the tier below `tier` — what dropping one more level
-    would cost in cap-days. Empty when `tier` is the cheapest, or when the
+    would cost in lockout time. Empty when `tier` is the cheapest, or when the
     lower tier is clean (it would then be the recommended tier itself, so
     this can only really be empty for missing data)."""
     idx = TIER_ORDER.index(tier)
     if idx == 0:
         return ""
     down_entry = plans[TIER_ORDER[idx - 1]]
-    days = _brief_cap_days(down_entry)
-    if days is None:
+    capped = _brief_capped_time(down_entry)
+    if capped is None:
         return ""
-    peek = f" A tier down, {SHORT_TIER_NAME[TIER_ORDER[idx - 1]]} would be capped {days}"
+    peek = f" A tier down, {SHORT_TIER_NAME[TIER_ORDER[idx - 1]]} would be locked out {capped}"
     sev = down_entry["median_throttle_peak_5h_pct"] or down_entry["median_throttle_peak_7d_pct"]
     if sev is not None:
         peek += f", typically near {sev:.0f}% of cap"
@@ -1205,29 +1492,38 @@ def _verdict(tier_projection: dict, throttle: dict, run_rate: dict,
         peak_7d = proj["peak_seven_day_pct"]
         has_peak_data = peak_5h is not None or peak_7d is not None
 
-        # Tolerance comparison uses the EXACT per-month rate (recomputed from
-        # the raw counts), not the display-rounded one — a 7d rate of
-        # 0.04/month must still disqualify under the zero-tolerance default
-        # even though it displays as 0.0.
-        def _exact_per_month(dim_stats: dict):
-            if dim_stats["days_observed"] == 0:
-                return None
-            return dim_stats["throttle_days"] / dim_stats["days_observed"] * MONTHLY_RUN_RATE_DAYS
-
-        t5 = _exact_per_month(thr["five_hour"])
-        t7 = _exact_per_month(thr["seven_day"])
+        # Viability is measured in locked-out HOURS per month against the
+        # hour tolerances; the day-equivalents ride along for display only.
+        h5 = thr["five_hour"]["capped_hours_per_month"]
+        h7 = thr["seven_day"]["capped_hours_per_month"]
         viable = True
-        if t5 is not None and t5 > THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH:
+        if h5 is not None and h5 > THROTTLE_TOLERANCE_5H_HOURS_PER_MONTH:
             viable = False
-        if t7 is not None and t7 > THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH:
+        if h7 is not None and h7 > THROTTLE_TOLERANCE_7D_HOURS_PER_MONTH:
             viable = False
         plans[tier] = {
             "price_usd": price,
             "api_equiv_ratio": ratio,
             "projected_peak_7d_util": peak_7d,
             "projected_peak_5h_util": peak_5h,
-            "throttle_days_5h_per_month": thr["five_hour"]["throttle_days_per_month"],
-            "throttle_days_7d_per_month": thr["seven_day"]["throttle_days_per_month"],
+            "capped_hours_5h_per_month": h5,
+            "capped_hours_7d_per_month": h7,
+            # Union across both caps — time locked out for EITHER reason. Not
+            # h5 + h7: the two overlap (see _tier_lockout's "any_cap").
+            "capped_hours_any_per_month": thr["any_cap"]["capped_hours_per_month"],
+            "throttle_days_any_per_month": thr["any_cap"]["capped_days_per_month"],
+            "median_lockout_any_hours": thr["any_cap"]["median_episode_hours"],
+            "longest_lockout_any_hours": thr["any_cap"]["longest_episode_hours"],
+            # Day-equivalents of the same hours. Name kept from the cap-day
+            # era so an older widget build keeps rendering this column — the
+            # value now means "days' worth of lockout", not "days on which a
+            # cap was touched".
+            "throttle_days_5h_per_month": thr["five_hour"]["capped_days_per_month"],
+            "throttle_days_7d_per_month": thr["seven_day"]["capped_days_per_month"],
+            "median_lockout_5h_hours": thr["five_hour"]["median_episode_hours"],
+            "median_lockout_7d_hours": thr["seven_day"]["median_episode_hours"],
+            "longest_lockout_5h_hours": thr["five_hour"]["longest_episode_hours"],
+            "longest_lockout_7d_hours": thr["seven_day"]["longest_episode_hours"],
             "median_throttle_peak_5h_pct": thr["five_hour"]["median_throttle_peak_pct"],
             "median_throttle_peak_7d_pct": thr["seven_day"]["median_throttle_peak_pct"],
             "price_delta_vs_current_usd": price - current_price,
@@ -1269,8 +1565,8 @@ def _verdict(tier_projection: dict, throttle: dict, run_rate: dict,
         cheapest = viable_tiers[0]
         cheapest_name = SHORT_TIER_NAME.get(cheapest, cheapest)
         current_name = SHORT_TIER_NAME.get(current_plan, current_plan)
-        days = _brief_cap_days(plans[cheapest])
-        fit_clause = f"capped only {days}" if days else "no projected cap-days"
+        capped = _brief_capped_time(plans[cheapest])
+        fit_clause = f"locked out only {capped}" if capped else "no projected lockout"
         if cheapest == current_plan:
             # Current plan fits: say so briefly, then peek one tier down so
             # the user can see what a downgrade would actually cost them.
@@ -1291,19 +1587,20 @@ def _verdict(tier_projection: dict, throttle: dict, run_rate: dict,
             # cheapest tier that fits.
             delta = plans[cheapest]["price_delta_vs_current_usd"]
             cur_entry = plans.get(current_plan)
-            cur_days = _brief_cap_days(cur_entry) if cur_entry else None
-            cur_clause = f"would be capped {cur_days} — over tolerance" if cur_days else "is over tolerance"
+            cur_capped = _brief_capped_time(cur_entry) if cur_entry else None
+            cur_clause = (f"would be locked out {cur_capped} — over tolerance"
+                          if cur_capped else "is over tolerance")
             fits = f"{cheapest_name} fits"
-            if days:
-                fits += f" (capped {days})"
+            if capped:
+                fits += f" (locked out {capped})"
             if delta > 0:
                 fits += f" for ${delta:g}/mo more"
             recommendation = f"Your current plan, {current_name}, {cur_clause}. {fits}."
         if preliminary:
             recommendation += " Preliminary — recheck with more history."
     else:
-        m20_days = _brief_cap_days(plans["max_20x"])
-        capped = f"would be capped {m20_days}" if m20_days else "is over tolerance"
+        m20_capped = _brief_capped_time(plans["max_20x"])
+        capped = f"would be locked out {m20_capped}" if m20_capped else "is over tolerance"
         recommendation = (
             f"Even Max 20x {capped}. Spread usage out, or budget for API overage during spikes."
         )
@@ -1315,10 +1612,13 @@ def _verdict(tier_projection: dict, throttle: dict, run_rate: dict,
         "recommendation": recommendation,
         "data_maturity": data_maturity,
         # Surfaced so consumers (widget tooltip, CLI) can say what "viable"
-        # means without hardcoding the thresholds a second time.
+        # means without hardcoding the thresholds a second time. Hours are the
+        # real thresholds; the day-equivalents are kept for older readers.
         "throttle_tolerance": {
-            "five_hour_days_per_month": THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH,
-            "seven_day_days_per_month": THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH,
+            "five_hour_hours_per_month": THROTTLE_TOLERANCE_5H_HOURS_PER_MONTH,
+            "seven_day_hours_per_month": THROTTLE_TOLERANCE_7D_HOURS_PER_MONTH,
+            "five_hour_days_per_month": round(THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH, 4),
+            "seven_day_days_per_month": round(THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH, 4),
         },
     }
 
@@ -1327,31 +1627,75 @@ def _verdict(tier_projection: dict, throttle: dict, run_rate: dict,
 # Budget windows (API-account dollar limits, config-driven)
 # ---------------------------------------------------------------------------
 
+def _budget_tz_helpers(when: datetime, tzname: str):
+    """(`when` as an aware datetime in the budget timezone, `to_utc(y,m,d)`).
+
+    `tzname` is "local" (system tz) or "utc". `to_utc` maps a wall-clock
+    midnight in that timezone to the UTC instant it happens at.
+
+    DST-safe: for the "local" case each date's midnight is localized on its
+    OWN date via stdlib naive-datetime `.astimezone()` (a naive datetime is
+    presumed to be system-local time, converted with the correct offset for
+    that specific date), so a period spanning a DST transition still resolves
+    to true local midnight at both ends. Pure stdlib — no zoneinfo key lookup
+    required.
+    """
+    when = _ensure_utc(when)
+    if tzname == "utc":
+        def to_utc(y: int, m: int, d: int) -> datetime:
+            return datetime(y, m, d, tzinfo=timezone.utc)
+        return when, to_utc
+
+    def to_utc(y: int, m: int, d: int) -> datetime:
+        # naive -> presumed local, localized on its own date (DST-correct)
+        return datetime(y, m, d).astimezone(timezone.utc)
+    return when.astimezone(), to_utc
+
+
+def _weekday_seconds(start: datetime, end: datetime, tzname: str) -> float:
+    """Seconds of [start, end) that fall on a Mon–Fri calendar date in the
+    budget timezone. Both bounds are UTC-aware instants; the day the seconds
+    are attributed to is the LOCAL (or UTC, per `tzname`) date, so this agrees
+    with how _budget_period_bounds slices periods.
+
+    Walks whole calendar dates and intersects each with the interval — DST
+    days are 23/25h and are counted as such, since each date's midnight is
+    localized on its own date. Bounded by the period length (≤ 31 iterations
+    for a month); returns 0.0 for an empty or inverted interval.
+    """
+    start = _ensure_utc(start)
+    end = _ensure_utc(end)
+    if end <= start:
+        return 0.0
+    ref_start, to_utc = _budget_tz_helpers(start, tzname)
+    day = ref_start.date()
+    total = 0.0
+    while True:
+        day_start = to_utc(day.year, day.month, day.day)
+        nxt = day + timedelta(days=1)
+        day_end = to_utc(nxt.year, nxt.month, nxt.day)
+        if day_start >= end:
+            break
+        if day.weekday() < 5:  # Mon=0 .. Fri=4
+            lo = max(day_start, start)
+            hi = min(day_end, end)
+            if hi > lo:
+                total += (hi - lo).total_seconds()
+        day = nxt
+    return total
+
+
 def _budget_period_bounds(now: datetime, kind: str, week_start: str, tzname: str) -> tuple[datetime, datetime]:
     """Calendar-period bounds for the budget window containing `now`,
     returned as UTC-aware datetimes.
 
     `kind` is "monthly" (calendar month) or "weekly" (calendar week starting
     `week_start`, "monday" or "sunday" — deliberately NOT the Max rolling-7d
-    window). `tzname` is "local" (system tz) or "utc".
-
-    DST-safe: for the "local" case each boundary's wall-clock midnight is
-    localized on its own date via stdlib naive-datetime `.astimezone()` (a
-    naive datetime is presumed to be system-local time, converted with the
-    correct offset for that specific date), so a period spanning a DST
-    transition still resolves to true local midnight at both ends. Pure
-    stdlib — no zoneinfo key lookup required.
+    window). `tzname` is "local" (system tz) or "utc". Boundary localization
+    (and its DST handling) lives in _budget_tz_helpers.
     """
     now = _ensure_utc(now)
-    if tzname == "utc":
-        ref = now  # already UTC-aware
-        def to_utc(y: int, m: int, d: int) -> datetime:
-            return datetime(y, m, d, tzinfo=timezone.utc)
-    else:  # "local"
-        ref = now.astimezone()  # aware datetime in the system-local tz
-        def to_utc(y: int, m: int, d: int) -> datetime:
-            # naive -> presumed local, localized on its own date (DST-correct)
-            return datetime(y, m, d).astimezone(timezone.utc)
+    ref, to_utc = _budget_tz_helpers(now, tzname)
 
     if kind == "monthly":
         start = to_utc(ref.year, ref.month, 1)
@@ -1372,7 +1716,8 @@ def _budget_period_bounds(now: datetime, kind: str, week_start: str, tzname: str
 
 
 def _budget_window(hourly_cost: dict, now: datetime, limit_usd, kind: str,
-                   week_start: str, tzname: str, includes_remote: bool = False) -> dict | None:
+                   week_start: str, tzname: str, includes_remote: bool = False,
+                   projection_basis: str = DEFAULT_BUDGET_PROJECTION_BASIS) -> dict | None:
     """One budget window (C2) or None when its limit is unconfigured.
 
     Spend = sum of the already-priced `hourly_cost` UTC hour buckets falling
@@ -1381,20 +1726,34 @@ def _budget_window(hourly_cost: dict, now: datetime, limit_usd, kind: str,
     suppressed in the period's first hour where too little has elapsed to
     extrapolate. `includes_remote` is True when at least one remote host's usage
     store was folded into the cost series (WS-6), False otherwise.
+
+    `projection_basis` picks which clock the elapsed fraction runs on:
+    "calendar" (every hour counts) or "weekdays" (only Mon–Fri hours count, on
+    both sides of the ratio — see BUDGET_PROJECTION_BASES). Under "weekdays"
+    the first-hour suppression is measured in weekday time too, so a month
+    that opens on a Saturday reports no projection until an hour into Monday
+    rather than extrapolating from a zero-length denominator.
     """
     if limit_usd is None:
         return None
     now = _ensure_utc(now)
     limit = float(limit_usd)
+    if projection_basis not in BUDGET_PROJECTION_BASES:
+        projection_basis = DEFAULT_BUDGET_PROJECTION_BASIS
     period_start, period_end = _budget_period_bounds(now, kind, week_start, tzname)
 
     spent = float(sum(c for h, c in hourly_cost.items() if period_start <= h < period_end))
     pct = round(spent / limit * 100.0, 1) if limit > 0 else None
 
+    if projection_basis == "weekdays":
+        elapsed = _weekday_seconds(period_start, now, tzname)
+        total = _weekday_seconds(period_start, period_end, tzname)
+    else:
+        elapsed = (now - period_start).total_seconds()
+        total = (period_end - period_start).total_seconds()
+
     projected_usd = None
     projected_pct = None
-    elapsed = (now - period_start).total_seconds()
-    total = (period_end - period_start).total_seconds()
     if elapsed >= BUDGET_PROJECTION_MIN_ELAPSED_SECONDS and total > 0:
         elapsed_fraction = elapsed / total
         if elapsed_fraction > 0:
@@ -1411,6 +1770,7 @@ def _budget_window(hourly_cost: dict, now: datetime, limit_usd, kind: str,
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
         "includes_remote": bool(includes_remote),
+        "projection_basis": projection_basis,
     }
 
 
@@ -1423,11 +1783,14 @@ def _budget_block(hourly_cost: dict, now: datetime, config: dict,
     budget = config.get("budget", {}) or {}
     week_start = budget.get("week_start", "monday")
     tzname = budget.get("timezone", "local")
+    basis = budget.get("projection_basis", DEFAULT_BUDGET_PROJECTION_BASIS)
     return {
         "weekly": _budget_window(hourly_cost, now, budget.get("weekly_usd"),
-                                 "weekly", week_start, tzname, includes_remote),
+                                 "weekly", week_start, tzname, includes_remote,
+                                 basis),
         "monthly": _budget_window(hourly_cost, now, budget.get("monthly_usd"),
-                                  "monthly", week_start, tzname, includes_remote),
+                                  "monthly", week_start, tzname, includes_remote,
+                                  basis),
     }
 
 
@@ -1560,14 +1923,20 @@ def compute(state_dir: Path, now: datetime) -> dict:
 
     tier_projection = _tier_projection(utilization_observed, current_plan)
 
-    daily_peaks = _daily_peaks(observed_points)
-    throttle_projection = _tier_throttle(daily_peaks, current_plan)
+    utilization_segments = _utilization_segments(observed_points)
+    throttle_projection = _tier_lockout(utilization_segments, current_plan)
     assumptions.append(
-        "Plan viability counts projected cap-days: each UTC day's peak utilization is rescaled "
-        "per tier, days at/over 100% are counted and normalized to a 30-day month, and a tier is "
-        f"viable when within tolerance (5h: <= {THROTTLE_TOLERANCE_5H_DAYS_PER_MONTH:g}/month; "
-        f"7d: <= {THROTTLE_TOLERANCE_7D_DAYS_PER_MONTH:g}/month). All-time peaks are context, "
-        "not the verdict."
+        "Plan viability measures projected lockout TIME: the utilization series is rescaled per "
+        "tier and the time it sits at/over 100% (i.e. unable to work) is summed and normalized to "
+        f"a 30-day month, tolerance 5h: <= {THROTTLE_TOLERANCE_5H_HOURS_PER_MONTH:g}h/month, "
+        f"7d: <= {THROTTLE_TOLERANCE_7D_HOURS_PER_MONTH:g}h/month. Hitting a cap late in its "
+        "window therefore costs only the time left until that window resets, not a whole day. "
+        "All-time peaks are context, not the verdict."
+    )
+    assumptions.append(
+        "Projected 5h lockout time is an upper bound: the observed series was measured on the "
+        "current plan, where usage kept accruing past the point a cheaper tier would have cut it "
+        "off. Weekly lockout is unaffected (the window resets on a fixed schedule either way)."
     )
 
     widest_window = MA_WINDOWS_DAYS[-1]
@@ -1652,7 +2021,7 @@ def write_plan_fit(state_dir: Path, now: datetime) -> None:
     usage_dir.mkdir(parents=True, exist_ok=True)
     tmp = usage_dir / "plan_fit.json.tmp"
     tmp.write_text(json.dumps(result, indent=2))
-    tmp.replace(usage_dir / "plan_fit.json")
+    platform_compat.replace_with_retry(tmp, usage_dir / "plan_fit.json")
 
 
 # ---------------------------------------------------------------------------
@@ -1701,22 +2070,38 @@ def _print_report(result: dict) -> None:
               f"avg 5h {_format_pct(tp['avg_five_hour_pct'])}, avg 7d {_format_pct(tp['avg_seven_day_pct'])}{cap_flag}")
     print()
 
-    def _format_cap_days(dim_stats: dict) -> str:
-        pm = dim_stats["throttle_days_per_month"]
+    def _format_lockout(dim_stats: dict) -> str:
+        pm = dim_stats.get("capped_hours_per_month")
         if pm is None:
             return "n/a"
-        s = f"{pm:g} d/mo"
-        med = dim_stats["median_throttle_peak_pct"]
-        if med is not None:
-            s += f" (median cap-day peak {med:.0f}%)"
+        s = f"{pm:.2f}h/mo ({pm / 24.0:.2f} d/mo)"
+        eps = dim_stats.get("cap_episodes") or 0
+        med = dim_stats.get("median_episode_hours")
+        if eps and med is not None:
+            s += f", {eps} episode(s), median {med:.2f}h"
+        peak = dim_stats.get("median_throttle_peak_pct")
+        if peak is not None:
+            s += f", median peak {peak:.0f}%"
         return s
 
     tp_throttle = result.get("throttle_projection")
     if tp_throttle:
-        print("Cap-day projection (per-day peak >= 100%, normalized to 30 days):")
+        print("Lockout projection (time at/over 100% of cap, normalized to 30 days):")
         for tier in TIER_ORDER:
             t = tp_throttle[tier]
-            print(f"  {tier:>8}: 5h {_format_cap_days(t['five_hour'])}, 7d {_format_cap_days(t['seven_day'])}")
+            print(f"  {tier:>8}: 5h {_format_lockout(t['five_hour'])}")
+            print(f"  {'':>8}  7d {_format_lockout(t['seven_day'])}")
+            if "any_cap" in t:
+                any_cap = t["any_cap"]
+                print(f"  {'':>8} any {_format_lockout(any_cap)}")
+                if any_cap["capped_hours"]:
+                    print(f"  {'':>8}     (of {any_cap['capped_hours']}h observed lockout: "
+                          f"5h only {any_cap['five_hour_only_hours']}h, "
+                          f"7d only {any_cap['seven_day_only_hours']}h, "
+                          f"both {any_cap['overlap_hours']}h)")
+        obs = tp_throttle[TIER_ORDER[0]]["five_hour"].get("hours_observed")
+        if obs:
+            print(f"  (observed coverage: {obs:.1f}h)")
         print()
 
     v = result["verdict"]
@@ -1724,16 +2109,18 @@ def _print_report(result: dict) -> None:
     for tier in TIER_ORDER:
         p = v["plans"][tier]
         ratio = "n/a" if p["api_equiv_ratio"] is None else f"{p['api_equiv_ratio']:.2f}x"
-        t5 = p.get("throttle_days_5h_per_month")
-        t7 = p.get("throttle_days_7d_per_month")
-        cap_days = (f"cap-days/mo 5h={'n/a' if t5 is None else f'{t5:g}'} "
-                    f"7d={'n/a' if t7 is None else f'{t7:g}'}")
-        print(f"  {tier:>8} (${p['price_usd']}/mo): viable={p['viable']}, {cap_days}, api-equiv ratio={ratio}, "
+        t5 = p.get("capped_hours_5h_per_month")
+        t7 = p.get("capped_hours_7d_per_month")
+        ta = p.get("capped_hours_any_per_month")
+        locked = (f"locked-out h/mo any={'n/a' if ta is None else f'{ta:g}'} "
+                  f"(5h={'n/a' if t5 is None else f'{t5:g}'} "
+                  f"7d={'n/a' if t7 is None else f'{t7:g}'})")
+        print(f"  {tier:>8} (${p['price_usd']}/mo): viable={p['viable']}, {locked}, api-equiv ratio={ratio}, "
               f"projected peak 7d={_format_pct(p['projected_peak_7d_util'])}, 5h={_format_pct(p['projected_peak_5h_util'])}")
     tol = v.get("throttle_tolerance")
     if tol:
-        print(f"  Tolerance: 5h <= {tol['five_hour_days_per_month']:g} cap-day(s)/mo, "
-              f"7d <= {tol['seven_day_days_per_month']:g} cap-day(s)/mo")
+        print(f"  Tolerance: 5h <= {tol['five_hour_hours_per_month']:g}h/mo locked out, "
+              f"7d <= {tol['seven_day_hours_per_month']:g}h/mo")
     print(f"  Data maturity: {v['data_maturity']}")
     print(f"  Recommendation: {v['recommendation']}")
     print()
@@ -1772,7 +2159,7 @@ def main(argv: list[str]) -> int:
     usage_dir.mkdir(parents=True, exist_ok=True)
     tmp = usage_dir / "plan_fit.json.tmp"
     tmp.write_text(json.dumps(result, indent=2))
-    tmp.replace(usage_dir / "plan_fit.json")
+    platform_compat.replace_with_retry(tmp, usage_dir / "plan_fit.json")
     print(f"\nWrote {usage_dir / 'plan_fit.json'}")
     return 0
 

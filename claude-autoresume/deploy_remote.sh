@@ -57,7 +57,7 @@ SERVICE_TEMPLATE="$SCRIPT_DIR/autoresume.service.template"
 # so omitting it makes the remote daemon crash with ModuleNotFoundError before
 # main() ever runs (systemd Restart=always then crash-loops every RestartSec).
 # On a remote with no config.json its RemoteSync worker just idles harmlessly.
-PAYLOAD_FILES=(autoresume.py cowork_resume.py usage_collector.py plan_fit.py autoresume_config.py remote_ctl.py remote_sync.py)
+PAYLOAD_FILES=(autoresume.py platform_compat.py cowork_resume.py usage_collector.py plan_fit.py autoresume_config.py remote_ctl.py remote_sync.py)
 
 # --- ssh/scp wrappers (never prompt) ---------------------------------------
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
