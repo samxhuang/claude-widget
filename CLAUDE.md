@@ -576,6 +576,46 @@ on top of the undeployed Windows-port-foundation session. Both
 `ClaudeUsageOverlay/build_and_run.command` are needed, and the option only
 does anything on an `account.type == "api"` config (this Mac's is `max`).
 
+### Follow-up: the monthly projection vanishing after the first usage fetch
+
+Reported symptom: "on first open it shows a prediction for the month, after
+the first UI refresh it goes away." Root cause is the **row switching data
+sources**, not the projection being recomputed. `apiBudgetSection`'s monthly
+row prefers `UsageModel.spendBudgetWindow` (the API's authoritative
+Enterprise Spend Limit) and falls back to the daemon-reconstructed
+`data?.budgetMonthly`. Before the first usage fetch `spendLimit` is nil, so
+the row renders the daemon window — which HAS `projected_*` — and the dot
+shows. The moment the API answers, the row flips to the spend window, which
+was built with `projectedUsd: nil, projectedPct: nil` (the payload carries
+neither a rate nor a period), and the dot disappears for good.
+
+Fixed by giving the spend window its own projection, computed widget-side:
+
+- **`Sources/BudgetMath/`** — a new SwiftPM target holding the pure date math
+  (`BudgetProjectionBasis`, `monthBounds`, `weekdaySeconds`,
+  `elapsedFraction`, `project`). Its own target ONLY so it can be
+  unit-tested: the app target is AppKit/SwiftUI and deliberately has none,
+  but this arithmetic (DST, month bounds, a period opening on a weekend) is
+  where it goes subtly wrong, and it has to agree with plan_fit.py's
+  independent implementation. `Tests/BudgetMathTests` (13 tests) mirrors
+  test_plan_fit.py's `BudgetProjectionBasisTests` case for case.
+- **The one assumption**: a monthly spend limit runs from the 1st of the
+  month (the API sends no period at all). That also gives the row a real
+  `period_end`, so "Monthly spend" now shows a reset countdown where it
+  previously showed none.
+- `projectedPct` is the API's own `pct` scaled by the elapsed fraction —
+  never `spent/limit` recomputed locally — so the dot can't disagree with
+  the percent printed beside it.
+- `AppConfig.budgetProjectionBasis` / `.budgetTimeZone` feed it the same
+  calendar-vs-weekdays setting and `budget.timezone` the daemon uses.
+
+Swift tests: **47** (34 ClaudeAPI + 13 BudgetMath).
+
+Not changed, and worth a decision if it comes up again: the **Graph tab's
+"1mo" period is a trailing 30 days**, not month-to-date (`recompute()` does
+`end - period.durationSeconds`). That's a history-range picker rather than a
+budget period, so "monthly = since the 1st" was not applied to it.
+
 ## Open threads / things a future session might reasonably pick up
 
 - Click-to-open for local sessions is now a "just foreground Desktop, no

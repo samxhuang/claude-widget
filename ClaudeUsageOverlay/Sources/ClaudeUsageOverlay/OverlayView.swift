@@ -549,7 +549,9 @@ struct OverlayView: View {
                 // bar, but the number matches Claude Desktop's usage tab and
                 // needs no daemon / remote-host token collection. Falls back to
                 // the reconstructed budget when the account has no spend limit.
-                if let spendWindow = model.spendBudgetWindow {
+                if let spendWindow = model.spendBudgetWindow(
+                    basis: configStore.config.budgetProjectionBasis,
+                    timeZone: configStore.config.budgetTimeZone) {
                     budgetRow(label: "Monthly spend", window: spendWindow)
                 } else {
                     budgetRowOrScaffold(label: "Monthly budget", window: data?.budgetMonthly)

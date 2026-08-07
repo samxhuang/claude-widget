@@ -1,4 +1,5 @@
 import Foundation
+import BudgetMath
 import ClaudeAPI
 
 /// Holds the latest usage numbers pulled from claude.ai and formats them
@@ -77,19 +78,41 @@ final class UsageModel: Observable {
     /// the plan has no active dollar limit. Lets the main usage rows render the
     /// authoritative spend with the same dollar-bar renderer as reconstructed
     /// budgets — but sourced from the API, no daemon/transcripts involved.
-    /// No projection dot or reset countdown: the usage payload carries neither
-    /// a rate nor a reset date (Desktop sources the reset elsewhere).
-    var spendBudgetWindow: BudgetWindow? {
+    ///
+    /// The projection is computed HERE rather than carried by the payload: the
+    /// usage API sends a bare spent/limit pair with no period and no rate. A
+    /// monthly spend limit runs from the 1st of the month, which is the one
+    /// assumption this makes — everything else (elapsed fraction, the
+    /// calendar-vs-weekdays basis, the first-hour suppression) is the same
+    /// math plan_fit.py applies to the budget windows it reconstructs.
+    ///
+    /// This used to return `projectedUsd: nil`, which read as a BUG at the
+    /// row level: before the first usage fetch the monthly row falls back to
+    /// the daemon-reconstructed window (which does project), so the projection
+    /// dot appeared on launch and then vanished the moment the API answered
+    /// and this window took over. Both sources must project, or neither.
+    ///
+    /// `pct` stays the API's own utilization figure, and the projected percent
+    /// is that same figure scaled by the elapsed fraction — never
+    /// spent/limit recomputed locally, so the dot can't disagree with the
+    /// number printed next to it.
+    func spendBudgetWindow(basis: BudgetProjectionBasis, timeZone: TimeZone) -> BudgetWindow? {
         guard let s = spendLimit, s.enabled, s.limitMinor > 0 else { return nil }
+        let bounds = BudgetProjection.monthBounds(containing: now, timeZone: timeZone)
+        let fraction = bounds.flatMap {
+            BudgetProjection.elapsedFraction(start: $0.start, end: $0.end, now: now,
+                                             basis: basis, timeZone: timeZone)
+        }
         return BudgetWindow(
             limitUsd: s.limitAmount,
             spentUsd: s.spentAmount,
             pct: s.percent,
-            projectedUsd: nil,
-            projectedPct: nil,
-            periodStart: nil,
-            periodEnd: nil,
-            includesRemote: false
+            projectedUsd: fraction.map { s.spentAmount / $0 },
+            projectedPct: fraction.map { s.percent / $0 },
+            periodStart: bounds?.start,
+            periodEnd: bounds?.end,
+            includesRemote: false,
+            projectionBasis: basis.rawValue
         )
     }
 

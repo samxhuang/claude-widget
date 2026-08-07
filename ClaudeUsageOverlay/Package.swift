@@ -18,9 +18,19 @@ let package = Package(
             path: "Sources/ClaudeAPI",
             exclude: ["CONTRACT.md"]
         ),
+        // Pure date math for the dollar-budget projections (elapsed-fraction
+        // over calendar days or weekdays only). Its own target purely so it
+        // can be unit-tested: the app target is AppKit/SwiftUI and untestable
+        // here, but this arithmetic is exactly the part that goes subtly wrong
+        // (DST, month bounds, a period that opens on a weekend), and it has to
+        // agree with plan_fit.py's independent implementation.
+        .target(
+            name: "BudgetMath",
+            path: "Sources/BudgetMath"
+        ),
         .executableTarget(
             name: "ClaudeUsageOverlay",
-            dependencies: ["ClaudeAPI"],
+            dependencies: ["ClaudeAPI", "BudgetMath"],
             path: "Sources/ClaudeUsageOverlay"
         ),
         // Unit tests for the ClaudeAPI module. ClaudeAPIClient became
@@ -37,6 +47,11 @@ let package = Package(
             name: "ClaudeAPITests",
             dependencies: ["ClaudeAPI"],
             path: "Tests/ClaudeAPITests"
+        ),
+        .testTarget(
+            name: "BudgetMathTests",
+            dependencies: ["BudgetMath"],
+            path: "Tests/BudgetMathTests"
         )
     ]
 )

@@ -1,3 +1,4 @@
+import BudgetMath
 import Foundation
 import Darwin
 
@@ -55,6 +56,20 @@ struct AppConfig: Equatable {
     var idleRetentionMinutes: Int = 30
 
     var isApiAccount: Bool { accountType == "api" }
+
+    /// `projectionBasis` as the typed enum the projection math takes; an
+    /// unknown string reads as `.calendar`, same as the Python reader.
+    var budgetProjectionBasis: BudgetProjectionBasis {
+        BudgetProjectionBasis(configValue: projectionBasis)
+    }
+
+    /// The timezone whose midnights bound a budget period (and whose dates
+    /// decide what counts as a weekday). Mirrors plan_fit's `"local"`/`"utc"`
+    /// handling; the UTC case is built arithmetically, never by identifier
+    /// lookup, for the reason GraphModel.utc documents.
+    var budgetTimeZone: TimeZone {
+        timezone == "utc" ? TimeZone(secondsFromGMT: 0)! : .current
+    }
 }
 
 /// Sole writer of `~/.claude-autoresume/config.json` (contract C1). Every
