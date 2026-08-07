@@ -611,10 +611,10 @@ Fixed by giving the spend window its own projection, computed widget-side:
 
 Swift tests: **47** (34 ClaudeAPI + 13 BudgetMath).
 
-Not changed, and worth a decision if it comes up again: the **Graph tab's
-"1mo" period is a trailing 30 days**, not month-to-date (`recompute()` does
-`end - period.durationSeconds`). That's a history-range picker rather than a
-budget period, so "monthly = since the 1st" was not applied to it.
+**Scope, decided by the owner (2026-08-06):** "since the 1st" is the budget
+period on the MAIN tab only. The **Graph tab's "1mo" stays a trailing 30
+days** (`recompute()` does `end - period.durationSeconds`) — it's a
+history-range picker, not a budget period. Don't "fix" it into month-to-date.
 
 ## Open threads / things a future session might reasonably pick up
 
